@@ -1,0 +1,190 @@
+// §9.1.3: the build checks the size of each `@ffi.struct` and the offset of each field
+// against the named C struct, and when they differ it fails and reports the struct and the
+// field. Each bad row builds on both build paths and for a clang cross target, and checks
+// that the build stops with one report at the mirror that names the C struct, the field and
+// what differs, in place of a raw C compiler error. `blink check` runs no C compiler
+// (§6.7.3), so it passes each bad row.
+
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_mirror_mismatch.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// The one place that names how a mismatch stops the build, so a change of its code changes
+// this helper alone. Only the JSON form of a report holds the code.
+fn assert_mismatch_stop(r: ProcessResult, label: Str, json: Bool) {
+    assert_eq(r.end, ChildEnd.Exited(101), "{label}: {diag(r)}")
+    assert(r.err_out.contains("GeneratedCDidNotCompile"), "{label}: {diag(r)}")
+    if json {
+        assert(r.err_out.contains("I0017"), "{label}: {diag(r)}")
+    }
+}
+
+// The text of a raw C compiler error about the layout check, which the report replaces.
+fn assert_no_raw_cc_error(r: ProcessResult, label: Str) {
+    for raw in ["_Static_assert", "static assertion", "has no member", "no member named", "mismatch with C"] {
+        assert(!r.err_out.contains(raw), "{label}: raw C compiler text `{raw}`: {diag(r)}")
+    }
+}
+
+// Builds `source` on both build paths for the host and for one cross target, and once for two
+// targets. Checks that each build stops with a report that holds each of `wants`, at the
+// mirror's line, and that `blink check` passes the source.
+fn mismatch_reports(source: Str, wants: List[Str], line: Int) ! FS.Write, Process.Spawn {
+    let dir = project(source)
+    let check = blink_in(dir, "check src/main.bl")
+    let pm = blink_in(dir, "build --per-module src/main.bl")
+    let one = blink_in(dir, "build --no-per-module src/main.bl")
+    let cross_pm = blink_in(dir, "build --per-module --target x86_64-linux-gnu src/main.bl")
+    let cross_one = blink_in(dir, "build --no-per-module --target x86_64-linux-gnu src/main.bl")
+    let two = blink_in(dir, "build --target x86_64-linux-gnu --target aarch64-linux-gnu src/main.bl")
+    let json = blink_in(dir, "build --json --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_mismatch_stop(json, "--json", true)
+    assert_no_raw_cc_error(json, "--json")
+    assert(json.err_out.contains("\"line\":{line}"), "--json: not at line {line}: {diag(json)}")
+    for want in wants {
+        assert(json.err_out.contains(want), "--json: no `{want}`: {diag(json)}")
+    }
+    assert_eq(check.end, ChildEnd.Exited(0), "check: {diag(check)}")
+    let runs = [("--per-module", pm), ("--no-per-module", one), ("--target --per-module", cross_pm), ("--target --no-per-module", cross_one), ("two targets", two)]
+    for (label, r) in runs {
+        assert_mismatch_stop(r, label, false)
+        assert_no_raw_cc_error(r, label)
+        for want in wants {
+            assert(r.err_out.contains(want), "{label}: no `{want}`: {diag(r)}")
+        }
+        assert(r.err_out.contains("main.bl:{line}:"), "{label}: not at line {line}: {diag(r)}")
+    }
+    for (label, r) in [("--target --per-module", cross_pm), ("--target --no-per-module", cross_one), ("two targets", two)] {
+        assert(r.err_out.contains("x86_64-linux-gnu"), "{label}: no target triple: {diag(r)}")
+    }
+}
+
+fn with_main(mirrors: Str) -> Str {
+    mirrors.concat(#"
+fn main() {
+    io.println("built")
+}
+"#)
+}
+
+test "a mirror field that the C struct lacks is reported by name" {
+    let src = with_main(#"@ffi.struct(header: "time.h", name: "tm")
+type Tm { tm_sec: I32, tm_nope: I32 }
+"#)
+    mismatch_reports(src, ["`Tm`", "`tm`", "has no field `tm_nope`"], 1)
+}
+
+test "a mirror smaller than its C struct is reported as a struct size mismatch" {
+    let src = with_main(#"@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I32 }
+"#)
+    mismatch_reports(src, ["`DivT`", "`div_t`", "the struct has a different size"], 1)
+}
+
+test "a mirror field of the wrong width is reported by name" {
+    let src = with_main(#"
+@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I64, rem: I32 }
+"#)
+    mismatch_reports(src, ["`DivT`", "`div_t`", "field `quot` has a different size"], 2)
+}
+
+test "a mirror name that is neither a struct tag nor a typedef is reported" {
+    let src = with_main(#"@ffi.struct(header: "stdlib.h", name: "div_tt")
+type DivT { quot: I32, rem: I32 }
+"#)
+    mismatch_reports(src, ["`DivT`", "names `div_tt`, but `stdlib.h` declares no complete struct tag"], 1)
+}
+
+// A mirror that holds another mirror and a pointer field: the check must spell each field as
+// the program's units do, or it reports a mirror that matches.
+fn matching_mirrors() -> Str {
+    #"@ffi.struct(header: "time.h", name: "timespec")
+type Timespec { tv_sec: I64, tv_nsec: I64 }
+@ffi.struct(header: "time.h", name: "itimerspec")
+type Itimerspec { it_interval: Timespec, it_value: Timespec }
+@ffi.struct(header: "sys/uio.h", name: "iovec")
+type Iovec { iov_base: Ptr[U8], iov_len: U64 }
+@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I32, rem: I32 }
+
+@ffi("div", header: "stdlib.h")
+fn c_div(a: I32, b: I32) -> DivT ! () {}
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#
+}
+
+test "mirrors that match their C structs build and run in each mode" {
+    let dir = project(matching_mirrors())
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let cross_pm = blink_in(dir, "build --per-module --target x86_64-linux-gnu src/main.bl")
+    let cross_one = blink_in(dir, "build --no-per-module --target x86_64-linux-gnu src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), "3 1", "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), "3 1", "--no-per-module: {diag(one)}")
+    assert_eq(cross_pm.end, ChildEnd.Exited(0), "--target --per-module: {diag(cross_pm)}")
+    assert_eq(cross_one.end, ChildEnd.Exited(0), "--target --no-per-module: {diag(cross_one)}")
+}
+
+// The units spell Bool as C int, four bytes, and C's bool is one byte. Where the offsets and
+// the struct size still match, the units' own asserts pass, so the check must not report the
+// field's size either.
+fn bool_project() -> Str ! FS.Write, Process.Spawn {
+    let dir = project(#"@ffi.struct(header: "opts.h", name: "opts")
+type Opts { verbose: Bool, level: I32 }
+
+@ffi("opts", "opts_level", header: "opts.h")
+@trusted(audit: "T1")
+fn opts_level(o: Opts) -> I32 ! () {}
+
+fn main() {
+    io.println("{opts_level(Opts { verbose: true, level: 7 })}")
+}
+"#)
+    let _ = sh("mkdir -p {dir}/vendor")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nopts = \{ type = \"vendored\", path = \"vendor/opts.c\", headers = [\"opts.h\"] \}\n").unwrap()
+    fs.write("{dir}/vendor/opts.h", "#include <stdbool.h>\nstruct opts \{ bool verbose; int level; };\nint opts_level(struct opts o);\n").unwrap()
+    fs.write("{dir}/vendor/opts.c", "#include \"opts.h\"\nint opts_level(struct opts o) \{ return o.level; }\n").unwrap()
+    dir
+}
+
+test "a Bool field whose offset and struct size match is not reported" {
+    let dir = bool_project()
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), "7", "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), "7", "--no-per-module: {diag(one)}")
+}

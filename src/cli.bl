@@ -75,6 +75,7 @@ import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line, build_passed_check}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
 import foreign_decl_probe
+import ffi_layout_probe.{LayoutMismatch, layout_probe_of, layout_mismatches, layout_mismatch_text}
 import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, ffi_struct_names_in, spelling_probe_of, typedef_names, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
@@ -87,7 +88,7 @@ import diag_catalog.{diag_catalog_code}
 import diagnostics.{
     Diag, DiagEntry, diag_entries, diag_prepend, diag_fix_edits,
     diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
-    diag_source_file, diag_file_for_node, diag_error_no_loc, diag_format, diag_explain, diag_set_abort_status_line,
+    diag_source_file, diag_file_for_node, diag_error_no_loc, diag_ice_at, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, diag_register_source, json_escape,
     MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
     TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, GENERATED_C_DID_NOT_COMPILE,
@@ -2196,12 +2197,7 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
             ChildEnd.Exited(0) | ChildEnd.Exited(127) => { continue }
             _ => {}
         }
-        let machine = match process.run("cc", ["-dumpmachine"]) {
-            Ok(m) => m.out
-            Err(_) => ""
-        }
-        let triple = if target != "" { target } else { triple_of_machine(machine) }
-        errors = errors + report_verdicts(good, probe_verdicts(good, probe, r.err_out, "fc_probe.c"), triple)
+        errors = errors + report_verdicts(good, probe_verdicts(good, probe, r.err_out, "fc_probe.c"), target_triple_name(target))
     }
     let _ = build_fs.remove_tree(dir)
     if errors > 0 {
@@ -2214,24 +2210,29 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
 // §9.1.3: a mirror's `name` can be a struct tag or a typedef name in its header, and only the
 // target's C compiler can tell which. The program's units spell the original as a macro that
 // is `struct <name>` unless the build defines it first, so this asks the target's C compiler
-// and gives one `-D` flag for each name that is a typedef name and not a struct tag. A probe
-// that cannot run gives none, and the program's compile reports what is wrong.
-fn ffi_struct_defines(headers: List[ForeignHeader], target: Str, vendored: Str, output_path: Str) -> Str ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+// and gives one `-D` flag for each name that is a typedef name and not a struct tag. The same
+// compile checks each mirror's layout against its C struct, and a mismatch stops the build
+// before any unit compiles (report_ffi_struct_mismatches), with the code it answers. A probe
+// that cannot run gives no flag and no verdict, and the program's compile reports what is
+// wrong.
+fn ffi_struct_defines(headers: List[ForeignHeader], target: Str, vendored: Str, output_path: Str) -> Result[Str, Int] ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read, Diag.Report {
     let names = ffi_struct_names_in(headers)
-    if names.is_empty() { return "" }
+    if names.is_empty() { return Ok("") }
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" { out_dir = "." }
     build_fs.reap_dead(out_dir, [".fsprobe"])
     let dir = build_fs.private_dir(out_dir, ".fsprobe")
-    if dir == "" { return "" }
+    if dir == "" { return Ok("") }
     let mut header_names: List[Str] = []
     for fh in headers { header_names.push(fh.header) }
     let probe = spelling_probe_of(names, header_names)
+    let layout = layout_probe_of(headers, names, probe)
     let file_name = "ffi_struct_probe.c"
     let mut defines: List[Str] = []
-    if build_fs.write_or_report("{dir}/{file_name}", probe.text) {
+    let mut mismatches: List[LayoutMismatch] = []
+    if build_fs.write_or_report("{dir}/{file_name}", probe.text.concat(layout.text)) {
         // The unit compile also reads the stdlib archive's directory. Each mirror that is not
-        // a typedef name has an error, so the probe lifts clang's limit on them. The verdicts
+        // a typedef name has errors, so the probe lifts clang's limit on them. The verdicts
         // read English diagnostics.
         let incs = system_includes("-I{resolve_archive_dir()} {vendored}")
         let cmd = "LC_ALL=C {cc_command("-c{cc_error_limit_flag(target)} {dir}/{file_name} -o {dir}/ffi_struct_probe.o {incs}", 0, 0, target)}"
@@ -2240,6 +2241,7 @@ fn ffi_struct_defines(headers: List[ForeignHeader], target: Str, vendored: Str, 
                 match r.end {
                     ChildEnd.Exited(0) | ChildEnd.Exited(127) => {}
                     ChildEnd.Exited(_) => {
+                        mismatches = layout_mismatches(layout, probe, r.err_out, file_name)
                         for n in typedef_names(names, probe, r.err_out, file_name) { defines.push("-D{c_ffi_struct_macro(n)}={n}") }
                     }
                     _ => {}
@@ -2249,7 +2251,31 @@ fn ffi_struct_defines(headers: List[ForeignHeader], target: Str, vendored: Str, 
         }
     }
     let _ = build_fs.remove_tree(dir)
-    if defines.is_empty() { "" } else { " {defines.join(" ")}" }
+    if !mismatches.is_empty() { return Err(report_ffi_struct_mismatches(mismatches, target)) }
+    if defines.is_empty() { Ok("") } else { Ok(" {defines.join(" ")}") }
+}
+
+// The one report of a mirror that does not match its C struct (§9.1.3): one diagnostic at
+// each such `@ffi.struct`, then the build stops with the code this answers.
+fn report_ffi_struct_mismatches(mismatches: List[LayoutMismatch], target: Str) -> Int ! IO, Process.Spawn, Diag.Report {
+    let triple = target_triple_name(target)
+    for m in mismatches {
+        let (message, help) = layout_mismatch_text(m, triple)
+        diag_ice_at("GeneratedCDidNotCompile", GENERATED_C_DID_NOT_COMPILE, message, m.annotation, help)
+    }
+    diag_flush()
+    101
+}
+
+// The triple a report names: the target's, or for a native build the one the host's C
+// compiler names.
+fn target_triple_name(target: Str) -> Str ! Process.Spawn {
+    if target != "" { return target }
+    let machine = match process.run("cc", ["-dumpmachine"]) {
+        Ok(m) => m.out
+        Err(_) => ""
+    }
+    triple_of_machine(machine)
 }
 
 // The `-D` flags among include_flags. A define changes the object, so each object key holds
@@ -2355,7 +2381,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
             None => return 1
         }
         let inc_flags = match resolve_vendored_includes(used_deps, target) {
-            Some(f) => "{f}{ffi_struct_defines(compiled.headers, target, f, output_path)}"
+            Some(f) => match ffi_struct_defines(compiled.headers, target, f, output_path) {
+                Ok(d) => "{f}{d}"
+                Err(rc) => return rc
+            }
             None => return 1
         }
         let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive, test_build, compiled.ffi_note, link)
@@ -2393,7 +2422,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let target_inc_flags = "{inc_flags}{ffi_struct_defines(compiled.headers, triple, inc_flags, output_path)}"
+        let target_inc_flags = match ffi_struct_defines(compiled.headers, triple, inc_flags, output_path) {
+            Ok(d) => "{inc_flags}{d}"
+            Err(rc) => return rc
+        }
         let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, compiler_archive, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
@@ -3187,7 +3219,10 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
             None => return 1
         }
         let inc_flags = match resolve_vendored_includes(used_deps, target) {
-            Some(f) => "{f}{ffi_struct_defines(headers, target, f, output_path)}"
+            Some(f) => match ffi_struct_defines(headers, target, f, output_path) {
+                Ok(d) => "{f}{d}"
+                Err(rc) => return rc
+            }
             None => return 1
         }
         let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build, ffi_note, link)
@@ -3224,7 +3259,10 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let target_inc_flags = "{inc_flags}{ffi_struct_defines(headers, triple, inc_flags, output_path)}"
+        let target_inc_flags = match ffi_struct_defines(headers, triple, inc_flags, output_path) {
+            Ok(d) => "{inc_flags}{d}"
+            Err(rc) => return rc
+        }
         let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, ffi_note, link)
         if lrc != 0 {
             return lrc

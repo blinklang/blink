@@ -30,8 +30,8 @@ has two lines for each name: one that uses `struct <name>` and one that uses `<n
   compiles, the tag wins.
 - Only the typedef line compiles: the build adds `-DBLINK_FFI_STRUCT_<name>=<name>` to the
   compile of each unit.
-- No line compiles: the build keeps the default spelling, and the unit compile reports the
-  error.
+- No line compiles: the build keeps the default spelling. If the layout check covers the
+  mirror, the build stops and reports that the header declares no such name.
 
 The probe reads English diagnostics, so it runs with `LC_ALL=C`. Each tag name gives one error
 on its typedef line. clang, and so zig cc for each cross target, stops after 20 errors by
@@ -41,6 +41,40 @@ verdict and keeps the default spelling.
 
 The `-D` flags are part of the include flags. The object-cache keys of both build paths and the
 PCH key hash them, so an object compiled with one spelling is not used for the other.
+
+## The layout check
+
+The same probe file also checks the layout of each of the program's own mirrors
+(`src/ffi_layout_probe.bl`). For each mirror, the file defines a struct with the C layout that
+the units give the mirror: `struct blink_fs_m<k>`. A mirror held by value gets its own probe
+struct first. A `Ptr` field gets one pointer type. Then, for both spellings of the C name, the
+file has these lines:
+
+- for each field, one line that compiles only if the C struct has a member of that name, one
+  line that compares the offsets and one line that compares the sizes;
+- one line that compares the size of the struct.
+
+The size line of a `Bool` field is not in the file. The units spell `Bool` as C `int`, and C's
+`bool` is one byte, so that compare would report the units' spelling as an error of the
+mirror. `offsetof` refuses a bit-field, so the report of a bit-field member says that the C
+struct has no such field, or that the field is a bit-field.
+
+The spelling verdict picks the lines that the build reads. Each failed line maps back to the
+mirror, the field and what differs. The build reports one mismatch for each mirror, in this
+order: no name, then no field, then the first field with a different offset or size, then the
+struct size.
+
+When a mirror differs, the build stops before it compiles a unit. It reports GeneratedCDidNotCompile
+(I0017, exit 101) at the `@ffi.struct` line, with the mirror, the C struct, the target and the
+field (`report_ffi_struct_mismatches` in `src/cli.bl`). This is the one place that sets the
+name, the code and the exit.
+
+The check gives no verdict in these cases, and the units' own `_Static_assert` lines stay as
+the backstop:
+
+- the probe cannot spell a field as the units do;
+- the compile stopped at an error limit;
+- an error is in a header, or on a line of the file that is not a check line.
 
 ## Limits
 

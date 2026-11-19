@@ -1,0 +1,244 @@
+// The layout half of the `@ffi.struct` probe (§9.1.3).
+//
+// The build checks that each of the program's own mirrors has the size of the C struct it
+// names and that each field has C's offset and size. The program's units hold the same
+// checks as `_Static_assert`s, but their failure is a raw C error in a generated file. So the
+// spelling probe's file also holds, for each mirror, one struct with the mirror's C layout
+// and one line per check, for both spellings of the C name. The spelling verdict picks the
+// lines to read, and each failed line maps back to a mirror, a field and what differs. A
+// compile whose errors do not all map to check lines gives no verdict, and the units' own
+// asserts stay as the backstop.
+
+import parser.{get_annotation, get_str_named_arg, node_name}
+import typecheck.{TyKind, tc_decl_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots, tc_tid_decl_node, tc_tid_kind}
+import layout.{field_layout_of}
+import cname.{is_c_identifier}
+import foreign_const_probe.{ForeignHeader, SpellingProbe, probe_failed_lines, probe_has_foreign_error}
+
+// What differs between a mirror and its C struct, in the order the build reports them.
+pub type LayoutKind {
+    // The header declares the name as no struct tag and no typedef name.
+    NoName
+    // The C struct has no member of the field's name.
+    NoField
+    Offset
+    FieldSize
+    StructSize
+}
+
+// One of the program's own mirrors that the probe checks. `probe_struct` is the probe's
+// struct with the mirror's C layout; field `j` of it is `f<j>`.
+pub type LayoutMirror {
+    decl: Int
+    annotation: Int
+    c_name: Str
+    header: Str
+    name_index: Int
+    probe_struct: Str
+    fields: List[Str]
+    // False for a field whose size the probe does not compare.
+    size_checked: List[Bool]
+}
+
+// One probe line: it is an error when the check of `kind` fails for `field` (-1 for the
+// struct) of mirror `mirror`, with the C name spelled as a typedef name or as a tag.
+pub type LayoutCheck {
+    line: Int
+    mirror: Int
+    typedef_form: Bool
+    field: Int
+    kind: LayoutKind
+}
+
+pub type LayoutProbe {
+    text: Str
+    mirrors: List[LayoutMirror]
+    checks: List[LayoutCheck]
+    // The 1-based line of the layout text's first line.
+    first_line: Int
+}
+
+pub type LayoutMismatch {
+    decl: Int
+    annotation: Int
+    c_name: Str
+    header: Str
+    // The mirror's field, or "" for NoName and StructSize.
+    field: Str
+    kind: LayoutKind
+}
+
+// A pointer field has the size and alignment of every object pointer, so the probe gives it
+// one pointer type and needs no declaration of the pointee.
+fn probe_pointer() -> Str { "struct blink_fs_pointee*" }
+
+// The probe's spelling of a mirror field's C type, or "" when the probe cannot spell it as
+// the program's units do. A field that holds another mirror by value defines that mirror's
+// probe struct first.
+fn field_spelling(owner: Int, ftid: Int, mut defs: List[Str], mut done: List[Int], mut visiting: List[Int]) -> Str {
+    let r = tc_resolve(ftid)
+    let k = tc_tid_kind(r)
+    if k == TyKind.Ptr { return probe_pointer() }
+    if k == TyKind.Struct {
+        let d = tc_tid_decl_node(r)
+        if d == -1 || get_annotation(d, "ffi.struct") == -1 { return "" }
+        return define_mirror(d, defs, done, visiting)
+    }
+    let rec = field_layout_of(owner, ftid)
+    if rec.decline_reason != "" || rec.c_spelling.contains("*") || rec.c_spelling.starts_with("blink_") { return "" }
+    rec.c_spelling
+}
+
+// The probe struct of mirror `decl`, defined in `defs` after each mirror it holds by value,
+// or "" when one of its fields has no probe spelling. `done` holds the defined mirrors; the
+// probe struct of `done[k]` is blink_fs_m<k>.
+fn define_mirror(decl: Int, mut defs: List[Str], mut done: List[Int], mut visiting: List[Int]) -> Str {
+    let k = done.index_of(decl) ?? -1
+    if k >= 0 { return "struct blink_fs_m{k}" }
+    if visiting.contains(decl) { return "" }
+    visiting.push(decl)
+    let owner = tc_decl_tid(decl)
+    if owner < 0 { return "" }
+    let mut members: List[Str] = []
+    for slot in tc_struct_field_slots(owner) {
+        let t = field_spelling(owner, tc_sfield_tid(slot), defs, done, visiting)
+        if t == "" { return "" }
+        members.push("{t} f{members.len()};")
+    }
+    if members.is_empty() { return "" }
+    let at = done.len()
+    done.push(decl)
+    defs.push("struct blink_fs_m{at} \{ {members.join(" ")} };")
+    "struct blink_fs_m{at}"
+}
+
+// The program's own mirrors that the probe can check, with the probe structs they need.
+fn layout_mirrors(headers: List[ForeignHeader], names: List[Str], mut defs: List[Str]) -> List[LayoutMirror] {
+    let mut done: List[Int] = []
+    let mut out: List[LayoutMirror] = []
+    let mut seen: List[Int] = []
+    for fh in headers {
+        if get_annotation(fh.decl, "ffi.struct") != fh.annotation || seen.contains(fh.decl) { continue }
+        seen.push(fh.decl)
+        let n = get_str_named_arg(fh.annotation, "name")
+        let name_index = names.index_of(n) ?? -1
+        if !is_c_identifier(n) || name_index < 0 { continue }
+        let m = define_mirror(fh.decl, defs, done, [])
+        if m == "" { continue }
+        let mut fields: List[Str] = []
+        let mut size_checked: List[Bool] = []
+        for slot in tc_struct_field_slots(tc_decl_tid(fh.decl)) {
+            fields.push(tc_sfield_name(slot))
+            // The units spell Bool as C int and C's bool is one byte, so a size compare would
+            // blame the mirror for the units' spelling. Its offset and the struct size are
+            // still checked, as the units' own asserts do.
+            size_checked.push(tc_tid_kind(tc_resolve(tc_sfield_tid(slot))) != TyKind.Bool)
+        }
+        out.push(LayoutMirror { decl: fh.decl, annotation: fh.annotation, c_name: n, header: fh.header, name_index: name_index, probe_struct: m, fields: fields, size_checked: size_checked })
+    }
+    out
+}
+
+// The layout text, which follows the spelling probe's text in the same file. `names` are
+// the names the spelling probe holds, in its order.
+pub fn layout_probe_of(headers: List[ForeignHeader], names: List[Str], spelling: SpellingProbe) -> LayoutProbe {
+    let mut text: List[Str] = ["#include <stddef.h>", "#include <stdbool.h>"]
+    let mirrors = layout_mirrors(headers, names, text)
+    let first_line = spelling.first_line + 2 * names.len()
+    let mut checks: List[LayoutCheck] = []
+    let mut mi = 0
+    for m in mirrors {
+        for typedef_form in [false, true] {
+            let orig = if typedef_form { m.c_name } else { "struct {m.c_name}" }
+            let form = if typedef_form { "t" } else { "s" }
+            let mut j = 0
+            for cf in m.fields {
+                checks.push(LayoutCheck { line: first_line + text.len(), mirror: mi, typedef_form: typedef_form, field: j, kind: LayoutKind.NoField })
+                text.push("enum \{ blink_fs_has_{mi}{form}{j} = offsetof({orig}, {cf}) };")
+                checks.push(LayoutCheck { line: first_line + text.len(), mirror: mi, typedef_form: typedef_form, field: j, kind: LayoutKind.Offset })
+                text.push("_Static_assert(offsetof({orig}, {cf}) == offsetof({m.probe_struct}, f{j}), \"\");")
+                if m.size_checked.get(j) ?? true {
+                    checks.push(LayoutCheck { line: first_line + text.len(), mirror: mi, typedef_form: typedef_form, field: j, kind: LayoutKind.FieldSize })
+                    text.push("_Static_assert(sizeof((({orig}*)0)->{cf}) == sizeof((({m.probe_struct}*)0)->f{j}), \"\");")
+                }
+                j = j + 1
+            }
+            checks.push(LayoutCheck { line: first_line + text.len(), mirror: mi, typedef_form: typedef_form, field: -1, kind: LayoutKind.StructSize })
+            text.push("_Static_assert(sizeof({orig}) == sizeof({m.probe_struct}), \"\");")
+        }
+        mi = mi + 1
+    }
+    LayoutProbe { text: text.join("\n").concat("\n"), mirrors: mirrors, checks: checks, first_line: first_line }
+}
+
+// Reads the probe compile's errors: one mismatch for each mirror that differs from its C
+// struct, the first in LayoutKind order and then in field order. An error that is not on a
+// check line of the probe file means the compile failed for another cause, so it answers
+// none, as a compile that stopped at an error limit does.
+pub fn layout_mismatches(lp: LayoutProbe, spelling: SpellingProbe, cc_err: Str, file_name: Str) -> List[LayoutMismatch] {
+    let mut out: List[LayoutMismatch] = []
+    if lp.mirrors.is_empty() || cc_err.contains("too many errors") || probe_has_foreign_error(cc_err, file_name) { return out }
+    let failed = probe_failed_lines(cc_err, file_name)
+    let mut check_lines: List[Int] = []
+    for c in lp.checks { check_lines.push(c.line) }
+    for line in failed {
+        if line >= lp.first_line && !check_lines.contains(line) { return out }
+    }
+    let mut mi = 0
+    for m in lp.mirrors {
+        let tag_line = spelling.first_line + 2 * m.name_index
+        let tag_ok = !failed.contains(tag_line)
+        if !tag_ok && failed.contains(tag_line + 1) {
+            out.push(mismatch_of(m, -1, LayoutKind.NoName))
+        } else {
+            let hit = first_failed_check(lp.checks, failed, mi, !tag_ok)
+            if hit.line > 0 { out.push(mismatch_of(m, hit.field, hit.kind)) }
+        }
+        mi = mi + 1
+    }
+    out
+}
+
+fn mismatch_of(m: LayoutMirror, field: Int, kind: LayoutKind) -> LayoutMismatch {
+    let f = if field < 0 { "" } else { m.fields.get(field) ?? "" }
+    LayoutMismatch { decl: m.decl, annotation: m.annotation, c_name: m.c_name, header: m.header, field: f, kind: kind }
+}
+
+fn kind_rank(k: LayoutKind) -> Int {
+    match k {
+        LayoutKind.NoName => 0
+        LayoutKind.NoField => 1
+        LayoutKind.Offset | LayoutKind.FieldSize => 2
+        LayoutKind.StructSize => 3
+    }
+}
+
+// The failed check of mirror `mi` in the spelling `typedef_form` to report, or one with line 0.
+fn first_failed_check(checks: List[LayoutCheck], failed: List[Int], mi: Int, typedef_form: Bool) -> LayoutCheck {
+    let none = LayoutCheck { line: 0, mirror: mi, typedef_form: typedef_form, field: -1, kind: LayoutKind.StructSize }
+    for rank in [1, 2, 3] {
+        for c in checks {
+            if c.mirror == mi && c.typedef_form == typedef_form && kind_rank(c.kind) == rank && failed.contains(c.line) { return c }
+        }
+    }
+    none
+}
+
+// The message and help of a mismatch's report. `triple` names the target whose C headers
+// differ.
+pub fn layout_mismatch_text(m: LayoutMismatch, triple: Str) -> (Str, Str) {
+    let label = node_name(m.decl)
+    let c = "C struct `{m.c_name}`"
+    let message = match m.kind {
+        LayoutKind.NoName => "`@ffi.struct` `{label}` names `{m.c_name}`, but `{m.header}` declares no complete struct tag and no complete typedef name `{m.c_name}` on {triple}"
+        LayoutKind.NoField => "`@ffi.struct` `{label}` does not match {c} on {triple}: {c} has no field `{m.field}`, or `{m.field}` is a bit-field"
+        LayoutKind.Offset => "`@ffi.struct` `{label}` does not match {c} on {triple}: field `{m.field}` is at a different offset"
+        LayoutKind.FieldSize => "`@ffi.struct` `{label}` does not match {c} on {triple}: field `{m.field}` has a different size"
+        LayoutKind.StructSize => "`@ffi.struct` `{label}` does not match {c} on {triple}: the struct has a different size"
+    }
+    let help = match m.kind {
+        LayoutKind.NoName => "check the spelling of `name:`, and that `{m.header}` declares it with its fields on this target; a C type with no visible fields is an `@ffi.opaque`"
+        _ => "give `{label}` the fields of {c} in `{m.header}`, in its order and with types of its sizes"
+    }
+    (message, help)
+}
