@@ -1,0 +1,170 @@
+// A handler clause shares each binding it captures, the same as a closure: a `let mut` or a
+// `mut` parameter that a clause reads or writes is one cell, so the clause, the handled body and
+// the code after the `with` all see each write.
+
+import compile_test_helpers
+
+fn shared_src() -> Str {
+    #"
+effect Counter { effect Tick { fn tick() -> Int } }
+
+fn use_it() -> Int ! Counter.Tick { counter.tick() }
+
+// A parameter is never assigned (E0612), but a `mut` one is the root of a mutating call.
+fn from_param(mut b: Bytes) -> Int {
+    with handler Counter { fn tick() -> Int {
+        b.push(7)
+        b.len()
+    } } {
+        let _ = use_it()
+        let _ = use_it()
+    }
+    b.push(1)
+    b.len()
+}
+
+fn main() {
+    let mut n = 0
+    with handler Counter { fn tick() -> Int {
+        n = n + 1
+        n
+    } } { io.println("write: {use_it()} {use_it()} {n}") }
+    io.println("write after: {n}")
+
+    let mut r = 0
+    with handler Counter { fn tick() -> Int { r * 10 } } {
+        r = 3
+        let a = use_it()
+        r = 4
+        io.println("read: {a} {use_it()}")
+    }
+
+    let mut v = 0
+    let h = handler Counter { fn tick() -> Int {
+        v = v + 7
+        v
+    } }
+    with h { let _ = use_it() }
+    with h { let _ = use_it() }
+    io.println("let-bound: {v}")
+
+    let mut c = 0
+    with handler Counter { fn tick() -> Int {
+        let bump = fn() { c = c + 2 }
+        bump()
+        bump()
+        c
+    } } { let _ = use_it() }
+    io.println("nested closure: {c}")
+
+    let mut bytes = Bytes.new()
+    bytes.push(0)
+    io.println("mut param: {from_param(bytes)}")
+
+    let mut asked: List[Str] = []
+    let mut calls = 0
+    with handler Env { fn var(name: Str) -> Option[Str] {
+        asked.push(name)
+        calls = calls + 1
+        None
+    } } {
+        let _ = env.var("A")
+        let _ = env.var("B")
+    }
+    io.println("env clause: {asked.len()} {calls}")
+}
+"#
+}
+
+fn expect_shared_output(out: Str) {
+    assert(out.contains("write: 1 2 2\n"))
+    assert(out.contains("write after: 2\n"))
+    assert(out.contains("read: 30 40\n"))
+    assert(out.contains("let-bound: 14\n"))
+    assert(out.contains("nested closure: 4\n"))
+    assert(out.contains("mut param: 4\n"))
+    assert(out.contains("env clause: 2 2\n"))
+}
+
+test "a handler clause shares each captured let mut with the body and the code after" {
+    let r = compile_test_helpers.compile_and_run(shared_src(), "handler_clause_shared_mut")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    if !r.out.contains("env clause: 2 2\n") { io.eprintln(r.out) }
+    expect_shared_output(r.out)
+}
+
+test "a handler clause shares each captured let mut under --per-module" {
+    let r = compile_test_helpers.run_via_cli(shared_src(), "handler_clause_shared_mut_per_module", "--per-module")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    if !r.out.contains("env clause: 2 2\n") { io.eprintln(r.out) }
+    expect_shared_output(r.out)
+}
+
+// The handler's frame is the arena block's, so the cell must outlive the block.
+test "a clause write in a with arena block is seen after the block" {
+    let src = #"
+effect Counter { effect Tick { fn tick() -> Int } }
+
+fn use_it() -> Int ! Counter.Tick { counter.tick() }
+
+fn main() {
+    let mut n = 0
+    with arena {
+        let mut names: List[Str] = []
+        with handler Counter { fn tick() -> Int {
+            n = n + 1
+            names.push("t{n}")
+            n
+        } } {
+            let _ = use_it()
+            let _ = use_it()
+        }
+        io.println("inside: {names.len()}")
+    }
+    io.println("after arena: {n}")
+}
+"#
+    let r = compile_test_helpers.compile_and_run(src, "handler_clause_shared_mut_arena")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    if !r.out.contains("after arena: 2\n") { io.eprintln(r.out) }
+    assert(r.out.contains("inside: 2\n"))
+    assert(r.out.contains("after arena: 2\n"))
+}
+
+// A closure's write before a panic stays after assert_panics catches it, so a clause's write
+// stays too. No closure in this test reads `n`, so only the clause makes it shared.
+fn panic_src() -> Str {
+    #"
+effect Counter { effect Tick { fn tick() -> Int } }
+
+fn use_it() -> Int ! Counter.Tick { counter.tick() }
+
+test "a clause write before a panic stays after assert_panics" {
+    let mut n = 0
+    assert_panics(matching: "boom") {
+        with handler Counter { fn tick() -> Int {
+            n = n + 1
+            n
+        } } {
+            let _ = use_it()
+            let _ = use_it()
+            panic("boom")
+        }
+    }
+    assert_eq(n, 2)
+}
+"#
+}
+
+test "a clause write before a panic stays after assert_panics, as a closure write does" {
+    let path = "{compile_test_helpers.scratch_root()}/_handler_clause_shared_mut_panic.bl"
+    fs.write(path, panic_src()).unwrap()
+    let r = process.run("build/blink", ["test", path]).unwrap()
+    let _ = fs.delete(path)
+    let all = r.out.concat(r.err_out)
+    if !r.out.contains("1 passed, 0 failed") { io.eprintln(all) }
+    assert(r.out.contains("1 passed, 0 failed"))
+}
