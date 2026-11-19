@@ -3249,7 +3249,7 @@ error[VariantArgumentCount]: variant `Ok` takes 1 argument, got 0
   note: fields of `Ok`, in order: T
 error[VariantArgumentCount]: variant `Some` takes 1 argument, got 0
   note: fields of `Some`, in order: T
-error[VariantArgumentCount]: variant `Shape.Dot` takes no arguments, got 1
+error[VariantArgumentCount]: variant `Dot` takes no arguments, got 1
   help: remove the parentheses
 ```
 

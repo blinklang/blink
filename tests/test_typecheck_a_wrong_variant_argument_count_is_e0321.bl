@@ -1,0 +1,219 @@
+// A wrong number of arguments in a variant paren payload is VariantArgumentCount (E0321), for
+// Some, Ok, Err, None and user variants alike (sections/03_types.md §3.4 *The payload form of a
+// construction*). `Ok` takes one argument, so `Ok()` is a count error at once, before 1.0
+// (sections/06_tooling.md §8.16.1 *Rollout of a new error*). Each test is one example of those
+// two sections.
+
+import std.fs
+import std.process.{ProcessResult, ChildEnd}
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import compile_test_helpers.{check_via_cli, scratch_root}
+import lexer.{Lex}
+import parser.{Parse}
+
+fn typecheck_probe(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+    }
+}
+
+// Each error as "name line:col: message | help | fix | notes", in report order. The fix reads
+// "action `text` at line:col-line:col", or "-" when there is none.
+fn errors_of(src: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_a_wrong_variant_argument_count_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            let fix = if d.fix_action == "" { "-" } else { "{d.fix_action} `{d.fix_text}` at {d.fix_line}:{d.fix_col}-{d.fix_end_line}:{d.fix_end_col}" }
+            out.push("{d.name} {d.line}:{d.col}: {d.message} | {d.help} | {fix} | {d.notes.join("; ")}")
+        }
+    }
+    out
+}
+
+// The one error a source gets, or every error when it gets another count, so a failed assert
+// shows them.
+fn only_error(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    let got = errors_of(src)
+    if got.len() != 1 { return "{got.len()} errors: {got.join(" || ")}" }
+    got.get(0).unwrap()
+}
+
+fn no_errors(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+let FIGURE = "type Figure \{ Circle(radius: Float, tag: Int) }\n"
+let SHAPE = "type Shape \{ Sq(Float, Float), Dot }\n"
+let CIRCLE_NOTE = "fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int)"
+
+// §3.4: positions, labels, and positions then labels all fill the payload.
+test "a payload that fills each field once by position, by label, or both is not a count error" {
+    let src = "{FIGURE}fn main() \{\n    let a = Figure.Circle(1.0, 2)\n    let b = Figure.Circle(1.5, tag: 2)\n    let c = Figure.Circle(tag: 2, radius: 1.5)\n    let _ = (a, b, c)\n}\n"
+    assert_eq(no_errors(src), "")
+}
+
+// §3.4: a payload with a label takes the field rules in place of the count.
+test "a labelled payload reports DuplicateField and MissingField, not a count" {
+    let src = "{FIGURE}fn main() \{\n    let d = Figure.Circle(1.0, radius: 2.0)\n    let _ = d\n}\n"
+    let got = errors_of(src)
+    assert_eq(got.len(), 2)
+    assert_eq(got.get(0).unwrap(), "DuplicateField 3:32: field `radius` is given twice | remove one of the two | - | argument 1 filled `radius`: 3:27")
+    assert_eq(got.get(1).unwrap(), "MissingField 3:13: `Figure.Circle` is missing field `tag` (Int) | add `tag: ` and a value | - | {CIRCLE_NOTE}")
+}
+
+// §3.4: a positional argument after a label is E0527, and no count error follows.
+test "a positional argument after a label is PositionalAfterKeyword and not a count" {
+    let src = "{FIGURE}fn main() \{\n    let e = Figure.Circle(tag: 2, 1.0)\n    let _ = e\n}\n"
+    assert_eq(only_error(src), "PositionalAfterKeyword 3:35: a payload cannot write a positional argument after a labelled one | label every argument, or write the positional arguments first | - | `tag:` is the first label")
+}
+
+// §3.4: the spec example `Figure.Circle(1.0)`.
+test "too few positional arguments to a user variant is E0321 with the fields note" {
+    let src = "{FIGURE}fn main() \{\n    let f = Figure.Circle(1.0)\n    let _ = f\n}\n"
+    assert_eq(only_error(src), "VariantArgumentCount 3:13: variant `Circle` takes 2 arguments, got 1 |  | - | {CIRCLE_NOTE}")
+}
+
+test "too many positional arguments to a user variant is E0321" {
+    let src = "{FIGURE}fn main() \{\n    let f = Figure.Circle(1.0, 2, 3)\n    let _ = f\n}\n"
+    assert_eq(only_error(src), "VariantArgumentCount 3:13: variant `Circle` takes 2 arguments, got 3 |  | - | fields of `Figure.Circle`, in order: radius (Float) (given), tag (Int) (given)")
+}
+
+// §3.4: more positional arguments than fields keeps the count, label or not.
+test "more positional arguments than fields is E0321 even with a label" {
+    let src = "{FIGURE}fn main() \{\n    let f = Figure.Circle(1.0, 2, 3, tag: 4)\n    let _ = f\n}\n"
+    let got = errors_of(src)
+    assert(got.len() >= 1, "no error")
+    assert(got.get(0).unwrap().starts_with("VariantArgumentCount 3:13: variant `Circle` takes 2 arguments, got 4 | "), got.join(" || "))
+}
+
+test "a wrong count on a variant with unnamed fields is E0321 with the fields note" {
+    let src = "{SHAPE}fn main() \{\n    let s = Shape.Sq(1.0)\n    let _ = s\n}\n"
+    assert_eq(only_error(src), "VariantArgumentCount 3:13: variant `Sq` takes 2 arguments, got 1 |  | - | fields of `Shape.Sq`, in order: Float (given), Float")
+}
+
+// §3.4: a variant with no payload says it takes no arguments, has no note, and the help removes
+// the parentheses.
+test "an argument to None is E0321: it takes no arguments" {
+    let src = "fn e() -> Option[Int] \{ None(1) }\nfn main() \{ let _ = e() }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 1:25: variant `None` takes no arguments, got 1 | remove the parentheses | - | ")
+}
+
+test "the spec example Shape.Dot(1.0) is E0321: it takes no arguments" {
+    let src = "{SHAPE}fn d() -> Shape \{ Shape.Dot(1.0) }\nfn main() \{ let _ = d() }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 2:19: variant `Dot` takes no arguments, got 1 | remove the parentheses | - | ")
+}
+
+// §3.4: `Ok(())` and `Some(1)` are the forms that build.
+// §3.4: the bare head takes the rule of the qualified one.
+test "a bare variant with no payload and empty parens is E0321: it takes no arguments" {
+    let color = "type Color \{ Red, Green }\nfn main() \{\n    let c: Color = Red()\n    let _ = c\n}\n"
+    assert_eq(only_error(color), "VariantArgumentCount 3:23: variant `Red` takes no arguments | remove the parentheses | - | ")
+    let mode = "type Mode \{ Ok, Bad(Int) }\nfn main() \{\n    let m: Mode = Ok()\n    let _ = m\n}\n"
+    assert_eq(only_error(mode), "VariantArgumentCount 3:21: variant `Ok` takes no arguments | remove the parentheses | - | ")
+}
+
+test "the unit success Ok(()) and Some(1) are not count errors" {
+    let src = "fn done() -> Result[(), Str] \{ Ok(()) }\nfn one() -> Option[Int] \{ Some(1) }\nfn main() \{ let _ = (done(), one()) }\n"
+    assert_eq(no_errors(src), "")
+}
+
+// §3.4 and §8.16.1: `Ok()` at the success type `()` is an error at once, with the machine fix.
+test "Ok() returned at Result[(), Str] is E0321 with the fix Ok(())" {
+    let src = "fn a() -> Result[(), Str] \{ Ok() }\nfn main() \{ let _ = a() }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 1:29: variant `Ok` takes 1 argument, got 0 | write `Ok(())` | write `Ok(())` `Ok(())` at 1:29-1:33 | fields of `Ok`, in order: T")
+}
+
+test "Ok() at a let annotated Result[(), Str] is E0321 with the fix Ok(())" {
+    let src = "fn main() \{\n    let r: Result[(), Str] = Ok()\n    let _ = r\n}\n"
+    assert_eq(only_error(src), "VariantArgumentCount 2:30: variant `Ok` takes 1 argument, got 0 | write `Ok(())` | write `Ok(())` `Ok(())` at 2:30-2:34 | fields of `Ok`, in order: T")
+}
+
+test "Result.Ok() at the success type () is E0321 with the fix Result.Ok(())" {
+    let src = "fn main() \{\n    let r: Result[(), Str] = Result.Ok()\n    let _ = r\n}\n"
+    assert_eq(only_error(src), "VariantArgumentCount 2:30: variant `Ok` takes 1 argument, got 0 | write `Result.Ok(())` | write `Result.Ok(())` `Result.Ok(())` at 2:30-2:41 | fields of `Ok`, in order: T")
+}
+
+// The fix rewrites the call, not the parens that wrap it.
+test "Ok() in parens gets a fix that keeps the parens" {
+    let src = "fn a() -> Result[(), Str] \{ ( (Ok() ) ) }\nfn main() \{ let _ = a() }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 1:32: variant `Ok` takes 1 argument, got 0 | write `Ok(())` | write `Ok(())` `Ok(())` at 1:32-1:36 | fields of `Ok`, in order: T")
+}
+
+// Through an alias, the alias names the success type, not the place.
+test "Ok() through an alias of Result[(), Str] gets the fix, and through one of Result[Int, Str] gets none" {
+    let aliases = "type RU = Result[(), Str]\ntype RI = Result[Int, Str]\n"
+    let unit = "{aliases}fn main() \{\n    let a = RU.Ok()\n    let _ = a\n}\n"
+    assert_eq(only_error(unit), "VariantArgumentCount 4:13: variant `Ok` takes 1 argument, got 0 | write `RU.Ok(())` | write `RU.Ok(())` `RU.Ok(())` at 4:13-4:20 | fields of `Ok`, in order: T")
+    let int = "{aliases}fn main() \{\n    let b: RU = RI.Ok()\n    let _ = b\n}\n"
+    assert(only_error(int).contains("variant `Ok` takes 1 argument, got 0 | "), only_error(int))
+    assert(only_error(int).contains(" | - | "), only_error(int))
+}
+
+// §3.4 and §8.16.1: `Ok()` at any other success type has no meaning, so it has no fix.
+test "Ok() at Result[Int, Str] is E0321 with no fix" {
+    let src = "fn b() -> Result[Int, Str] \{ Ok() }\nfn main() \{ let _ = b() }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 1:30: variant `Ok` takes 1 argument, got 0 |  | - | fields of `Ok`, in order: T")
+}
+
+test "Some() is E0321 with the fields note" {
+    let src = "fn c() -> Option[Int] \{ Some() }\nfn main() \{ let _ = c() }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 1:25: variant `Some` takes 1 argument, got 0 |  | - | fields of `Some`, in order: T")
+}
+
+test "Err with two arguments is E0321 with the fields note" {
+    let src = "fn j() -> Result[Int, Str] \{ Err(\"a\", \"b\") }\nfn main() \{ let _ = j() }\n"
+    assert_eq(only_error(src), "VariantArgumentCount 1:30: variant `Err` takes 1 argument, got 2 |  | - | fields of `Err`, in order: E (given)")
+}
+
+// §3.4: a rejected term gives no type to infer from.
+test "let r = Ok() is E0321 only, not CannotInferType" {
+    let src = "fn main() \{\n    let r = Ok()\n    let _ = r\n}\n"
+    assert_eq(only_error(src), "VariantArgumentCount 2:13: variant `Ok` takes 1 argument, got 0 |  | - | fields of `Ok`, in order: T")
+}
+
+// §8.16.1: the three lines of the before-1.0 example, through the CLI, with the fix as JSON.
+test "the rollout example: Ok(()) builds, Ok() at () is an error with the fix, Ok() at Int has none" {
+    let src = "fn ok_now() -> Result[(), Str] \{ Ok(()) }\nfn breaks() -> Result[(), Str] \{ Ok() }\nfn never() -> Result[Int, Str] \{ Ok() }\nfn main() \{ let _ = (ok_now(), breaks(), never()) }\n"
+    let out = check_via_cli(src, "variant_count_rollout_{getpid()}")
+    let mut errs: List[Str] = []
+    for line in out.split("\n") {
+        if line.contains("\"severity\":\"error\"") { errs.push(line) }
+    }
+    assert_eq(errs.len(), 2)
+    let breaks = errs.get(0).unwrap()
+    assert(breaks.contains("\"name\":\"VariantArgumentCount\",\"code\":\"E0321\""), breaks)
+    assert(breaks.contains("\"line\":2"), breaks)
+    assert(breaks.contains("\"fix\":\{\"action\":\"write `Ok(())`\""), breaks)
+    let never = errs.get(1).unwrap()
+    assert(never.contains("\"name\":\"VariantArgumentCount\",\"code\":\"E0321\""), never)
+    assert(never.contains("\"line\":3"), never)
+    assert(!never.contains("\"fix\":"), never)
+}
+
+let DIR = "{scratch_root()}/variant_count_fix"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// §8.16.1: blink fix writes Ok(()), and the fixed file checks.
+test "blink fix rewrites Ok() at the success type () to Ok(()) and leaves the file clean" {
+    let _mk = sh("rm -rf {DIR} && mkdir -p {DIR}")
+    fs.write("{DIR}/main.bl", "fn breaks() -> Result[(), Str] \{ Ok() }\nfn main() \{ let _ = breaks() }\n").unwrap()
+    let env_of = "env -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_PER_MODULE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE"
+    let _fix = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} timeout 120 $B fix main.bl < /dev/null")
+    let fixed = fs.read("{DIR}/main.bl").unwrap()
+    let check = sh("B=$(pwd)/build/blink; cd {DIR} && {env_of} timeout 120 $B check main.bl < /dev/null")
+    let _rm = sh("rm -rf {DIR}")
+    assert_eq(fixed, "fn breaks() -> Result[(), Str] \{ Ok(()) }\nfn main() \{ let _ = breaks() }\n")
+    assert_eq(check.end, ChildEnd.Exited(0))
+}

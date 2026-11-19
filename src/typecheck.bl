@@ -70,7 +70,7 @@ import diagnostics.{
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
     NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, RESERVED_EFFECT_NAME, HANDLER_CLAUSE_MISMATCH, UNKNOWN_HANDLER_OP, DUPLICATE_HANDLER_CLAUSE, NOT_DERIVABLE,
-    NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, PATTERN_MISSING_REST, MIXED_VARIANT_FIELDS, diag_set_last_assist_at,
+    NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, PATTERN_MISSING_REST, MIXED_VARIANT_FIELDS, VARIANT_ARGUMENT_COUNT, diag_set_last_assist_at,
     INT_LITERAL_OUT_OF_RANGE, diag_has_error_at,
     OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
     POSITIONAL_AFTER_KEYWORD, DUPLICATE_KEYWORD_ARG, UNLABELED_KEYWORD_ARG,
@@ -28064,13 +28064,11 @@ pub fn tc_qualified_carrier(qualifier: Str, variant: Str) -> Option[TyKind] {
 // A carrier variant called through an alias, as `OI.Some(1)`. The alias's target is the value's
 // type, so the payload is held to the slot the target gives it.
 fn tc_alias_carrier_call_tid(head: Int, spelled: Str, variant: Str, args_sl: Int, node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
-    if !tc_check_carrier_payload(variant, args_sl, node) { return tc_error_recovery_tid() }
+    if !tc_check_carrier_payload(variant, args_sl, head, node) { return tc_error_recovery_tid() }
     let h = ty_pool.get(tc_resolve(head)).unwrap()
     let slot = if variant == "Err" { h.inner2 } else { h.inner1 }
     if args_sl != -1 && sublist_length(args_sl) == 1 {
         check_arg_value(spelled, 0, slot, sublist_get(args_sl, 0), false)
-    } else if variant == "Ok" && tc_unify(slot, TYPE_VOID) == 0 {
-        tc_report_declared_mismatch("{spelled}: expected {type_to_str(slot)} but got ()", node, node, slot, TYPE_VOID)
     }
     tc_note_open_value(node, head)
 }
@@ -28079,9 +28077,7 @@ fn tc_alias_carrier_call_tid(head: Int, spelled: Str, variant: Str, args_sl: Int
 // Only None is a value on its own. `spelled` is the name as written.
 fn tc_carrier_nullary_tid(variant: Str, spelled: Str, node: Int) -> Int ! TypeCheck.Report, Diag.Report {
     if variant == "None" { return tc_note_open_value(node, make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1))) }
-    let (fewest, most) = tc_carrier_arity(variant)
-    let want = if fewest == most { "{most}" } else { "{fewest} or {most}" }
-    tc_report_payload_variant_value(variant, want, "fn(x) \{ {spelled}(x) \}", node)
+    tc_report_payload_variant_value(variant, "{tc_carrier_field_count(variant)}", "fn(x) \{ {spelled}(x) \}", node)
 }
 
 // A declared variant named with no argument list. One with a payload is no value on its own;
@@ -28115,43 +28111,64 @@ fn tc_report_payload_variant_value(variant: Str, want: Str, closure: Str, node: 
     tc_error_recovery_tid()
 }
 
-// The fewest and most arguments each carrier constructor takes. `Ok()` is `Ok(())`, so `Ok`
-// takes none only where its payload may be unit.
-fn tc_carrier_arity(variant: Str) -> (Int, Int) {
-    match variant {
-        "None" => (0, 0)
-        "Ok" => if tc_ok_payload_may_be_unit() { (0, 1) } else { (1, 1) }
-        _ => (1, 1)
-    }
+// The number of fields of a carrier variant. `Ok` takes one at every success type, `()`
+// included (§3.4).
+fn tc_carrier_field_count(variant: Str) -> Int {
+    if variant == "None" { 0 } else { 1 }
 }
 
-// Whether the expected type leaves `Ok`'s payload free to be unit: it names no payload, or
-// names unit. A payload it names fixes the count even while the error side is still open, so
-// `r = Ok()` with `r` inferred from `Ok(5)` is the arity error. A callee's own type parameter
-// names nothing at this site, so the call may still solve it to unit.
-fn tc_ok_payload_may_be_unit() -> Bool {
-    if tc_construct_hint < 0 { return true }
-    let h = resolve_alias_tid(tc_construct_hint)
-    if h < 0 || h >= ty_pool.len() { return true }
+// The fields note of a carrier count error. The spec names a carrier's field by the type
+// parameter it holds.
+fn tc_carrier_fields_note(variant: Str, positional: Int, labels: List[Int]) -> List[Str] {
+    if variant == "None" { return [] }
+    let field = if variant == "Err" { "E" } else { "T" }
+    ["fields of `{variant}`, in order: {tc_mark_given([field], [""], positional, labels).join(", ")}"]
+}
+
+// Whether `carrier` sets `Ok`'s success type to `()`. Only there does `Ok()` mean `Ok(())`,
+// so only there does the count error get that fix.
+fn tc_ok_success_is_unit(carrier: Int) -> Bool {
+    if carrier < 0 { return false }
+    let h = resolve_alias_tid(carrier)
+    if h < 0 || h >= ty_pool.len() { return false }
     let e = ty_pool.get(h).unwrap()
-    if e.kind != TyKind.Result || e.inner1 < 0 { return true }
-    let payload = tc_resolve(e.inner1)
-    if tc_tid_is_no_info(payload) != 0 || tc_is_unbound_metavar(payload) != 0 { return true }
-    if tc_tid_has_foreign_typevar(payload) != 0 { return true }
-    type_kind(resolve_alias_tid(payload)) == TyKind.Void
+    if e.kind != TyKind.Result || e.inner1 < 0 { return false }
+    type_kind(resolve_alias_tid(tc_resolve(e.inner1))) == TyKind.Void
+}
+
+// §3.4 and §8.16.1: `Ok()` where the success type is `()`, with the machine fix that writes
+// `Ok(())` after the head as the site writes it.
+// The span runs from the head to the `)` of this call, not the written span, which takes in
+// parens that wrap the call.
+fn tc_report_ok_no_argument(node: Int) ! TypeCheck.Report, Diag.Report {
+    let open = tc_open_col_after_head(node, 40)
+    let close = if open == -1 { -1 } else { tc_byte_col_from(node, open + 1, 41) }
+    let line = node_line(node)
+    let col = node_col(node)
+    let head = if close == -1 { "" } else { tc_source_text(diag_file_for_node(node), line, col, line, open) }
+    let fixed = if head == "" { "Ok(())" } else { "{head}(())" }
+    let msg = "variant `Ok` takes 1 argument, got 0"
+    tc_errors.push(msg)
+    diag_error_at_notes("VariantArgumentCount", VARIANT_ARGUMENT_COUNT, msg, node, "write `{fixed}`", tc_carrier_fields_note("Ok", 0, []))
+    if head != "" { diag_set_last_fix_at("write `{fixed}`", fixed, line, col, line, close + 1) }
 }
 
 // A carrier's fields have no names, so its payload takes the rules of a user variant declared
 // with unnamed fields (§3.4). Answers whether the payload can type the carrier's slot: a
 // label fills no slot, so its value is inferred for its own errors and checked against none.
-fn tc_check_carrier_payload(variant: Str, args_sl: Int, call_node: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+// `carrier` is the Result type the call builds, as far as it is known: the alias a head names,
+// else the expected type.
+fn tc_check_carrier_payload(variant: Str, args_sl: Int, carrier: Int, call_node: Int) -> Bool ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     let labels = tc_lit_labels(args_sl)
     let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
-    let (fewest, most) = tc_carrier_arity(variant)
-    if labels.len() == 0 && got >= fewest && got <= most { return true }
-    let want = if fewest == most { "{most}" } else { "{fewest} or {most}" }
-    let well_formed = tc_check_unnamed_payload(tc_carrier_literal_owner(variant), args_sl, fewest, most,
-        "variant `{variant}` expects {want} argument(s), got {got}", [], call_node)
+    let expected = tc_carrier_field_count(variant)
+    if labels.len() == 0 && got == expected { return true }
+    if variant == "Ok" && got == 0 && tc_ok_success_is_unit(carrier) {
+        tc_report_ok_no_argument(call_node)
+        return false
+    }
+    let notes = tc_carrier_fields_note(variant, got - labels.len(), labels)
+    let well_formed = tc_check_unnamed_payload(tc_carrier_literal_owner(variant), variant, args_sl, expected, notes, call_node)
     let mut i = 0
     while labels.len() > 0 && i < got {
         let a = sublist_get(args_sl, i)
@@ -28174,14 +28191,13 @@ fn tc_carrier_call_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! Type
 
 fn tc_carrier_call_instance_tid(variant: Str, args_sl: Int, call_node: Int) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // A payload that cannot type the slot leaves the carrier's type unknown, not a guess from it.
-    if !tc_check_carrier_payload(variant, args_sl, call_node) { return tc_error_recovery_tid() }
+    if !tc_check_carrier_payload(variant, args_sl, tc_construct_hint, call_node) { return tc_error_recovery_tid() }
     let arg = if args_sl != -1 && sublist_length(args_sl) >= 1 { sublist_get(args_sl, 0) } else { -1 }
     match variant {
         "None" => make_option_type(tc_carrier_slot_from_hint(TyKind.Option, 1))
         "Some" => make_option_type(infer_carrier_arg(arg, variant))
         "Ok" => {
-            let payload = if arg == -1 { TYPE_VOID } else { infer_carrier_arg(arg, variant) }
-            make_result_type(payload, tc_carrier_slot_from_hint(TyKind.Result, 2))
+            make_result_type(infer_carrier_arg(arg, variant), tc_carrier_slot_from_hint(TyKind.Result, 2))
         }
         _ => make_result_type(tc_carrier_slot_from_hint(TyKind.Result, 1), infer_carrier_arg(arg, variant))
     }
@@ -28416,6 +28432,7 @@ fn tc_check_variant_payload_values_at(label: Str, var_idx: Int, args_sl: Int, in
 fn tc_infer_bare_variant_call(node: Int, fn_name: Str, vpick: BareVariantPick) -> Option[Int] ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     match vpick {
         BareVariantPick.Declared(venum, var_idx) => {
+            if tc_report_unit_variant_parens(var_idx, fn_name, node) { return Some(tc_error_recovery_tid()) }
             tc_check_variant_paren_payload(var_idx, fn_name, node)
             let payload_tids = tc_check_variant_payload_values(fn_name, var_idx, node_args(node))
             // A generic-enum variant (`Leaf(1)`) reverse-infers its concrete
@@ -28743,8 +28760,8 @@ fn tc_check_brace_literal(owner: Option[LitOwner], node: Int) ! Diag.Report {
 }
 
 // §3.4 *The payload form of a construction*: a unit variant takes no paren payload, not even
-// `()`. The argument count cannot see `()`, since it gives 0 arguments for 0 fields. A bare `A()`
-// is E0554 (§3.4 *Resolving a bare name*), so only a qualified head comes here. The caller
+// `()`. The argument count cannot see `()`, since it gives 0 arguments for 0 fields. A bare head
+// that resolves to the variant comes here too. The caller
 // gives the call the poison type, so the site gets one report. No machine fix: the E0321
 // catalog entry gives one only for `Ok()`.
 fn tc_report_unit_variant_parens(var_idx: Int, vname: Str, node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
@@ -28756,9 +28773,9 @@ fn tc_report_unit_variant_parens(var_idx: Int, vname: Str, node: Int) -> Bool ! 
     let open = tc_open_col_after_head(node, 40)
     let close = if open == -1 { -1 } else { tc_byte_col_from(node, open, 41) }
     if close == -1 {
-        diag_error_at("TypeError", TYPE_ERROR, msg, node, help)
+        diag_error_at("VariantArgumentCount", VARIANT_ARGUMENT_COUNT, msg, node, help)
     } else {
-        diag_error_in_file_label_notes("TypeError", TYPE_ERROR, msg, diag_file_for_node(node), node_line(node), open, node_line(node), close + 1, "", help, [])
+        diag_error_in_file_label_notes("VariantArgumentCount", VARIANT_ARGUMENT_COUNT, msg, diag_file_for_node(node), node_line(node), open, node_line(node), close + 1, "", help, [])
     }
     true
 }
@@ -28932,7 +28949,7 @@ fn tc_check_variant_paren_payload(var_idx: Int, vname: Str, node: Int) ! TypeChe
     }
     if owner.rows.len() == 0 {
         let notes = tc_variant_fields_note(owner.shown, var_idx, got - labels.len(), labels)
-        let _ = tc_check_unnamed_payload(owner, args_sl, expected, expected, "variant `{vname}` expects {expected} argument(s), got {got}", notes, node)
+        let _ = tc_check_unnamed_payload(owner, vname, args_sl, expected, notes, node)
         return
     }
     if tc_report_positional_after_label(args_sl, true) { return }
@@ -28958,11 +28975,11 @@ fn tc_payload_takes_count(positional: Int, labels: List[Int], most: Int) -> Bool
 }
 
 // The payload rules of a variant whose fields have no names, a carrier among them (§3.4):
-// E0527 first; then the count error (`count_msg`, with `count_notes`) where the count governs;
+// E0527 first; then the count error (with `count_notes`) where the count governs;
 // then the field rules, under which no label names a field, so a label is NoSuchField and a
 // second use of it is DuplicateField. Answers whether the payload can type the variant's
 // slots: a positional count that fits and no label.
-fn tc_check_unnamed_payload(owner: LitOwner, args_sl: Int, fewest: Int, most: Int, count_msg: Str, count_notes: List[Str], node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
+fn tc_check_unnamed_payload(owner: LitOwner, vname: Str, args_sl: Int, expected: Int, count_notes: List[Str], node: Int) -> Bool ! TypeCheck.Report, Diag.Report {
     if tc_report_positional_after_label(args_sl, false) { return false }
     let labels = tc_lit_labels(args_sl)
     let got = if args_sl != -1 { sublist_length(args_sl) } else { 0 }
@@ -28972,10 +28989,9 @@ fn tc_check_unnamed_payload(owner: LitOwner, args_sl: Int, fewest: Int, most: In
         positional.push(sublist_get(args_sl, i))
         i = i + 1
     }
-    let fits = got >= fewest && got <= most
-    if !fits && tc_payload_takes_count(positional.len(), labels, most) {
-        tc_errors.push(count_msg)
-        diag_error_at_notes("TypeError", TYPE_ERROR, count_msg, node, "", count_notes)
+    let fits = got == expected
+    if !fits && tc_payload_takes_count(positional.len(), labels, expected) {
+        tc_report_variant_count(vname, expected, got, count_notes, node)
     }
     let _ = tc_report_label_faults(owner, owner.rows, positional, labels, false, false)
     fits && labels.len() == 0
@@ -29007,9 +29023,17 @@ fn tc_report_variant_arity(shown: Str, var_idx: Int, vname: Str, positional: Int
     let expected = variant_field_count(var_idx)
     let got = positional + labels.len()
     if got == expected { return }
-    let msg = "variant `{vname}` expects {expected} argument(s), got {got}"
+    tc_report_variant_count(vname, expected, got, tc_variant_fields_note(shown, var_idx, positional, labels), node)
+}
+
+// §3.4: VariantArgumentCount. A variant with no payload takes no arguments, gets no note, and
+// its help removes the parentheses.
+fn tc_report_variant_count(vname: Str, expected: Int, got: Int, notes: List[Str], node: Int) ! TypeCheck.Report, Diag.Report {
+    let takes = if expected == 0 { "no arguments" } else if expected == 1 { "1 argument" } else { "{expected} arguments" }
+    let msg = "variant `{vname}` takes {takes}, got {got}"
     tc_errors.push(msg)
-    diag_error_at_notes("TypeError", TYPE_ERROR, msg, node, "", tc_variant_fields_note(shown, var_idx, positional, labels))
+    let help = if expected == 0 { "remove the parentheses" } else { "" }
+    diag_error_at_notes("VariantArgumentCount", VARIANT_ARGUMENT_COUNT, msg, node, help, if expected == 0 { [] } else { notes })
 }
 
 // The note of a count error, or [] when the variant's declaration is not known.
