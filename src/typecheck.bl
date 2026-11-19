@@ -17,7 +17,7 @@ import parser.{
     node_op, node_params, node_pattern, node_return_type, node_right, node_scrutinee,
     node_start, node_stmts, node_str_val, node_target, node_then_body, node_trait_name,
     node_type_ann, node_type_name, node_type_params, node_value, node_var_name,
-    node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_source_module,
+    node_impl_binders, node_recv_type_args, node_impl_where_bounds, node_impl_trait_at, node_impl_target_at, written_unpack, copy_type_list_at, node_set_elements, node_source_module,
     node_set_module, node_set_name, node_supertraits, node_empty_row_line, node_empty_row_col, node_empty_row_end_col, node_end_line, node_end_col, node_inclusive, BINDER_MUT_RECOVERED,
     synth_named_arg, sublist_append, sublist_of, node_set_obj, node_set_args,
     node_set_params, node_set_stmts, node_set_fields, node_set_arms,
@@ -21656,6 +21656,7 @@ fn tc_register_fn_sigs(fns_sl: Int) ! TypeCheck.Register, TypeCheck.Resolve, Dia
 pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     if trace_mode != "" { phase_trace("typecheck", "start") }
     init_types()
+    tc_refuse_self_in_impl_headers(program)
     nr_check_duplicate_declarations(program)
     tc_reject_reserved_effect_names(program)
     tc_reject_same_module_handle_clash(program)
@@ -32353,11 +32354,305 @@ fn nr_names_a_type(name: Str) -> Int {
 // `Self` token, which starts the name whether it is bare or qualifies one (`Self.Item`).
 fn nr_refuse_self_outside(name: Str, at: Int) -> Bool ! Diag.Report {
     if nr_walk.in_trait_or_impl { return false }
-    if name != "Self" && !name.starts_with("Self.") { return false }
-    tc_errors.push("`Self` outside trait or impl")
+    if !tc_names_self(name) { return false }
     let (line, col) = tc_written_name_start(at)
-    diag_error_span_label_at_notes("SelfOutsideTraitOrImpl", SELF_OUTSIDE_TRAIT_OR_IMPL, "`Self` outside trait or impl", at, line, col, col + 4, "`Self` is only valid inside trait declarations and impl blocks", "", [])
+    tc_report_refused_self(at, line, col, "`Self` outside trait or impl", "`Self` is only valid inside trait declarations and impl blocks", "")
     true
+}
+
+fn tc_names_self(name: Str) -> Bool {
+    name == "Self" || name.starts_with("Self.")
+}
+
+// One E0569 report, at the `Self` token that starts at line:col.
+fn tc_report_refused_self(at: Int, line: Int, col: Int, title: Str, label: Str, help: Str) ! Diag.Report {
+    tc_errors.push(title)
+    diag_error_span_label_at_notes("SelfOutsideTraitOrImpl", SELF_OUTSIDE_TRAIT_OR_IMPL, title, at, line, col, col + 4, label, help, [])
+}
+
+const SELF_IN_IMPL_HEADER = "`Self` in an impl header"
+const SELF_IN_IMPL_HEADER_LABEL = "an impl header names its type, so `Self` is not bound here"
+const SELF_IN_IMPL_HEADER_FOR_TARGET = "write the type the impl is for in place of `Self`"
+
+// The `Self` of an impl binds at the `{` of its body, so every `Self` in an impl header is
+// E0569 at its token (§3.6). Where the header names its trait and its target, the target takes
+// the place of each `Self` and the impl is checked as the help writes it. Otherwise the impl
+// leaves the program before any pass reads it: the header does not say what it implements, and
+// a later report on it would be a second error for the same `Self`.
+fn tc_refuse_self_in_impl_headers(program: Int) ! Diag.Report {
+    let impls_sl = node_methods(program)
+    if impls_sl == -1 { return }
+    let mut drop: Set[Int] = Set()
+    let mut recovered: Set[Int] = Set()
+    let mut i = 0
+    while i < sublist_length(impls_sl) {
+        let im = sublist_get(impls_sl, i)
+        if impl_provided_by_closeable(im) {
+            // The parser copied the header's binders and `where` clause into this impl, so it
+            // goes the way of the impl it was made from.
+            let of = closeable_impl_of(im)
+            if drop.contains(of) { drop.insert(im) }
+            if recovered.contains(of) { tc_put_target_for_self(im) }
+        } else if tc_refuse_self_in_impl_header(im) {
+            if tc_recover_self_in_impl_header(im) { recovered.insert(im) } else { drop.insert(im) }
+        }
+        i = i + 1
+    }
+    if drop.len() == 0 { return }
+    sublist_remove_members(impls_sl, drop)
+}
+
+// Reports each `Self` in the header of `im`, in source order, and says whether there was one.
+fn tc_refuse_self_in_impl_header(im: Int) -> Bool ! Diag.Report {
+    if !tc_impl_header_names_self(im) { return false }
+    let before = tc_errors.len()
+    let target = tc_impl_header_target_text(im)
+    let binders = node_impl_binders(im)
+    let mut i = 0
+    while binders != -1 && i < sublist_length(binders) {
+        let b = sublist_get(binders, i)
+        if node_name(b) == "Self" {
+            tc_report_refused_self(im, node_line(b), node_col(b), SELF_IN_IMPL_HEADER, SELF_IN_IMPL_HEADER_LABEL, "give the binder another name, such as `T`")
+        }
+        tc_refuse_self_in_bounds(im, node_elements(b), target, "[{node_name(b)}: ", "]")
+        i = i + 1
+    }
+    let trait_name = node_trait_name(im)
+    if tc_names_self(trait_name) {
+        let (line, col) = written_unpack(node_impl_trait_at(im))
+        // Blink has no inherent impls, so with or without `for` this name is a trait.
+        tc_report_refused_self(im, line, col, SELF_IN_IMPL_HEADER, SELF_IN_IMPL_HEADER_LABEL, "write the name of the trait the impl implements")
+    }
+    let trait_args = node_type_params(im)
+    let trait_help = if target == "" || tc_names_self(trait_name) { SELF_IN_IMPL_HEADER_FOR_TARGET } else { "write the type: `{trait_name}[{tc_type_list_text_with_self_as(trait_args, target, ", ")}]`" }
+    tc_refuse_self_in_type_list(im, trait_args, trait_help, Set())
+    if tc_names_self(node_name(im)) {
+        let (line, col) = written_unpack(node_impl_target_at(im))
+        tc_report_refused_self(im, line, col, SELF_IN_IMPL_HEADER, SELF_IN_IMPL_HEADER_LABEL, SELF_IN_IMPL_HEADER_FOR_TARGET)
+    }
+    tc_refuse_self_in_type_list(im, node_recv_type_args(im), SELF_IN_IMPL_HEADER_FOR_TARGET, Set())
+    let wheres = node_impl_where_bounds(im)
+    i = 0
+    while wheres != -1 && i < sublist_length(wheres) {
+        let c = sublist_get(wheres, i)
+        let prefix = "where {tc_type_text_with_self_as(node_type_ann(c), target)}: "
+        let subject_help = if target == "" { SELF_IN_IMPL_HEADER_FOR_TARGET } else { "write the type: `{prefix}{tc_type_list_text_with_self_as(node_elements(c), target, " + ")}`" }
+        let mut subject_selfs: List[Int] = []
+        tc_self_tokens_in_type(node_type_ann(c), subject_selfs)
+        let mut clause_selfs: List[Int] = []
+        tc_self_tokens_in_type(node_type_ann(c), clause_selfs)
+        tc_self_tokens_in_list(node_elements(c), clause_selfs)
+        let heads = tc_self_bound_heads(node_elements(c))
+        let rewrite = tc_selfs_take_target(clause_selfs, heads)
+        for s in subject_selfs {
+            let (line, col) = tc_written_name_start(s)
+            tc_report_refused_self(im, line, col, SELF_IN_IMPL_HEADER, SELF_IN_IMPL_HEADER_LABEL, if rewrite { subject_help } else { tc_refused_self_no_rewrite_help(s, heads) })
+        }
+        tc_refuse_self_in_bounds(im, node_elements(c), if rewrite { target } else { "" }, prefix, "")
+        i = i + 1
+    }
+    tc_errors.len() > before
+}
+
+fn tc_impl_header_names_self(im: Int) -> Bool {
+    if tc_names_self(node_trait_name(im)) || tc_names_self(node_name(im)) { return true }
+    let binders = node_impl_binders(im)
+    let mut i = 0
+    while binders != -1 && i < sublist_length(binders) {
+        if node_name(sublist_get(binders, i)) == "Self" { return true }
+        i = i + 1
+    }
+    let mut selfs = tc_impl_header_self_tokens(im)
+    tc_self_tokens_in_list(node_recv_type_args(im), selfs)
+    selfs.len() > 0
+}
+
+// Every `Self` token in the header of `im` that a type can stand in for: the type arguments of
+// the trait, the binder bounds, and the `where` clause. The trait name, the target and a binder
+// name are not types the header can be read with.
+fn tc_impl_header_self_tokens(im: Int) -> List[Int] {
+    let mut out: List[Int] = []
+    tc_self_tokens_in_list(node_type_params(im), out)
+    let binders = node_impl_binders(im)
+    let mut i = 0
+    while binders != -1 && i < sublist_length(binders) {
+        tc_self_tokens_in_list(node_elements(sublist_get(binders, i)), out)
+        i = i + 1
+    }
+    let wheres = node_impl_where_bounds(im)
+    i = 0
+    while wheres != -1 && i < sublist_length(wheres) {
+        let c = sublist_get(wheres, i)
+        tc_self_tokens_in_type(node_type_ann(c), out)
+        tc_self_tokens_in_list(node_elements(c), out)
+        i = i + 1
+    }
+    out
+}
+
+fn tc_self_tokens_in_list(sl: Int, out: List[Int]) {
+    let mut i = 0
+    while sl != -1 && i < sublist_length(sl) {
+        tc_self_tokens_in_type(sublist_get(sl, i), out)
+        i = i + 1
+    }
+}
+
+// Puts the impl's target in place of each refused `Self` in its header, as the help writes it,
+// so the impl stays in the program and is checked as if the header said so. False when the
+// header gives no type to put there: the trait or the target is `Self` or holds one, a binder
+// is named `Self`, or a `Self` is one the target cannot stand in for (tc_selfs_take_target).
+fn tc_recover_self_in_impl_header(im: Int) -> Bool {
+    if tc_impl_header_target_text(im) == "" || tc_names_self(node_trait_name(im)) { return false }
+    let binders = node_impl_binders(im)
+    let mut heads: Set[Int] = Set()
+    let mut i = 0
+    while binders != -1 && i < sublist_length(binders) {
+        let b = sublist_get(binders, i)
+        if node_name(b) == "Self" { return false }
+        for h in tc_self_bound_heads(node_elements(b)) { heads.insert(h) }
+        i = i + 1
+    }
+    let wheres = node_impl_where_bounds(im)
+    i = 0
+    while wheres != -1 && i < sublist_length(wheres) {
+        for h in tc_self_bound_heads(node_elements(sublist_get(wheres, i))) { heads.insert(h) }
+        i = i + 1
+    }
+    if !tc_selfs_take_target(tc_impl_header_self_tokens(im), heads) { return false }
+    tc_put_target_for_self(im)
+    true
+}
+
+// Puts the target of `im` in place of each `Self` token in its header.
+fn tc_put_target_for_self(im: Int) {
+    let target = node_name(im)
+    let args = node_recv_type_args(im)
+    for s in tc_impl_header_self_tokens(im) {
+        let (line, col) = tc_written_name_start(s)
+        node_set_name(s, target)
+        node_set_elements(s, copy_type_list_at(args, line, col))
+    }
+    // The parser keeps a bare subject's name on the constraint, and the checker reads it there.
+    let bare_target = args == -1 || sublist_length(args) == 0
+    let wheres = node_impl_where_bounds(im)
+    let mut i = 0
+    while wheres != -1 && i < sublist_length(wheres) {
+        let c = sublist_get(wheres, i)
+        if node_name(c) == "Self" { node_set_name(c, if bare_target { target } else { "" }) }
+        i = i + 1
+    }
+}
+
+// The impl's target as written, or "" when the header names none or the target holds a `Self`.
+fn tc_impl_header_target_text(im: Int) -> Str {
+    let name = node_name(im)
+    if name == "" || tc_names_self(name) { return "" }
+    let args = node_recv_type_args(im)
+    if args == -1 || sublist_length(args) == 0 { return name }
+    let mut selfs: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(args) {
+        tc_self_tokens_in_type(sublist_get(args, i), selfs)
+        i = i + 1
+    }
+    if selfs.len() > 0 { return "" }
+    "{name}[{tc_type_list_text_with_self_as(args, "", ", ")}]"
+}
+
+// A bound list (`A + B`) whose `Self` tokens are each reported, with help that writes the
+// binder or the clause again as `prefix` + bounds + `suffix`, with the target in place of `Self`.
+fn tc_refuse_self_in_bounds(im: Int, bounds: Int, target: Str, prefix: Str, suffix: Str) ! Diag.Report {
+    let help = if target == "" { SELF_IN_IMPL_HEADER_FOR_TARGET } else { "write the type: `{prefix}{tc_type_list_text_with_self_as(bounds, target, " + ")}{suffix}`" }
+    tc_refuse_self_in_type_list(im, bounds, help, tc_self_bound_heads(bounds))
+}
+
+// `heads` holds the tokens of `sl` that stand where a trait goes.
+fn tc_refuse_self_in_type_list(im: Int, sl: Int, help: Str, heads: Set[Int]) ! Diag.Report {
+    if sl == -1 { return }
+    let mut selfs: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(sl) {
+        tc_self_tokens_in_type(sublist_get(sl, i), selfs)
+        i = i + 1
+    }
+    let rewrite = tc_selfs_take_target(selfs, heads)
+    for s in selfs {
+        let (line, col) = tc_written_name_start(s)
+        tc_report_refused_self(im, line, col, SELF_IN_IMPL_HEADER, SELF_IN_IMPL_HEADER_LABEL, if rewrite { help } else { tc_refused_self_no_rewrite_help(s, heads) })
+    }
+}
+
+// The members of a bound list that are `Self` themselves, where a trait goes.
+fn tc_self_bound_heads(bounds: Int) -> Set[Int] {
+    let mut heads: Set[Int] = Set()
+    let mut i = 0
+    while bounds != -1 && i < sublist_length(bounds) {
+        let b = sublist_get(bounds, i)
+        if tc_names_self(node_name(b)) { heads.insert(b) }
+        i = i + 1
+    }
+    heads
+}
+
+// Whether the target can stand in for each of `selfs`, so that a help may write the header with
+// it. Not when one is a bound (the target is a type, not a trait), takes type arguments of its
+// own (`Self[Int]`), or qualifies a name: Blink has no associated types, so `Self.Item` with
+// the target in place names no type. A help that writes such text teaches a second error.
+fn tc_selfs_take_target(selfs: List[Int], heads: Set[Int]) -> Bool {
+    for s in selfs {
+        if heads.contains(s) || node_name(s) != "Self" { return false }
+        let elems = node_elements(s)
+        if elems != -1 && sublist_length(elems) > 0 { return false }
+    }
+    true
+}
+
+fn tc_refused_self_no_rewrite_help(s: Int, heads: Set[Int]) -> Str {
+    if heads.contains(s) { return "write the name of a trait in place of `{node_name(s)}`" }
+    if node_name(s) == "Self" { SELF_IN_IMPL_HEADER_FOR_TARGET } else { "write a type in place of `{node_name(s)}`" }
+}
+
+// The nodes of a written type that name `Self`, in source order.
+fn tc_self_tokens_in_type(ann: Int, out: List[Int]) {
+    if ann == -1 { return }
+    if tc_names_self(node_name(ann)) { out.push(ann) }
+    if node_kind(ann) != NodeKind.TypeAnn { return }
+    let elems = node_elements(ann)
+    let mut i = 0
+    while elems != -1 && i < sublist_length(elems) {
+        tc_self_tokens_in_type(sublist_get(elems, i), out)
+        i = i + 1
+    }
+    // `fn(A, B) -> R` keeps its return in `type_ann`.
+    if node_name(ann) == "Fn" { tc_self_tokens_in_type(node_type_ann(ann), out) }
+}
+
+// The types of `sl` as written, joined by `sep`, with `target` in place of each `Self`
+// (`Self.Item` reads `<target>.Item`). An empty `target` leaves the text as written.
+fn tc_type_list_text_with_self_as(sl: Int, target: Str, sep: Str) -> Str {
+    if sl == -1 { return "" }
+    let mut parts: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(sl) {
+        parts.push(tc_type_text_with_self_as(sublist_get(sl, i), target))
+        i = i + 1
+    }
+    parts.join(sep)
+}
+
+fn tc_type_text_with_self_as(ann: Int, target: Str) -> Str {
+    let mut renames: Map[Str, Str] = Map()
+    if target != "" {
+        let mut selfs: List[Int] = []
+        tc_self_tokens_in_type(ann, selfs)
+        for s in selfs { renames.insert(node_name(s), tc_self_renamed(node_name(s), target)) }
+    }
+    type_ann_text_renamed(ann, renames)
+}
+
+fn tc_self_renamed(name: Str, target: Str) -> Str {
+    "{target}{name.byte_slice(4, name.byte_len())}"
 }
 
 // `at` is the node the report points at, or -1 when the caller has none.

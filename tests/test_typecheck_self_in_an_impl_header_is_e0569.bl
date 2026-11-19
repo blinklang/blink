@@ -1,0 +1,206 @@
+// The `Self` of an impl binds at the `{` of its body, so every `Self` in the header is
+// SelfOutsideTraitOrImpl (E0569), one error at each `Self` token (sections/03_types.md, `Self`
+// in an impl header). The header is the trait, the target type, the type arguments of both,
+// the binders with their bounds and the `where` clause. The error has the header label, and
+// its help writes what to put in place of `Self`. The refused `Self` gets no second error. A
+// trait header and an impl body keep `Self`.
+
+import std.fs
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
+
+fn typecheck_probe(path: Str, src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+    }
+}
+
+// Each error as "name line:col-end: message | help | label", in report order.
+fn errors_of(src: Str) -> List[Str] ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe("build/test_typecheck_self_in_an_impl_header_probe.bl", src)
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.line}:{d.col}-{d.end_col}: {d.message} | {d.help} | {d.label}")
+        }
+    }
+    out
+}
+
+fn all_errors(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    errors_of(src).join(" || ")
+}
+
+// Four lines that every program below starts with, so its impl is on line 5.
+fn prelude() -> Str {
+    "trait Tr \{ fn m(self) -> Int }\ntrait Tg[T] \{ fn g(self) -> Int }\ntype Point \{ x: Int }\ntype Box[T] \{ v: T }\n"
+}
+
+fn with_impl(header: Str, body: Str) -> Str {
+    "{prelude()}{header} \{ {body} }\nfn main() \{}\n"
+}
+
+// The error E0569 reports at line:col for a `Self` in an impl header, with `help`.
+fn refused_at(line: Int, col: Int, help: Str) -> Str {
+    "SelfOutsideTraitOrImpl {line}:{col}-{col + 4}: `Self` in an impl header | {help} | an impl header names its type, so `Self` is not bound here"
+}
+
+fn for_target() -> Str { "write the type the impl is for in place of `Self`" }
+
+fn write_type(text: Str) -> Str { "write the type: `{text}`" }
+
+test "a Self target is e0569 at the Self token and nothing more" {
+    let src = with_impl("impl Tr for Self", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 13, for_target()))
+}
+
+test "a Self type argument of the target is e0569" {
+    let src = with_impl("impl Tr for Box[Self]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 17, for_target()))
+}
+
+test "each Self token in a nested target gets its own error" {
+    let src = with_impl("impl Tr for Map[Self, List[Self]]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), "{refused_at(5, 17, for_target())} || {refused_at(5, 28, for_target())}")
+}
+
+test "a Self target on its own line is reported at that line" {
+    let src = "{prelude()}impl Tr\n    for Self \{ fn m(self) -> Int \{ 1 } }\nfn main() \{}\n"
+    assert_eq(all_errors(src), refused_at(6, 9, for_target()))
+}
+
+test "a Self trait name is e0569 and not an undefined trait" {
+    let src = with_impl("impl Self for Point", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 6, "write the name of the trait the impl implements"))
+}
+
+// Blink has no inherent impls, so the name after `impl` is a trait.
+test "a Self impl with no for is e0569 and its help asks for a trait" {
+    let src = with_impl("impl Self", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 6, "write the name of the trait the impl implements"))
+}
+
+test "a Self trait with a Self type argument gets no help that writes Self again" {
+    let src = with_impl("impl Self[Self] for Point", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), "{refused_at(5, 6, "write the name of the trait the impl implements")} || {refused_at(5, 11, for_target())}")
+}
+
+// The rewrite the help gives overlaps the provided `impl From[T] for T`, and that is the
+// program's own error, not a second error for the refused `Self`.
+test "a Self type argument of the trait is e0569 and its help writes the target" {
+    let src = with_impl("impl From[Self] for Point", "fn from(p: Point) -> Point \{ p }")
+    let overlap = "OverlappingImpls 5:1-0: impl of `From` for `Point` overlaps the compiler-provided `impl From[T] for T`; Blink does not support specialization | a type already converts to itself; narrow the source so it can never be the receiver | "
+    assert_eq(all_errors(src), "{refused_at(5, 11, write_type("From[Point]"))} || {overlap}")
+}
+
+test "a Self argument of a user trait is e0569" {
+    let src = with_impl("impl Tg[Self] for Point", "fn g(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 9, write_type("Tg[Point]")))
+}
+
+test "a Self inside a function type argument is e0569" {
+    let src = with_impl("impl Tg[fn(Self) -> Int] for Point", "fn g(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 12, write_type("Tg[fn(Point) -> Int]")))
+}
+
+test "a Self as a function type's return is e0569" {
+    let src = with_impl("impl Tg[fn() -> Self] for Point", "fn g(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 17, write_type("Tg[fn() -> Point]")))
+}
+
+test "a Self that qualifies a name is e0569 at the Self token" {
+    let src = with_impl("impl Tg[Self.Item] for Point", "fn g(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 9, "write a type in place of `Self.Item`"))
+}
+
+test "a Self with type arguments of its own gets a help with no rewrite" {
+    let src = with_impl("impl Tg[Self[Int]] for Point", "fn g(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 9, for_target()))
+}
+
+test "a Self where subject is e0569 and its help writes the clause" {
+    let src = with_impl("impl Tr for Point where Self: Eq", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 25, write_type("where Point: Eq")))
+}
+
+test "a Self where subject of a generic impl writes the target with its binder" {
+    let src = with_impl("impl[T] Tr for Box[T] where Self: Eq", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 29, write_type("where Box[T]: Eq")))
+}
+
+test "a Self inside a where subject is e0569 and its help writes the clause" {
+    let src = with_impl("impl[T] Tr for Box[T] where Box[Self]: Eq", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 33, write_type("where Box[Box[T]]: Eq")))
+}
+
+test "a Self in the bound of a type subject writes the subject in its help" {
+    let src = with_impl("impl[T] Tr for Box[T] where Box[T]: Tg[Self]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 40, write_type("where Box[T]: Tg[Box[T]]")))
+}
+
+test "a Self in a where bound is e0569" {
+    let src = with_impl("impl[T] Tr for Box[T] where T: Tg[Self]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 35, write_type("where T: Tg[Box[T]]")))
+}
+
+test "a Self that qualifies a name in a where bound gets a help with no rewrite" {
+    let src = with_impl("impl[T] Tr for Box[T] where T: Tg[Self.Item]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 35, "write a type in place of `Self.Item`"))
+}
+
+test "a Self in a binder bound is e0569" {
+    let src = with_impl("impl[T: Tg[Self]] Tr for Box[T]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 12, write_type("[T: Tg[Box[T]]]")))
+}
+
+// The target is a type, so it cannot stand where a trait goes.
+test "a Self that is a binder bound asks for a trait" {
+    let src = with_impl("impl[T: Self] Tr for Box[T]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 9, "write the name of a trait in place of `Self`"))
+}
+
+test "a Self that is a where bound asks for a trait" {
+    let src = with_impl("impl Tr for Point where Point: Self", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), refused_at(5, 32, "write the name of a trait in place of `Self`"))
+}
+
+test "a binder named Self is e0569 and so is its use in the target" {
+    let src = with_impl("impl[Self] Tr for Box[Self]", "fn m(self) -> Int \{ 1 }")
+    assert_eq(all_errors(src), "{refused_at(5, 6, "give the binder another name, such as `T`")} || {refused_at(5, 23, for_target())}")
+}
+
+test "an impl whose Self has a known target is checked at that target" {
+    let src = "{prelude()}impl Tg[Self] for Point \{ fn g(self) -> Int \{ self.x } }\nfn main() \{\n    let _n = Point \{ x: 1 }.g()\n}\n"
+    assert_eq(all_errors(src), refused_at(5, 9, write_type("Tg[Point]")))
+}
+
+test "an impl whose Self has a known target still reports an error in its body" {
+    let src = with_impl("impl Tg[Self] for Point", "fn g(self) -> Int \{ self.y }")
+    let no_field = "NoSuchField 5:47-0: `Point` has no field `y` | use a declared field, or add the field to the type | "
+    assert_eq(all_errors(src), "{refused_at(5, 9, write_type("Tg[Point]"))} || {no_field}")
+}
+
+// The parser gives a Closeable impl a BlockHandler impl with copies of its binders.
+test "a Closeable impl with a known target is checked at that target with no second error" {
+    let src = "{prelude()}impl[T: Tg[Self]] Closeable for Box[T] \{ fn close(self) \{} }\nimpl Tg[Box[Int]] for Int \{ fn g(self) -> Int \{ 1 } }\nfn main() \{\n    with Box \{ v: 1 } as _b \{}\n}\n"
+    assert_eq(all_errors(src), refused_at(5, 12, write_type("[T: Tg[Box[T]]]")))
+}
+
+test "a trait header keeps Self in its supertrait clause" {
+    let src = "trait Tg[T] \{ fn g(self) -> Int }\ntrait Sb2: Tg[Self] \{ fn s(self) -> Int }\ntype Point \{ x: Int }\nimpl Tg[Point] for Point \{ fn g(self) -> Int \{ self.x } }\nimpl Sb2 for Point \{ fn s(self) -> Int \{ self.x + 1 } }\nfn main() \{\n    let p = Point \{ x: 1 }\n    let _n = p.s() + p.g()\n}\n"
+    assert_eq(all_errors(src), "")
+}
+
+test "an impl body keeps Self in its signatures and its locals" {
+    let src = "{prelude()}impl Tr for Point \{\n    fn m(self) -> Int \{\n        let q: Self = self\n        q.x\n    }\n}\nimpl From[Int] for Point \{ fn from(x: Int) -> Self \{ Point \{ x: x } } }\nfn main() \{\n    let p = Point.from(4)\n    let _n = p.m()\n}\n"
+    assert_eq(all_errors(src), "")
+}
