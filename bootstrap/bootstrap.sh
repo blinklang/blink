@@ -1,10 +1,6 @@
 #!/bin/sh
 set -e
 
-if [ -n "$BLINK_BOOTSTRAP_LEGACY" ]; then
-    exec "$(dirname "$0")/bootstrap_legacy.sh"
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
