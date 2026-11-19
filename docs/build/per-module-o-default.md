@@ -1107,12 +1107,10 @@ too, once per module.
 The header still comes from the program, never from the last build, so
 nothing in it can be stale: content decides, as for every other file. The
 per-module tests run under `BLINK_EMIT_REUSE_VERIFY=1`, and verify writes
-each header after a walk of its own and compares bytes. A header pass
-skips lowering `#embed` initializers when it asks whether a module needs
-an init function: such an initializer lowers to one string constant, and
-spelling a large file as a C literal cost more than the rest of the
-header. The skip is a parameter of that call, and verify writes the
-headers without it.
+each header after a walk of its own and compares bytes. A header lowers
+no initializer: whether it declares the module's init function comes
+from the program facts (`entry_init_fns`), which the shim in the entry
+unit also reads.
 
 Phase split of a cli body edit (`src/cname.bl`), 5 reps, in ms. The unit
 headers are the program facts, the types header and the module headers:

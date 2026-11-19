@@ -1,0 +1,72 @@
+// A handler held in a module-level `let` builds and runs in every emit mode: one C unit for
+// the whole program, and one C unit per module, where each module's headers must declare
+// only what the module's own unit defines.
+
+import compile_test_helpers
+
+fn main_module_src() -> Str {
+    #"
+effect Ping { effect Op { fn ping() -> Int } }
+effect Name { effect Who { fn name() -> Str
+    fn greet() -> Str { "hi {name.name()}" } } }
+
+let base = 5
+let add_two = fn(x: Int) -> Int { x + 2 }
+let gh = handler Ping.Op { fn ping() -> Int { 7 } }
+let nh = handler Name.Who { fn name() -> Str { "ann" } }
+// The clause's closure is queued as a thunk, beside the builder the literal prints.
+let ch = handler Ping.Op { fn ping() -> Int {
+    let f = fn(x: Int) -> Int { x * 3 }
+    f(base)
+} }
+
+fn main() {
+    with gh { io.println("ping: {ping.ping()}") }
+    with nh { io.println("greet: {name.greet()}") }
+    with gh, nh { io.println("both: {ping.ping()} {name.name()}") }
+    with ch { io.println("closure clause: {ping.ping()} {add_two(base)}") }
+}
+"#
+}
+
+fn check_main_module(r: compile_test_helpers.RunResult) ! IO.Eprint {
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "ping: 7\ngreet: hi ann\nboth: 7 ann\nclosure clause: 15 7\n")
+}
+
+test "a handler in a main-module let runs in a single C unit" {
+    check_main_module(compile_test_helpers.compile_and_run(main_module_src(), "main_module_handler_let_single"))
+}
+
+// The one-unit corpus sets BLINK_COMPILER_ARCHIVE, which turns this row and the imported-module
+// row into one-unit builds; the per-module slice of the corpus runs both per-module.
+test "a handler in a main-module let runs in the per-module build" {
+    check_main_module(compile_test_helpers.run_via_cli(main_module_src(), "main_module_handler_let_per_module", "--per-module"))
+}
+
+test "a handler in a main-module let runs under --no-per-module" {
+    check_main_module(compile_test_helpers.run_via_cli(main_module_src(), "main_module_handler_let_one_unit", "--no-per-module"))
+}
+
+// The imported effect has an operation with a default body that the handler does not write,
+// so the handler's builder in the helper's unit points that slot at the default.
+test "a handler in an imported module's let runs, with a default operation" {
+    let helper = #"
+pub effect Fz { effect Sub { fn a() -> Str
+    fn b() -> Str { "x" } } }
+
+pub let H = handler Fz.Sub { fn a() -> Str { "y" } }
+"#
+    let entry = #"
+import hl.libz
+
+pub fn main() {
+    with libz.H { io.println("{fz.a()} {fz.b()}") }
+}
+"#
+    let r = compile_test_helpers.run_xmod(entry, "hl", "libz", helper, "imported_handler_let")
+    if r.exit_code != 0 { io.eprintln(r.err_out) }
+    assert_eq(r.exit_code, 0)
+    assert_eq(r.out, "y x\n")
+}

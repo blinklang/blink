@@ -345,7 +345,7 @@ fn instance_is_private_copy(cfg: CgConfig, decl: Int) -> Bool {
 // parser accepts a bare top-level `let` the same as a local one) has nothing to lower and
 // is left out, so a reader of this map never has to ask "was there one." The caller
 // chooses the scope: the whole program for a single-unit build, or one module's own
-// globals for the per-module mode — the defining module is the only one that ever lowers
+// globals for the per-module mode — the defining module's unit is the only one that prints
 // a given global's initializer.
 //
 // The closures an initializer queues are lowered with it, in its module and under the root,
@@ -1051,9 +1051,10 @@ pub type ModuleHeaders {
 pub type ProgramFacts {
     key_tables: List[KeyTableUse]
     carrier_tids: List[Int]
-    // The init names the entry unit's shim calls. Finding one lowers another module's
-    // globals, so it runs here, before any unit: the entry unit's emit then lowers no code
-    // but its own, and its key holds the names its text calls.
+    // The init names the entry unit's shim calls, which each module's header also
+    // declares. Finding one lowers another module's globals, so it runs here, before any
+    // unit: the entry unit's emit then lowers no code but its own, and its key holds the
+    // names its text calls.
     entry_init_fns: List[Str]
 }
 
@@ -1086,7 +1087,7 @@ pub fn generate_module_headers_with(program: Int, module_key: Str, cfg: CgConfig
     // The prologue sets the linkage the signatures are printed under.
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, c_module_header_guard(module_key), "", false)
     mark_typedefs_written(facts)
-    module_header_texts(module_key, cfg, false)
+    module_header_texts(module_key, cfg, facts.entry_init_fns)
 }
 
 // The types header already holds every typedef. Writing them here too and throwing the
@@ -1124,18 +1125,18 @@ fn install_header_preamble(pre: HeaderPreamble) {
 // header_preamble and with no other emit between, so the registry is still that program's.
 // BLINK_EMIT_REUSE_VERIFY compares each header with the one generate_module_headers_with
 // writes.
-pub fn generate_module_headers_from(module_key: Str, cfg: CgConfig, pre: HeaderPreamble) -> ModuleHeaders ! Codegen, Diag.Report {
+pub fn generate_module_headers_from(module_key: Str, cfg: CgConfig, pre: HeaderPreamble, facts: ProgramFacts) -> ModuleHeaders ! Codegen, Diag.Report {
     reset_unit_state()
     cg_decl_emit_prologue(cfg.user_tu_mode != 0, cfg.archive_over_std != 0, false, false, c_module_header_guard(module_key), "", false)
     install_header_preamble(pre)
     let _ = print_take()
-    module_header_texts(module_key, cfg, true)
+    module_header_texts(module_key, cfg, facts.entry_init_fns)
 }
 
-// `skip_embeds`: an #embed initializer lowers to one string constant, so it never needs
-// the init function, and spelling a large file as a C literal costs more than the rest of
-// the header.
-fn module_header_texts(module_key: Str, cfg: CgConfig, skip_embeds: Bool) -> ModuleHeaders ! Codegen, Diag.Report {
+// `init_fns` is ProgramFacts.entry_init_fns. The header takes the answer from there and
+// lowers no initializer itself: lowering a handler literal prints its builder at once, and
+// that text would land in the header.
+fn module_header_texts(module_key: Str, cfg: CgConfig, init_fns: List[Str]) -> ModuleHeaders ! Codegen, Diag.Report {
     let globals = globals_in_scope(cfg, module_key, true)
     let fns = fns_in_scope(cfg, module_key, false, true)
     let methods = methods_in_scope(cfg, module_key, false, true)
@@ -1150,9 +1151,9 @@ fn module_header_texts(module_key: Str, cfg: CgConfig, skip_embeds: Bool) -> Mod
     let private_guard = c_module_private_header_guard(module_key)
     open_module_header(private_guard)
     let _ = cg_decl_emit_globals(true, surface_decls(globals, false), Map())
-    let lowered = if skip_embeds { without_embed_inits(globals) } else { globals }
-    if cg_decl_has_deferred_global(lowered, lower_global_inits(lowered)) {
-        print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, c_module_init_globals_name(module_key), [], false)
+    let init_fn = c_module_init_globals_name(module_key)
+    if init_fns.contains(init_fn) {
+        print_fn_decl(false, layout_of(TYPE_VOID, Position.Return).c_spelling, init_fn, [], false)
     }
     emit_root_signatures(cfg, surface_decls(fns, false), surface_decls(methods, false))
     // Nothing is compiled ahead of this program, so its modules home their own generics'
@@ -1182,16 +1183,6 @@ pub fn module_instance_names(cfg: CgConfig, module_key: Str) -> List[Str] {
                 BodySite.Nothing => {}
             }
         }
-    }
-    out
-}
-
-fn without_embed_inits(globals: List[Int]) -> List[Int] {
-    let mut out: List[Int] = []
-    for g in globals {
-        let init = node_value(g)
-        if init >= 0 && node_kind(init) == NodeKind.EmbedExpr { continue }
-        out.push(g)
     }
     out
 }
@@ -1444,9 +1435,10 @@ fn hex32(v: Int) -> Str {
 // Every module's init-fn name the entry unit's shim must call, in module order (the same
 // first-seen order `cg_reg_modules` yields, which is import order — an imported module is
 // merged ahead of the importing module, so its init call lands first). Each is answered by
-// lowering that module's own globals, which is safe to discard: this only checks whether a
-// name is needed, and never prints. The entry module's globals answer the same Const
-// question here as in its unit's head.
+// lowering that module's own globals and throwing the result away. Lowering can print (a
+// handler literal prints its builder at once), so the caller must reset the unit after this
+// call, as `program_facts` does. The entry module's globals answer the same Const question
+// here as in its unit's head.
 fn module_init_fn_names(cfg: CgConfig) -> List[Str] ! Diag.Report {
     // The lowering below is thrown away, so the instances it names and the sources it spans
     // are no unit's, even if a unit is being emitted.
