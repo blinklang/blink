@@ -2221,13 +2221,17 @@ let mut ffi_opaque_type_set: Map[Int, Int] = Map()
 // `underlying` maps a type-alias name (e.g. `type Port = Int`) to its underlying type id.
 // Consulted by types_compatible so refinement aliases stay compatible with their base type.
 // Keyed by name (not type id) because type ids are pass-dependent across the dual codegen passes.
-// `cyclic` holds the alias declarations in a cycle of aliases (E0327) or leading into one. Each
-// has the poison type (§6.3.5), so a use gets no second error and an impl on it is dropped.
+// `poisoned` holds the alias declarations whose right-hand side does not resolve to a type: in a
+// cycle of aliases (E0327), leading into one, or naming an unknown type or a poisoned alias.
+// Each has the poison type (§6.3.5), so a use gets no second error and an impl on it is dropped.
+// `bad_refs` counts the names a resolution met that are no type or a poisoned alias, so a
+// settle can tell whether its right-hand side met one, through any alias it settles in turn.
 type AliasFacts {
     underlying: Map[Str, Int]
-    cyclic: Set[Int]
+    poisoned: Set[Int]
+    bad_refs: Int
 }
-let mut tc_aliases: AliasFacts = AliasFacts { underlying: Map(), cyclic: Set() }
+let mut tc_aliases: AliasFacts = AliasFacts { underlying: Map(), poisoned: Set(), bad_refs: 0 }
 
 // The underlying tid of the alias that `name` means, or -1. Keyed by the DECLARATION, so a
 // namesake is asked for under the module the reading file selected: the bare key alone
@@ -14869,8 +14873,11 @@ fn resolve_type_parts_at(name: Str, elems_sl: Int, ann_node: Int, at_context: Bo
     // type), and an alias-keyed map inside a compound carrier emitted a void key
     // temp. The annotation node still names what the user wrote for diagnostics.
     let written_alias = tc_alias_decl_of_written(name)
-    // A cyclic alias (E0327) has no expansion to settle or apply.
-    if written_alias != -1 && tc_aliases.cyclic.contains(written_alias) { return tc_error_recovery_tid() }
+    // A poisoned alias has no expansion to settle or apply.
+    if written_alias != -1 && tc_aliases.poisoned.contains(written_alias) {
+        tc_aliases.bad_refs = tc_aliases.bad_refs + 1
+        return tc_error_recovery_tid()
+    }
     if written_alias != -1 {
         // An alias that names a later generic alias settles it first, because applying it needs
         // its target: `type B[Y] = A[Y]` before `type A[X] = P[X]` has no other way to reach `P[Y]`.
@@ -14935,6 +14942,7 @@ fn resolve_type_parts_at(name: Str, elems_sl: Int, ann_node: Int, at_context: Bo
     // in a struct field / enum-variant payload / alias underlying" leak (the positions
     // name-resolution does not walk) must be closed in the name-resolution walker with its
     // full acceptance set, not in this fallback.
+    if name != "Self" && !tc_name_declares_trait(name) { tc_aliases.bad_refs = tc_aliases.bad_refs + 1 }
     make_typevar(name)
 }
 
@@ -15084,9 +15092,13 @@ fn tc_settle_alias_decl(atd: Int) ! TypeCheck.Resolve, Diag.Report {
     let alias_tparams = node_type_params(atd)
     tc_push_tparam_scope(alias_tparams)
     // A cyclic alias still resolves its right-hand side, so an error there that the cycle does
-    // not cause is reported, but it means the poison type.
+    // not cause is reported, but it means the poison type. Name resolution reports an unknown
+    // name later; the signatures that name this alias resolve before that, so the poison is
+    // decided here.
+    let bad_before = tc_aliases.bad_refs
     let underlying = resolve_type_ann(node_value(atd))
-    tc_aliases.underlying.insert(key, if tc_aliases.cyclic.contains(atd) { tc_error_recovery_tid() } else { underlying })
+    if tc_aliases.bad_refs > bad_before { tc_aliases.poisoned.insert(atd) }
+    tc_aliases.underlying.insert(key, if tc_aliases.poisoned.contains(atd) { tc_error_recovery_tid() } else { underlying })
     tc_pop_tparam_scope(alias_tparams)
     tc_suppress_ann_validation = saved_suppress
     tc_active_tparams = saved_active
@@ -15205,10 +15217,10 @@ fn tc_check_alias_cycles(types_sl: Int) ! Diag.Report {
     for a in aliases {
         let r = reach.get(a) ?? Set()
         if cyclic.contains(a) {
-            tc_aliases.cyclic.insert(a)
+            tc_aliases.poisoned.insert(a)
         } else {
             for c in cyclic {
-                if r.contains(c) { tc_aliases.cyclic.insert(a) }
+                if r.contains(c) { tc_aliases.poisoned.insert(a) }
             }
         }
     }
@@ -15305,16 +15317,16 @@ fn tc_alias_struct_form(decl: Int) -> Str {
     "type {node_name(decl)}{tc_type_param_names(node_type_params(decl))} \{ {field}: {parts.join(" ")} }"
 }
 
-// An impl on a cyclic alias is dropped with no error, so its methods leave method lookup (§3.4).
-fn tc_drop_impls_on_cyclic_aliases(program: Int) {
+// An impl on a poisoned alias is dropped with no error, so its methods leave method lookup (§3.4).
+fn tc_drop_impls_on_poisoned_aliases(program: Int) {
     let impls_sl = node_methods(program)
-    if impls_sl == -1 || tc_aliases.cyclic.len() == 0 { return }
+    if impls_sl == -1 || tc_aliases.poisoned.len() == 0 { return }
     let mut drop: Set[Int] = Set()
     let mut i = 0
     while i < sublist_length(impls_sl) {
         let im = sublist_get(impls_sl, i)
         let decl = tc_impl_header_alias_decl(im)
-        if decl != -1 && tc_aliases.cyclic.contains(decl) { drop.insert(im) }
+        if decl != -1 && tc_aliases.poisoned.contains(decl) { drop.insert(im) }
         i = i + 1
     }
     if drop.len() == 0 { return }
@@ -16456,8 +16468,8 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
     if tc_name_is_tparam_in_scope(decl_name) != 0 { return }
     // A `Self` outside a trait or impl has its own report (E0569).
     if decl_name == "Self" && tc_current_self_tid == -1 { return }
-    // A cyclic alias (E0327) has the poison type.
-    if tc_aliases.cyclic.contains(tc_alias_decl_of_written(decl_name)) { return }
+    // A poisoned alias has no key type to judge.
+    if tc_aliases.poisoned.contains(tc_alias_decl_of_written(decl_name)) { return }
     // A name imported from blink.core under another name is the builtin (§10.6), and is judged
     // as the written builtin is. It names no declaration, so no declaration may answer for it,
     // not even one in this module that takes the builtin's name.
@@ -19436,7 +19448,7 @@ fn tc_check_trait_sig_ann(ann: Int, trait_name: Str, mname: Str, m: Int) ! Diag.
     }
     if name != "" && tc_trait_sig_name_declared(name, m) == 0 {
         tc_trait_sig_poisoned.insert(trait_name, 1)
-        diag_error_at("UnknownType", UNKNOWN_TYPE, "unknown type `{name}` in method `{mname}` of trait `{tc_trait_shown(trait_name)}`", ann,
+        nr_type_name_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}` in method `{mname}` of trait `{tc_trait_shown(trait_name)}`", ann,
             "a trait signature may name a declared type, a builtin type, `Self`, an associated type, or one of the trait's or method's own type parameters")
         return
     }
@@ -21765,7 +21777,7 @@ fn init_types() ! TypeCheck.Register {
     tc_walk_value_tail = 0
     tc_in_ensures_predicate = 0
     tc_trait_sig_poisoned.clear()
-    tc_aliases = AliasFacts { underlying: Map(), cyclic: Set() }
+    tc_aliases = AliasFacts { underlying: Map(), poisoned: Set(), bad_refs: 0 }
     sfield_pool.clear()
     evar_pool.clear()
     evar_decl_nodes.clear()
@@ -21960,7 +21972,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
     // Register all type definitions (structs and enums)
     let types_sl = node_fields(program)
     tc_register_type_decls(types_sl)
-    tc_drop_impls_on_cyclic_aliases(program)
+    tc_drop_impls_on_poisoned_aliases(program)
     tc_drop_unprovided_closeable_impls(program)
 
     // Kind A: a struct name equal to an enum variant name is a hard error (E0518), within
@@ -22134,13 +22146,10 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
         }
     }
     // Register builtin trait names (handled specially in codegen, no AST nodes)
-    tc_trait_names.push("From")
-    tc_trait_names.push("TryFrom")
-    tc_trait_names.push("Into")
     // Iterator is NOT a trait: §3c.1:38 makes it a sealed, opaque, non-user-implementable
     // built-in type (constructed by make_iterator_type). IntoIterator stays a trait name —
     // it is the sealed protocol whose built-in impls `.into_iter()` dispatches through.
-    tc_trait_names.push("IntoIterator")
+    for builtin in tc_registered_undeclared_trait_names() { tc_trait_names.push(builtin) }
     // These builtins are single-tparam (From[T], Into[T], ...); record
     // their arity so E0910 fires for impls that supply the wrong count. From/
     // Into/TryFrom are also declared in lib/std/traits.bl and pass through
@@ -25761,9 +25770,9 @@ fn nr_poisoned(mod_name: Str, namespace: Str, name: Str) -> Bool {
 }
 
 // Whether `decl` is the module-scope type declaration (type, alias, trait, effect) a module
-// keeps of a name it declares more than once (E1016).
+// keeps of a name it declares more than once (E1016), or an alias with the poison type.
 fn tc_type_decl_poisoned(decl: Int) -> Bool {
-    nr_poisoned_first(decl, "type") || tc_aliases.cyclic.contains(decl)
+    nr_poisoned_first(decl, "type") || tc_aliases.poisoned.contains(decl)
 }
 
 // Whether `decl` is the module-scope value declaration (fn, let, const) a module keeps of a
@@ -29463,6 +29472,26 @@ pub fn suggest_module_member(mod_name: Str, member: Str) -> Str {
     best_name
 }
 
+// Whether the written `name` reaches a trait. An alias of a trait (`type H = Html`) names a
+// context, not a missing type, and aliases settle before any trait registers, so this reads
+// the declarations rather than the registered trait names. The compiler-known traits it
+// accepts are the ones name resolution accepts in a type position.
+fn tc_name_declares_trait(name: Str) -> Bool {
+    if tc_trait_node_idx.contains_key(name) || tc_registered_undeclared_trait_names().contains(name) { return true }
+    let parts = name.split(".")
+    let d = if parts.len() == 1 {
+        nr_resolve_bare_decl(name, nr_current_module)
+    } else {
+        nr_resolve_qualified_decl(parts.slice(0, parts.len() - 1).join("."), parts.get(parts.len() - 1).unwrap())
+    }
+    d >= 0 && node_kind(d) == NodeKind.TraitDef
+}
+
+// The traits with no declaration that still register as trait names.
+fn tc_registered_undeclared_trait_names() -> List[Str] {
+    ["From", "TryFrom", "Into", "IntoIterator"]
+}
+
 // Whether `name` is a trait's identity, or the bare name of one that shares its name.
 fn is_trait_name(name: Str) -> Int {
     let shared = "{name}@"
@@ -32961,7 +32990,7 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
                     Some(kids) => {
                         if kids.contains(tc_handler_effect_root(tail)) { return }
                         // The head is an effect, so the name is a sub-effect it does not declare.
-                        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: `{qualifier}` has no sub-effect `{tail}`", at, "")
+                        nr_type_name_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: `{qualifier}` has no sub-effect `{tail}`", at, "")
                         return
                     }
                     None => {}
@@ -33002,7 +33031,7 @@ fn nr_check_type_ref(name: Str, at: Int) ! TypeCheck.Resolve, Diag.Report {
         return
     }
     tc_errors.push("unknown type `{name}`")
-    nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, "")
+    nr_type_name_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, "")
 }
 
 // std.panic is loaded in each program for the hook's type, so its type has a declaration that
@@ -33021,7 +33050,7 @@ fn nr_report_panic_info_needs_import(name: Str, at: Int) ! Diag.Report {
     }
     let before = diag_entry_count()
     tc_errors.push("unknown type `{name}`")
-    nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, help)
+    nr_type_name_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`", at, help)
     if at == -1 || diag_entry_count() == before { return }
     let file = diag_file_for_node(at)
     let lines = diag_source_lines(file)
@@ -33053,7 +33082,7 @@ fn nr_check_qualified_type_ref(name: Str, qualifier: Str, member: Str, at: Int) 
     let target = nr_qualifier_module_here(qualifier)
     if target == "" {
         tc_errors.push("unknown type `{name}`")
-        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: no module `{qualifier}` is imported here", at, nr_missing_import_help(qualifier))
+        nr_type_name_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: no module `{qualifier}` is imported here", at, nr_missing_import_help(qualifier))
         return
     }
     tc_mark_qualifier_used(qualifier)
@@ -33067,7 +33096,7 @@ fn nr_check_qualified_type_ref(name: Str, qualifier: Str, member: Str, at: Int) 
         let near = suggest_module_member(target, member)
         let help = if near != "" && near != member { "did you mean `{qualifier}.{near}`?" } else { "" }
         let what = if only_value { "type " } else { "" }
-        nr_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: module `{qualifier}` declares no {what}`{member}`", at, help)
+        nr_type_name_error("UnknownType", UNKNOWN_TYPE, "unknown type `{name}`: module `{qualifier}` declares no {what}`{member}`", at, help)
         return
     }
     if nr_qualified_private_access("type", qualifier, member) != 0 {
@@ -33274,13 +33303,26 @@ fn nr_error(name: Str, code: Str, message: Str, at: Int, help: Str) ! Diag.Repor
     }
 }
 
+// A type annotation node sits at the token after it, so an error about the name it writes
+// takes the written place of the name.
+fn nr_type_name_error(name: Str, code: Str, message: Str, at: Int, help: Str) ! Diag.Report {
+    if at != -1 && node_kind(at) == NodeKind.TypeAnn {
+        let (line, col, _, _) = node_written_span(at)
+        if line != 0 {
+            diag_error_span_at_notes(name, code, message, at, line, col, col + node_name(at).byte_len(), help, [])
+            return
+        }
+    }
+    nr_error(name, code, message, at, help)
+}
+
 // F32 is a built-in the spec names and the compiler does not build yet; F64 is claimed with no
 // spec entry. Both stay reserved, so a user type cannot take them, and the report says so
 // instead of calling them unknown. Lowering has no type for either and would mint a typevar.
 fn tc_report_reserved_unbuilt(name: Str, at: Int) -> Int ! Diag.Report {
     if name != "F32" && name != "F64" { return 0 }
     tc_errors.push("reserved type `{name}` is not yet supported")
-    nr_error("UnknownType", UNKNOWN_TYPE, "type `{name}` is reserved but not yet supported", at, "use Float")
+    nr_type_name_error("UnknownType", UNKNOWN_TYPE, "type `{name}` is reserved but not yet supported", at, "use Float")
     1
 }
 

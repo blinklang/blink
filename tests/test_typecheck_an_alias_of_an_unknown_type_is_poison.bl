@@ -1,0 +1,136 @@
+// An alias whose right-hand side does not resolve to a type has the poison type
+// (sections/03_types.md §3.4, "Poison"; ERROR_CATALOG.md E0507). `type A = Nope` is one
+// UnknownType (E0507), at `Nope`, and a use of `A` gets no second error. The same holds for
+// an unknown type inside a type argument or a tuple, for an alias that leads into the bad
+// one, and for a generic alias. An impl on such an alias is dropped with no error. The poison
+// hides no unrelated error at a use. An alias of a trait names that trait and is not poison.
+
+import std.fs
+import std.process.{ProcessResult}
+import compiler.{compile_to_program}
+import typecheck.{check_types, TypeCheck}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import lexer.{Lex}
+import parser.{Parse}
+
+let PROBE: Str = "build/test_typecheck_an_alias_of_an_unknown_type_probe.bl"
+
+fn typecheck_probe(src: Str) ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(PROBE, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(PROBE, 1)
+        check_types(program)
+        let _ = fs.delete(PROBE)
+    }
+}
+
+// Each error as "name code line:col: message", in report order, joined with " || ".
+fn errors_of(src: Str) -> Str ! FS, Env.Exit, Env.Read, IO {
+    typecheck_probe(src)
+    reported_errors()
+}
+
+fn reported_errors() -> Str {
+    let mut out: List[Str] = []
+    for d in diag_entries {
+        if d.severity == "error" || d.severity == "ice" {
+            out.push("{d.name} {d.code} {d.line}:{d.col}: {d.message}")
+        }
+    }
+    out.join(" || ")
+}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// The errors of a package whose src/lib.bl is `lib_src` and whose src/main.bl is `main_src`.
+fn package_errors_of(lib_src: Str, main_src: Str) -> Str ! FS, Process.Spawn, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        let dir = sh("mktemp -d /tmp/blink_alias_poison.XXXXXX").out.trim()
+        let _ = sh("mkdir -p {dir}/src")
+        fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+        fs.write("{dir}/src/lib.bl", lib_src).unwrap()
+        let main_path = "{dir}/src/main.bl"
+        fs.write(main_path, main_src).unwrap()
+        diag_reset()
+        let program = compile_to_program(main_path, 1)
+        check_types(program)
+        let got = reported_errors()
+        let _ = sh("rm -rf {dir}")
+        got
+    }
+}
+
+fn unknown(line: Int, col: Int, name: Str) -> Str {
+    "UnknownType E0507 {line}:{col}: unknown type `{name}`"
+}
+
+test "an alias of an unknown type is one e0507 at the name, and a use gets no second error" {
+    let src = "type A = Nope\nfn f(x: A) -> Int \{ x.len() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(1, 10, "Nope"))
+}
+
+test "an unknown type argument poisons the alias for a method call, a map key and an impl" {
+    let src = "type A = List[Nope]\nfn f(x: A) -> Int \{ x.len() }\nfn g(m: Map[A, Int]) -> Int \{ m.len() }\ntrait Sh \{ fn n(self) -> Int }\nimpl Sh for A \{ fn n(_self) -> Int \{ 1 } }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(1, 15, "Nope"))
+}
+
+test "an unknown type in a tuple poisons the alias" {
+    let src = "type A = (Int, Nope)\nfn f(x: A) -> Int \{ x.len() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(1, 16, "Nope"))
+}
+
+test "an alias that leads into a bad alias gets no error of its own" {
+    let src = "type B = A\ntype A = Nope\nfn f(x: B) -> Int \{ x.len() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(2, 10, "Nope"))
+}
+
+test "a generic alias with an unknown type is poison at each use" {
+    let src = "type P[T] = (T, Nope)\nfn f(x: P[Int]) -> Int \{ x.len() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(1, 17, "Nope"))
+}
+
+test "a method call through an impl on a bad alias gets no second error" {
+    let src = "trait Sh \{ fn n(self) -> Int }\ntype A = Nope\nimpl Sh for A \{ fn n(_self) -> Int \{ 1 } }\nfn g(a: A) -> Int \{ a.n() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(2, 10, "Nope"))
+}
+
+test "the poison does not hide an unrelated error at a use" {
+    let src = "type A = Nope\nfn f(x: A, y: Int) -> Int \{ y }\nfn main() \{ let _ = f(1) }\n"
+    assert_eq(errors_of(src), "{unknown(1, 10, "Nope")} || TypeError E0300 3:21: function `f` expects 2 argument(s), got 1")
+}
+
+test "an alias of a known type in the same program keeps its methods" {
+    let src = "type A = Nope\ntype G = List[Int]\nfn f(x: G) -> Int \{ x.len() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(1, 10, "Nope"))
+    let missing = "type G = List[Int]\nfn f(x: G) -> Int \{ x.nope() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(missing), "UnresolvedMethod E0505 2:21: unresolved method `.nope` on type List[Int]")
+}
+
+test "an alias of a trait is not poison" {
+    let src = "trait Html \{ fn h(self) -> Int }\ntype H = Html\nfn take(t: Template[H]) -> Int \{ t.count() }\nfn main() \{ io.println(\"\{take(\"a\")}\") }\n"
+    assert_eq(errors_of(src), "")
+    let missing = "trait Html \{ fn h(self) -> Int }\ntype H = Html\nfn bad(t: Template[H]) -> Int \{ t.nope() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(missing), "UnresolvedMethod E0505 3:33: unresolved method `.nope` on type Template[Html]")
+}
+
+test "an alias of a trait named through its module is not poison" {
+    let lib = "pub trait Html \{ fn h(self) -> Int }\n"
+    let main = "import lib\n\ntype H = lib.Html\n\nfn take(t: Template[H]) -> Int \{ t.count() }\n\nfn main() \{ io.println(\"\{take(\"a\")}\") }\n"
+    assert_eq(package_errors_of(lib, main), "")
+}
+
+test "an alias of a compiler-known trait that names no type is poison" {
+    let src = "type H = Serialize\nfn f(t: H) -> Int \{ t.zz() }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), unknown(1, 10, "Serialize"))
+}
+
+test "an unknown type in a trait signature has its caret on the name" {
+    let src = "trait T \{ fn f(self) -> Nope }\nfn main() \{ io.println(\"x\") }\n"
+    assert_eq(errors_of(src), "UnknownType E0507 1:25: unknown type `Nope` in method `f` of trait `T`")
+}
