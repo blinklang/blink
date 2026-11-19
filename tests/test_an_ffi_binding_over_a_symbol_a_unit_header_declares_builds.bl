@@ -1,0 +1,276 @@
+// A C header that the unit reads can declare a symbol that a binding also names, with types
+// no Blink signature spells (`const char *`, `size_t`, `ssize_t`). A second prototype written
+// from the Blink signature then conflicts with the header's, and C rejects the unit. The
+// binding must build and call the symbol whether the binding names the header or not, on both
+// build paths. Each row builds and runs the program in its own directory and checks what it
+// prints.
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_unit_decl.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"udecl\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path. The program runs in `dir`, so it can make
+// files by relative path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && rm -f a.txt b.txt c.txt && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+// zig cc keeps its own cache and prints no warning when it gives back a cached object, so a
+// row that reads C warnings compiles with a zig cache of its own.
+fn blink_in_fresh_zig(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    let _ = sh("rm -rf {dir}/zig-cache")
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache ZIG_GLOBAL_CACHE_DIR={dir}/zig-cache ZIG_LOCAL_CACHE_DIR={dir}/zig-cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// Runs `source` on both build paths and checks that each prints `want`.
+fn runs_and_prints(source: Str, want: Str) ! FS.Write, Process.Spawn, IO.Print {
+    let dir = project(source)
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), want, "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), want, "--no-per-module: {diag(one)}")
+}
+
+// Makes a.txt, links b.txt to it, makes c.txt a symlink to it, and reads the symlink back.
+fn link_main() -> Str {
+    #"
+fn main() {
+    fs.write("a.txt", "hi").unwrap()
+    with ffi.scope() as s {
+        let l = c_link(s.cstr("a.txt"), s.cstr("b.txt"))
+        let y = c_symlink(s.cstr("a.txt"), s.cstr("c.txt"))
+        let buf = s.alloc_n[U8](64)
+        let n = c_readlink(s.cstr("c.txt"), buf, 63)
+        io.println("{l} {y} {n} {buf.to_str() ?? "-"} {fs.read("b.txt").unwrap()}")
+    }
+}
+"#
+}
+
+test "link, symlink and readlink over Ptr[U8] build and run, without header:" {
+    let src = #"
+@ffi("link")
+@trusted(audit: "T1")
+fn c_link(old: Ptr[U8], new: Ptr[U8]) -> I32 ! () {}
+
+@ffi("symlink")
+@trusted(audit: "T1")
+fn c_symlink(target: Ptr[U8], path: Ptr[U8]) -> I32 ! () {}
+
+@ffi("readlink")
+@trusted(audit: "T1")
+fn c_readlink(path: Ptr[U8], buf: Ptr[U8], n: U64) -> I64 ! () {}
+"#.concat(link_main())
+    runs_and_prints(src, "0 0 5 a.txt hi")
+}
+
+test "link, symlink and readlink over Ptr[U8] build and run, under header: unistd.h" {
+    let src = #"
+@ffi("link", header: "unistd.h")
+@trusted(audit: "T1")
+fn c_link(old: Ptr[U8], new: Ptr[U8]) -> I32 ! () {}
+
+@ffi("symlink", header: "unistd.h")
+@trusted(audit: "T1")
+fn c_symlink(target: Ptr[U8], path: Ptr[U8]) -> I32 ! () {}
+
+@ffi("readlink", header: "unistd.h")
+@trusted(audit: "T1")
+fn c_readlink(path: Ptr[U8], buf: Ptr[U8], n: U64) -> I64 ! () {}
+"#.concat(link_main())
+    runs_and_prints(src, "0 0 5 a.txt hi")
+}
+
+// setenv takes `const char *`; getenv and getcwd return `char *` to a Ptr[U8].
+test "setenv over Ptr[U8] and a Ptr[U8] return over a char pointer build and run" {
+    let src = #"
+@ffi("setenv", header: "stdlib.h")
+@trusted(audit: "T1")
+fn c_setenv(name: Ptr[U8], value: Ptr[U8], overwrite: I32) -> I32 ! () {}
+
+@ffi("getenv")
+@trusted(audit: "T1")
+fn c_getenv(name: Ptr[U8]) -> Ptr[U8] ! () {}
+
+@ffi("getcwd", header: "unistd.h")
+@trusted(audit: "T1")
+fn c_getcwd(buf: Ptr[U8], n: U64) -> Ptr[U8] ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        let r = c_setenv(s.cstr("UDECL_VAR"), s.cstr("v1"), 1)
+        let buf = s.alloc_n[U8](4096)
+        let cwd = c_getcwd(buf, 4095).to_str() ?? "-"
+        io.println("{r} {c_getenv(s.cstr("UDECL_VAR")).to_str() ?? "-"} {cwd == (buf.to_str() ?? "")} {cwd.len() > 0}")
+    }
+}
+"#
+    runs_and_prints(src, "0 v1 true true")
+}
+
+// No header the unit reads declares cos, so the binding's own prototype stays.
+test "cos under header: math.h still builds and runs" {
+    let src = #"
+@ffi("cos", header: "math.h")
+@trusted(audit: "T1")
+fn c_cos(x: Float) -> Float ! () {}
+
+fn main() {
+    io.println("{c_cos(0.0)}")
+}
+"#
+    runs_and_prints(src, "1")
+}
+
+let OPS_MANIFEST = "[package]\nname = \"udecl\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nops = \{ type = \"vendored\", path = \"vendor/ops.c\", headers = [\"ops.h\"] \}\n"
+
+let OPS_HEADER = "#ifndef OPS_H\n#define OPS_H\nstruct ops_cell \{ int n; };\nint ops_len(const char *s);\n#endif\n"
+
+let OPS_SOURCE = "#include \"ops.h\"\nint ops_len(const char *s) \{ int n = 0; while (s[n]) n++; return n; }\n"
+
+// Module `cell` reads ops.h for its mirror, and ops.h declares ops_len over `const char *`.
+// The entry module binds the same symbol, so on the per-module path two units each write a
+// prototype that the header can conflict with.
+test "two modules bind a symbol that a mirror's header declares" {
+    let dir = project(#"
+import cell
+
+@ffi("ops", "ops_len")
+@trusted(audit: "T1")
+fn main_len(s: Ptr[U8]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        io.println("{main_len(s.cstr("abc"))} {cell.len_of("abcd")}")
+    }
+}
+"#)
+    fs.write("{dir}/blink.toml", OPS_MANIFEST).unwrap()
+    let _ = sh("mkdir -p {dir}/vendor")
+    fs.write("{dir}/vendor/ops.h", OPS_HEADER).unwrap()
+    fs.write("{dir}/vendor/ops.c", OPS_SOURCE).unwrap()
+    fs.write("{dir}/src/cell.bl", #"@ffi.struct(header: "ops.h", name: "ops_cell")
+pub type Cell { n: I32 }
+
+@ffi("ops", "ops_len")
+@trusted(audit: "T1")
+fn cell_len(s: Ptr[U8]) -> I32 ! () {}
+
+pub fn len_of(text: Str) -> I32 {
+    with ffi.scope() as s {
+        let c = s.alloc[Cell]()
+        c.n.write(cell_len(s.cstr(text)))
+        c.n.read()
+    }
+}
+"#).unwrap()
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), "3 4", "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), "3 4", "--no-per-module: {diag(one)}")
+}
+
+// clang knows cos as a library builtin with no header read. That is not a declaration in the
+// unit, so the binding keeps its own prototype and the unit compiles for a zig target.
+test "cos with no header builds for a clang cross target" {
+    let dir = project(#"
+@ffi("cos")
+@trusted(audit: "T1")
+fn c_cos(x: Float) -> Float ! () {}
+
+fn main() {
+    io.println("{c_cos(0.0)}")
+}
+"#)
+    let pm = blink_in(dir, "build --per-module --target x86_64-linux-gnu src/main.bl")
+    let one = blink_in(dir, "build --no-per-module --target x86_64-linux-gnu src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+}
+
+// A call through the header's prototype passes uint8_t * where the header takes const char *.
+// clang warns on the sign of the pointer target by default, and gcc does not. The build must
+// pass in each mode and print no pointer-sign warning for it.
+test "a call through a header prototype over Ptr[U8] builds in each mode with no pointer-sign warning" {
+    let dir = project(#"
+@ffi("link")
+@trusted(audit: "T1")
+fn c_link(a: Ptr[U8], b: Ptr[U8]) -> I32 ! () {}
+
+@ffi("setenv", header: "stdlib.h")
+@trusted(audit: "T1")
+fn c_setenv(n: Ptr[U8], v: Ptr[U8], o: I32) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        io.println("{c_link(s.cstr("a.txt"), s.cstr("b.txt"))} {c_setenv(s.cstr("UDECL_W"), s.cstr("1"), 1)}")
+    }
+}
+"#)
+    let mut fails: List[Str] = []
+    for target in ["", " --target x86_64-linux-gnu"] {
+        for mode in ["", " --release", " --debug"] {
+            for path in [" --per-module", " --no-per-module"] {
+                let r = blink_in_fresh_zig(dir, "build{path}{mode}{target} src/main.bl")
+                if r.end != ChildEnd.Exited(0) || r.err_out.contains("pointer-sign") || r.out.contains("pointer-sign") {
+                    fails.push("build{path}{mode}{target}: {diag(r)}")
+                }
+            }
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(fails, [])
+}
+
+// The flag that hides the pointer-sign warning in generated C stays off a user's own C
+// source: there the warning is the user's to act on, so the build still prints it.
+test "a vendored C source still prints its own pointer-sign warning" {
+    let dir = project(#"
+@ffi("ops", "ops_len")
+@trusted(audit: "T1")
+fn c_len(s: Ptr[U8]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as s {
+        io.println("{c_len(s.cstr("abc"))}")
+    }
+}
+"#)
+    fs.write("{dir}/blink.toml", OPS_MANIFEST).unwrap()
+    let _ = sh("mkdir -p {dir}/vendor")
+    fs.write("{dir}/vendor/ops.h", OPS_HEADER).unwrap()
+    fs.write("{dir}/vendor/ops.c", "#include \"ops.h\"\nstatic int count(const char *s) \{ int n = 0; while (s[n]) n++; return n; }\nint ops_len(const char *s) \{ unsigned char u[1] = \{0}; return count(s) + count(u); }\n").unwrap()
+    let mut fails: List[Str] = []
+    for path in [" --per-module", " --no-per-module"] {
+        let _ = sh("rm -rf {dir}/build {dir}/cache")
+        let r = blink_in_fresh_zig(dir, "build{path} --target x86_64-linux-gnu src/main.bl")
+        if r.end != ChildEnd.Exited(0) || !r.err_out.contains("ops.c") || !r.err_out.contains("-Wpointer-sign") {
+            fails.push("build{path}: {diag(r)}")
+        }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(fails, [])
+}

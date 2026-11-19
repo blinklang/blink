@@ -74,6 +74,7 @@ import cg_trace_names.{cg_trace_names}
 import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line, build_passed_check}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
+import foreign_decl_probe
 import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
 import symbol_index.{collect_effects}
 import query.{query_index_source, query_answer}
@@ -1192,7 +1193,17 @@ fn cc_opt_flags(debug_mode: Int, release_mode: Int) -> List[Str] {
 // declarations its scan found, so a missed one must stop the build: gcc before 14 only warns
 // on a call to an undeclared function and then guesses an int return.
 fn unit_cc_flags() -> List[Str] {
-    ["-Werror=implicit-function-declaration"]
+    let mut flags = ["-Werror=implicit-function-declaration"]
+    for f in generated_c_flags() { flags.push(f) }
+    flags
+}
+
+// Flags for each compile of C that blink generates, and never for a user's C source. A call
+// through a header's prototype passes a Ptr[U8] as uint8_t * where C takes char *, and clang
+// warns on the sign of the pointer target by default. No change to the Blink source can stop
+// that warning, so it is noise to a user.
+fn generated_c_flags() -> List[Str] {
+    ["-Wno-pointer-sign"]
 }
 
 // The paths an object at this level records, for its key: the dir cc runs in, the dir its C
@@ -1544,7 +1555,8 @@ let mut cache_did_store: Int = 0
 // snap, the private copy of the C the build emitted.
 fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug_mode: Int, release_mode: Int, target: Str, arc_dir: Str, include_flags: Str, test_build: Bool) -> Str ! IO, FS.Read, FS.Write, Process.Spawn, FS.Delete, Env.Exit, Time.Read, Env.Read {
     let vendored_dirs = vendored_dirs_in(include_flags)
-    let flags = cc_opt_flags(debug_mode, release_mode)
+    let mut flags = cc_opt_flags(debug_mode, release_mode)
+    for f in generated_c_flags() { flags.push(f) }
     let paths = match recorded_paths(debug_mode, path_dirname(c_path), arc_dir) {
         Some(p) => p
         None => return ""
@@ -1568,7 +1580,8 @@ fn cache_compile_snapshot(out: Str, snap: Str, c_path: Str, snap_dir: Str, debug
     // The map gives the object the __FILE__ and debug paths a compile of c_path gives.
     // A failed compile prints nothing: on a miss the link compiles the same C, and
     // its failure reports the step.
-    let ran = run_cc_step("-c {snap} -o {staging} -MMD -MF {depfile} -ffile-prefix-map={snap_dir}={path_dirname(c_path)} {includes}", debug_mode, release_mode, target, test_build)
+    let declared = declared_guard_flags(snap, target, includes, debug_mode, release_mode)
+    let ran = run_cc_step("-c {generated_c_flags().join(" ")} {snap} -o {staging} -MMD -MF {depfile} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}{declared} {includes}", debug_mode, release_mode, target, test_build)
     if ran.rc != 0 {
         return ""
     }
@@ -1852,11 +1865,14 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     }
     let cached_o = if cache_dir != "" { cache_compile_snapshot(out, snap, c_path, snap_dir, debug_mode, release_mode, target, arc_dir, include_flags, test_build) } else { "" }
     // The map gives the binary the __FILE__ and debug paths a compile of c_path gives.
-    let compile_input = if cached_o != "" { cached_o } else { "{snap} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}" }
+    let compile_input = if cached_o != "" { cached_o } else { "{generated_c_flags().join(" ")} {snap} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}" }
+    // A compile of the C below drops the prototypes that a compile for the cache dropped.
+    let layer_inc = if compiler_archive != "" { " -I{compiler_archive}" } else { "" }
+    let unit_includes = if cached_o != "" { includes } else { declared_guard_flags(snap, target, "{includes}{layer_inc} -I{arc_dir}", debug_mode, release_mode).concat(includes) }
     // A program with no `fn main` compiles its C and links nothing (§6.7.7). An object the
     // cache gave has compiled already.
     if !link {
-        let crc = if cached_o != "" { 0 } else { compile_unit_only(snap, "{snap_dir}/unit.o", snap_dir, c_path, includes, arc_dir, compiler_archive, debug_mode, release_mode, target, test_build, ffi_note) }
+        let crc = if cached_o != "" { 0 } else { compile_unit_only(snap, "{snap_dir}/unit.o", snap_dir, c_path, unit_includes, arc_dir, compiler_archive, debug_mode, release_mode, target, test_build, ffi_note) }
         let _ = build_fs.remove_tree(snap_dir)
         if crc == 0 && cache_did_store == 1 {
             build_objcache.maybe_gc()
@@ -1866,8 +1882,8 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
     if build_objcache.dev_evict_at("link") {
         trace.log("blink.build.units", "dev evict link")
     }
-    let ran = run_cc_step("-o {out} {compile_input}{objs}{includes}{archive} {effective_link_flags}", debug_mode, release_mode, target, test_build)
-    let failed_rc = if ran.rc != 0 { report_link_target_failure(ran.output, cached_o, snap, includes, archive, debug_mode, release_mode, target, ffi_note) } else { 0 }
+    let ran = run_cc_step("-o {out} {compile_input}{objs}{unit_includes}{archive} {effective_link_flags}", debug_mode, release_mode, target, test_build)
+    let failed_rc = if ran.rc != 0 { report_link_target_failure(ran.output, cached_o, snap, unit_includes, archive, debug_mode, release_mode, target, ffi_note) } else { 0 }
     let _ = build_fs.remove_tree(snap_dir)
     if failed_rc != 0 {
         return failed_rc
@@ -1883,7 +1899,7 @@ fn do_link_target(out: Str, c_path: Str, c_source: Str, link_flags: Str, obj_fil
 fn compile_unit_only(snap: Str, obj: Str, snap_dir: Str, c_path: Str, includes: Str, arc_dir: Str, compiler_archive: Str, debug_mode: Int, release_mode: Int, target: Str, test_build: Bool, ffi_note: Str) -> Int ! IO, Process.Spawn, FS.Read, Env.Read {
     // A unit that imports a module of the compiler archive layer includes the layer's header.
     let layer = if compiler_archive != "" { " -I{compiler_archive}" } else { "" }
-    let ran = run_cc_step("-c {snap} -o {obj} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}{includes}{layer} -I{arc_dir}", debug_mode, release_mode, target, test_build)
+    let ran = run_cc_step("-c {generated_c_flags().join(" ")} {snap} -o {obj} -ffile-prefix-map={snap_dir}={path_dirname(c_path)}{includes}{layer} -I{arc_dir}", debug_mode, release_mode, target, test_build)
     if ran.rc != 0 {
         return generated_c_failed("compiling the generated C", ran.output, ffi_note)
     }
@@ -3427,6 +3443,44 @@ fn cc_is_clang() -> Bool ! IO, Process.Spawn {
     process_cc_id("").contains("clang")
 }
 
+// The flags that drop each guarded foreign prototype in the C file `c_file` whose symbol a
+// header the file reads already declares, for its compile for `target`, or "" for none
+// (§9.1). A C file that guards no prototype runs no probe. The flags are a function of the
+// C text, the includes and the compiler, which the object keys hold already. The probe sits
+// beside `c_file`, so a header the file includes by a quoted name is found the same way.
+fn declared_guard_flags(c_file: Str, target: Str, includes: Str, debug_mode: Int, release_mode: Int) -> Str ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+    let c_text = build_fs.read_or_empty(c_file)
+    let symbols = foreign_decl_probe.guarded_symbols(c_text)
+    let mut flags = ""
+    if !symbols.is_empty() {
+        let probe = "{c_file}.declprobe"
+        let mut code = -1
+        let text = foreign_decl_probe.probe_text(c_text, symbols)
+        if fs.write(probe, text).is_ok() {
+            // clang stops after 20 errors by default, and a probe that stops declares nothing.
+            // gcc has no such limit and rejects the flag.
+            let limit = if target != "" || cc_is_clang() { " -ferror-limit=0" } else { "" }
+            // clang knows a library function such as cos with no header read, and that is not
+            // a declaration the unit can call through. The probe reads English diagnostics.
+            let cmd = "LC_ALL=C {cc_command("-c {unit_cc_flags().join(" ")}{limit} -fno-builtin -x c {probe} -o {probe}.o {includes}", debug_mode, release_mode, target)}"
+            match process.run("sh", ["-c", cmd]) {
+                Ok(r) => {
+                    code = match r.end {
+                        ChildEnd.Exited(n) => n
+                        _ => -1
+                    }
+                    flags = foreign_decl_probe.guard_flags(foreign_decl_probe.declared_symbols(symbols, code, r.err_out))
+                }
+                Err(_) => {}
+            }
+        }
+        let _ = fs.delete(probe)
+        let _ = fs.delete("{probe}.o")
+        trace.log("blink.build.units", "declared {c_file} for {if target == "" { "host" } else { target }} (probe exit {code}):{flags}")
+    }
+    flags
+}
+
 // Compiles the units the cache cannot answer, largest first, then links every unit's object
 // against the archive.
 fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], shas: Option[Map[Str, Str]], link_flags: Str, obj_files: List[Str], include_flags: Str, debug_mode: Int, release_mode: Int, target: Str, unit_jobs: Int, test_build: Bool, ffi_note: Str, link: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
@@ -3598,7 +3652,8 @@ fn link_units(out: Str, work: Str, units_dir: Str, units: List[emit_record.Emitt
     let mut mi = 0
     for u in misses {
         trace.log("blink.build.units", "compile {u.stem}")
-        let line = "-c {unit_cc_flags().join(" ")} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -MMD -MF {obj_dir}/{u.stem}.d -ffile-prefix-map={work}={units_dir}"
+        let declared = declared_guard_flags("{work}/{u.stem}.c", target, includes, debug_mode, release_mode)
+        let line = "-c {unit_cc_flags().join(" ")}{declared} {work}/{u.stem}.c -o {obj_dir}/{u.stem}.o -MMD -MF {obj_dir}/{u.stem}.d -ffile-prefix-map={work}={units_dir}"
         cmds.push(cc_command("{line} {includes}", debug_mode, release_mode, target))
         if pch_hold != "" && prefixes.get(mi).unwrap() == pch_prefix && clang {
             pch_cmds.push(cc_command("{line} -include-pch {pch_hold}/{build_objcache.clang_pch_name()} {includes}", debug_mode, release_mode, target))

@@ -1,0 +1,54 @@
+// The probe that asks the C compiler which guarded foreign symbols a unit's headers declare
+// must declare a symbol only on an error on that symbol's own probe lines. Any other result
+// (a clean compile, an error in a header, a compiler that stopped early or never ran) declares
+// nothing, so the unit keeps the prototypes it writes from the Blink signatures.
+import foreign_decl_probe.{guarded_symbols, probe_text, declared_symbols, guard_flags}
+
+let UNIT = "#include \"libblink_std.h\"\ntypedef int blink_t;\n#ifndef BLINK_DECLARED_link\nextern int32_t link(uint8_t* a, uint8_t* b);\n#endif\nint32_t w(void);\n#ifndef BLINK_DECLARED_setenv\nextern int32_t setenv(uint8_t* a, uint8_t* b, int32_t c);\n#endif\n"
+
+let SYMBOLS = ["link", "symlink", "setenv"]
+
+test "the guarded symbols are read from the unit in order" {
+    assert_eq(guarded_symbols(UNIT), ["link", "setenv"])
+    assert_eq(guarded_symbols("#include \"libblink_std.h\"\nint main(void) \{ return 0; }\n"), [])
+}
+
+test "the probe reads the unit up to its first guard, then four lines per symbol" {
+    let text = probe_text(UNIT, ["link", "setenv"])
+    assert(text.starts_with("#include \"libblink_std.h\"\ntypedef int blink_t;\n#line 1 \"__blink_decl_probe__\"\n"))
+    assert(!text.contains("extern int32_t link"))
+    assert(text.contains("#ifdef link\n#error \"blink: link is a macro\"\n#endif\nextern struct __blink_decl_probe_tag link;\n"))
+    assert(text.ends_with("extern struct __blink_decl_probe_tag setenv;\n"))
+}
+
+test "an error on a symbol's own lines declares that symbol" {
+    let gcc = "In file included from __blink_decl_probe__:1:\n__blink_decl_probe__:4:37: error: 'link' redeclared as different kind of symbol\n/usr/include/unistd.h:819:12: note: previous declaration of 'link' with type 'int(const char *, const char *)'\n__blink_decl_probe__:12:37: error: 'setenv' redeclared as different kind of symbol\n"
+    assert_eq(declared_symbols(SYMBOLS, 1, gcc), ["link", "setenv"])
+    // A macro of the symbol's name is declared too.
+    let mac = "__blink_decl_probe__:6:2: error: \"blink: symlink is a macro\"\n__blink_decl_probe__:8:37: error: redefinition of 'symlink' as different kind of symbol\n"
+    assert_eq(declared_symbols(SYMBOLS, 1, mac), ["symlink"])
+    assert_eq(guard_flags(["link", "setenv"]), " -DBLINK_DECLARED_link -DBLINK_DECLARED_setenv")
+}
+
+test "a clean probe declares nothing" {
+    assert_eq(declared_symbols(SYMBOLS, 0, "__blink_decl_probe__:4:1: warning: unused\n"), [])
+}
+
+test "an error anywhere but on a symbol's lines declares nothing" {
+    // An error in a header the unit reads.
+    let header = "__blink_decl_probe__:4:37: error: 'link' redeclared as different kind of symbol\nvendor/widget.h:3:1: error: unknown type name 'wat'\n"
+    assert_eq(declared_symbols(SYMBOLS, 1, header), [])
+    // clang stopped early, so a later symbol was never tested.
+    let stopped = "__blink_decl_probe__:4:37: error: redefinition of 'link' as different kind of symbol\nfatal error: too many errors emitted, stopping now [-ferror-limit=]\n"
+    assert_eq(declared_symbols(SYMBOLS, 1, stopped), [])
+    // A line past the last symbol's lines.
+    assert_eq(declared_symbols(SYMBOLS, 1, "__blink_decl_probe__:13:1: error: expected identifier\n"), [])
+    // The compiler rejected a flag.
+    assert_eq(declared_symbols(SYMBOLS, 1, "clang: error: unknown argument: '-ferror-limit=0'\n"), [])
+}
+
+test "a probe that never ran declares nothing" {
+    assert_eq(declared_symbols(SYMBOLS, 127, "sh: 1: cc: not found\n"), [])
+    // Killed by a signal, with no diagnostics.
+    assert_eq(declared_symbols(SYMBOLS, -1, ""), [])
+}

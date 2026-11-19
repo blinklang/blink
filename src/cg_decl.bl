@@ -945,10 +945,13 @@ pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Repo
 // checked against the prologue's header: a Blink signature cannot spell what such a header
 // can (a pointer to const), so no prototype is written. Any other symbol gets a prototype
 // from the Blink signature, with each named mirror spelled as its C struct, which matches a
-// header the unit reads for the mirror and declares the function too. A binding's own
-// `header:` does not go into the unit: a header can hide its symbol behind a feature macro
-// the runtime does not set, and it can declare other symbols that another binding spells
-// its own way.
+// header the unit reads for the mirror and declares the function too. That prototype is
+// guarded, and the build drops it when the target's C compiler finds the symbol declared in
+// a header the unit reads, as for a prologue symbol. Only a wrapper whose call is the same
+// under both prototypes is guarded: a mirror that names no C struct crosses another way
+// when the header declares the symbol. A binding's own `header:` does not go into the unit:
+// a header can hide its symbol behind a feature macro the runtime does not set, and it can
+// declare other symbols that another binding spells its own way.
 pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
     let symbol = c_ffi_symbol(fn_node)
     let crossings = foreign_crossings(fn_node)
@@ -961,12 +964,28 @@ pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
     let back = sides.get(sides.len() - 1) ?? ""
     if !declared {
         let c_ret = if back != "" { back } else { ret }
-        if !write_foreign_decl(fn_node, c_ret, symbol, foreign_c_params(fn_node, params, sides)) { return }
+        let guarded = same_call_if_declared(crossings, sides)
+        if !write_foreign_decl(fn_node, c_ret, symbol, foreign_c_params(fn_node, params, sides), guarded) { return }
     }
     let pass = foreign_call_args(fn_node, crossings, sides)
     print_fn(false, ret, cg_decl_c_name(fn_node), params, cg_decl_takes_ev(fn_node),
         foreign_call_block(fn_node, symbol, ret, pass, back))
     emit_display_dispatch_def(fn_node, false)
+}
+
+// Whether the wrapper written for an undeclared symbol, from `sides`, passes the same
+// arguments when a header declares it, so the build may drop its prototype. C then checks
+// each argument against the header's parameter type, and a pointer type that C does not
+// convert (`uint8_t **` to `char *const *`) still stops the build.
+fn same_call_if_declared(crossings: List[Crossing], sides: List[Str]) -> Bool {
+    let mut i = 0
+    while i < crossings.len() {
+        let cross = crossings.get(i).unwrap()
+        if cross.decl == DECL_NODE_AMBIGUOUS { return false }
+        if foreign_c_side(cross, true) != (sides.get(i) ?? "") { return false }
+        i = i + 1
+    }
+    true
 }
 
 // The prototype's parameters: the wrapper's own, with each named mirror's spelling swapped
@@ -987,11 +1006,11 @@ fn foreign_c_params(fn_node: Int, params: List[Str], sides: List[Str]) -> List[S
 // the unit has none yet. A second binding that asks for a different one is refused: C
 // rejects the pair, and picking either prototype makes one of the two wrappers call the
 // foreign function under a signature its own source never wrote.
-fn write_foreign_decl(site: Int, ret: Str, symbol: Str, params: List[Str]) -> Bool ! Diag.Report {
+fn write_foreign_decl(site: Int, ret: Str, symbol: Str, params: List[Str], guarded: Bool) -> Bool ! Diag.Report {
     let shape = ret.concat("(").concat(params.join(", ")).concat(")")
     if !foreign_decls.contains_key(symbol) {
         foreign_decls.insert(symbol, shape)
-        print_foreign_decl(ret, symbol, params)
+        print_foreign_decl(ret, symbol, params, guarded)
         return true
     }
     if foreign_decls.get(symbol).unwrap() == shape { return true }

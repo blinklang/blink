@@ -1,0 +1,90 @@
+// Which foreign symbols the headers a unit reads already declare (§9.1).
+//
+// Codegen guards the prototype it writes from a Blink signature, and a C header can declare
+// the same symbol with types no Blink signature spells (`const char *`, `size_t`). Two such
+// prototypes conflict, so the build asks the target's C compiler which guarded symbols the
+// unit's own includes declare, and defines the guard of each one for the unit's compile.
+//
+// The probe is the unit's C up to its first guard, then the lines that test each symbol. An error on
+// a symbol's lines says the headers declare it: a macro of that name is an `#error`, and a
+// declaration of any kind conflicts with `extern struct <tag> <symbol>;`, a variable of a
+// struct type no header names. A probe that fails for any other reason, or that cannot run,
+// declares nothing, so the unit keeps the prototypes it has today.
+
+import cg_emit.{DECLARED_GUARD_PREFIX}
+
+// The file name the probe's own lines report under, after a `#line` directive.
+let PROBE_FILE = "__blink_decl_probe__"
+
+fn guard_open() -> Str { "#ifndef {DECLARED_GUARD_PREFIX}" }
+
+// The lines that test one symbol. An error on any of them declares that symbol.
+fn symbol_lines(s: Str) -> List[Str] {
+    ["#ifdef {s}", "#error \"blink: {s} is a macro\"", "#endif", "extern struct __blink_decl_probe_tag {s};"]
+}
+
+// The symbols whose prototypes `c_text` guards, in the order the text writes them.
+pub fn guarded_symbols(c_text: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    let open = guard_open()
+    for line in c_text.split("\n") {
+        if !line.starts_with(open) { continue }
+        let symbol = line.byte_slice(open.byte_len(), line.byte_len()).trim()
+        if symbol != "" && !out.contains(symbol) { out.push(symbol) }
+    }
+    out
+}
+
+// The probe for `symbols` over the unit text `c_text`: the unit's C before its first guard,
+// so the probe reads every header the unit reads by then, and the lines that test each symbol.
+pub fn probe_text(c_text: Str, symbols: List[Str]) -> Str {
+    let mut prefix = match c_text.byte_index_of("\n{guard_open()}", 0) {
+        Some(n) => c_text.byte_slice(0, n + 1)
+        None => c_text
+    }
+    if prefix != "" && !prefix.ends_with("\n") { prefix = prefix.concat("\n") }
+    let mut parts: List[Str] = ["#line 1 \"{PROBE_FILE}\""]
+    for s in symbols {
+        for l in symbol_lines(s) { parts.push(l) }
+    }
+    prefix.concat(parts.join("\n")).concat("\n")
+}
+
+// The symbols the probe found declared, from the C compiler's exit code and diagnostics. An
+// error anywhere but on a symbol's own lines means the probe did not run clean, and then no
+// symbol is declared.
+pub fn declared_symbols(symbols: List[Str], exit_code: Int, cc_err: Str) -> List[Str] {
+    let mut out: List[Str] = []
+    if exit_code == 0 { return out }
+    let marker = "{PROBE_FILE}:"
+    for raw in cc_err.split("\n") {
+        if !raw.contains("error:") { continue }
+        let i = probe_symbol_of(raw, marker)
+        if i < 0 || i >= symbols.len() { return [] }
+        let s = symbols.get(i).unwrap()
+        if !out.contains(s) { out.push(s) }
+    }
+    out
+}
+
+// The index of the symbol whose probe lines a diagnostic names, or -1 when it names none.
+fn probe_symbol_of(raw: Str, marker: Str) -> Int {
+    let at = match raw.byte_index_of(marker, 0) {
+        Some(n) => n + marker.byte_len()
+        None => return -1
+    }
+    let rest = raw.byte_slice(at, raw.byte_len())
+    let line = match rest.byte_index_of(":", 0) {
+        Some(n) => rest.byte_slice(0, n).to_int()
+        None => return -1
+    }
+    if line < 1 { return -1 }
+    (line - 1) / symbol_lines("").len()
+}
+
+// The C compiler flags that define the guard of each declared symbol.
+pub fn guard_flags(declared: List[Str]) -> Str {
+    let mut out = ""
+    for s in declared { out = out.concat(" -D{DECLARED_GUARD_PREFIX}{s}") }
+    out
+}
