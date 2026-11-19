@@ -10336,6 +10336,7 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
     if tc_arg_binds_free.len() == 0 { tc_arg_binds_free.push(Map()) }
     let mut seen = tc_arg_binds_free.pop().unwrap()
     seen.clear()
+    let ffi_call = tc_decl_is_ffi_fn(fs.decl)
     let n = sublist_length(args_sl)
     let mut i = 0
     while i < n {
@@ -10365,7 +10366,7 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
                 // A type parameter that an earlier argument fixed joins the two arguments, and
                 // projection is no join; only a parameter written as a handler type projects.
                 let projects = tc_handler_effect_of(bound) != ""
-                arg_t = check_one_arg_shape(fn_name, i, arg_node, ptid, projects)
+                arg_t = check_one_arg_shape_at(fn_name, i, arg_node, ptid, projects, ffi_call)
             }
             if arg_t >= 0 { unify_typevar_binds(formal, arg_t, seen) }
         }
@@ -10412,6 +10413,28 @@ fn tc_pin_param_into_arg(ptid: Int, arg_node: Int, arg_t: Int) ! TypeCheck.Resol
 }
 
 fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int, projects: Bool) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
+    check_one_arg_shape_at(fn_name, idx, arg_node, ptid, projects, false)
+}
+
+// Whether `decl` is a function that `@ffi` binds to a C symbol.
+pub fn tc_decl_is_ffi_fn(decl: Int) -> Bool {
+    decl >= 0 && node_kind(decl) == NodeKind.FnDef && get_annotation(decl, "ffi") != -1
+}
+
+// At an argument of a call to an `@ffi` function, and only there, any `Ptr[T]` passes to a
+// `Ptr[Void]` parameter (07 §9.1.1, *A `Ptr` at an `@ffi` Call*). One level deep: the
+// parameter is `Ptr[Void]` itself, so `Ptr[Ptr[U8]]` does not pass to `Ptr[Ptr[Void]]`. It is
+// not a subtype, so types_compatible keeps the two apart everywhere else.
+fn tc_ffi_arg_passes_as_void_ptr(ptid: Int, arg_t: Int) -> Bool {
+    let p = resolve_alias_tid(tc_resolve(ptid))
+    let a = resolve_alias_tid(tc_resolve(arg_t))
+    if tc_tid_kind(p) != TyKind.Ptr || tc_tid_kind(a) != TyKind.Ptr { return false }
+    tc_tid_child_count(p) > 0 && tc_ptr_pointee_is_void(tc_tid_child(p, 0))
+}
+
+// `ffi_call` says the call names an `@ffi` function, where a `Ptr` argument may pass to a
+// `Ptr[Void]` parameter. The argument keeps its own type, which the E0601 scope check reads.
+fn check_one_arg_shape_at(fn_name: Str, idx: Int, arg_node: Int, ptid: Int, projects: Bool, ffi_call: Bool) -> Int ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     tc_seed_expected_into_value(arg_node, ptid)
     let arg_hint = resolve_alias_tid(ptid)
     let saved_hint = tc_construct_hint
@@ -10480,6 +10503,9 @@ fn check_one_arg_shape(fn_name: Str, idx: Int, arg_node: Int, ptid: Int, project
             // so one mistake stays one error.
             diag_error_at("TemplateMismatch", TEMPLATE_MISMATCH, "expected {type_to_str(ptid)}, found {type_to_str(arg_t)} — string variables cannot be implicitly converted to Template", arg_node, "pass the string literal directly, or wrap values in Raw() for dynamic SQL")
             lit_to_int = 1
+        }
+        if lit_to_int == 0 && ffi_call && tc_ffi_arg_passes_as_void_ptr(ptid, arg_t) {
+            return arg_t
         }
         if lit_to_int == 0 && projects && tc_handler_short_of(ptid, arg_t) {
             tc_report_handler_coverage(arg_node, ptid, arg_t)
@@ -18311,7 +18337,7 @@ fn check_deprecated_type(type_name: Str, usage_node: Int) ! Diag.Report {
 }
 
 // `Ptr[Void]` is `void*`: no value lies behind it to read or store (07 §9.1.1, E0825).
-fn tc_ptr_pointee_is_void(pointee: Int) -> Bool {
+pub fn tc_ptr_pointee_is_void(pointee: Int) -> Bool {
     resolve_alias_tid(tc_resolve(pointee)) == TYPE_VOID
 }
 
@@ -35145,9 +35171,9 @@ fn types_compatible(a0: Int, b0: Int) -> Int {
         //
         // Ptr[Void] is deliberately NOT special-cased into a universal pointer. C converts
         // void* implicitly in both directions, so importing that rule would make every Ptr
-        // assignable to every other via one Void hop — the exact hole this arm closes. If a real
-        // FFI signature needs the C conversion, it belongs in an explicit cast, not in the
-        // compatibility relation.
+        // assignable to every other via one Void hop — the exact hole this arm closes. The one
+        // place a Ptr passes to Ptr[Void] is an argument of an @ffi call
+        // (tc_ffi_arg_passes_as_void_ptr), which is not this relation.
         TyKind.Ptr => tc_type_part_compatible(ta.inner1, tb.inner1)
         // The phantom injection context, and the same one-inner recursion for a third
         // distinct reason: sections/03b_contracts.md:566 is normative — "`Template[DB]` and

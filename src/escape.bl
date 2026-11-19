@@ -22,7 +22,7 @@ import typecheck.{
     tc_global_decl_node, tc_ident_binder_node, tc_tid_is_pointer_bearing, tc_tid_reaches_itself,
     tc_type_str, tc_qualified_carrier, tc_decl_param_count, tc_decl_param_name, tc_decl_param_tid,
     tc_struct_field_slots, tc_sfield_name, tc_sfield_tid, tc_member_tid_at_instance, tc_declared_field_tids, tc_tid_decl_grows,
-    tc_tid_child_count, tc_tid_is_no_info, tc_tid_has_bare_typevar, tc_arg_value_at,
+    tc_tid_child_count, tc_tid_is_no_info, tc_tid_has_bare_typevar, tc_arg_value_at, tc_ptr_pointee_is_void, tc_decl_is_ffi_fn,
 }
 import free_names.{closure_read_idents, pattern_names, push_param_names}
 import unparse.{unparse_expr}
@@ -1646,16 +1646,20 @@ fn ffi_creation_by_assignment(node: Int) {
 // Whether a parameter is pointer-holding (§9.1.1, rule 4) at this call. The
 // declared type decides the kind, and the argument's type the element types,
 // so a generic `List[T]` holds pointers where `T` is a pointer. A concrete
-// declared pointee decides a `Ptr`, since the callee sees only that type.
+// declared pointee decides a `Ptr`, since the callee sees only that type. A
+// `Void` pointee at an `@ffi` call is the exception: there any `Ptr[T]` passes
+// to `Ptr[Void]`, and the scope check reads the type of the argument
+// (07 *A `Ptr` at an `@ffi` Call*). Elsewhere the argument is `Ptr[Void]` too.
 // `declared` is -3 where the receiver's own type stands in for it.
-fn ffi_is_pointer_holding(declared: Int, arg: Int) -> Bool {
+fn ffi_is_pointer_holding(declared: Int, arg: Int, ffi_call: Bool) -> Bool {
     let inst = tc_resolve(tc_lookup_node_tid(arg))
     if inst < 0 { return false }
     let d = if declared >= 0 { tc_resolve(declared) } else { inst }
     let dk = tc_tid_kind(d)
     if dk != tc_tid_kind(inst) { return false }
     if dk == TyKind.Ptr {
-        let pointee = if tc_tid_has_bare_typevar(d) == 0 { tc_tid_child(d, 0) } else { tc_tid_child(inst, 0) }
+        let from_arg = tc_tid_has_bare_typevar(d) != 0 || (ffi_call && tc_ptr_pointee_is_void(tc_tid_child(d, 0)))
+        let pointee = if from_arg { tc_tid_child(inst, 0) } else { tc_tid_child(d, 0) }
         return tc_tid_is_pointer_bearing(pointee) != 0
     }
     if ffi_is_collection_kind(dk) { return tc_tid_is_pointer_bearing(inst) != 0 }
@@ -1767,11 +1771,12 @@ fn check_ffi_call_beside_holder(call: Int, method_obj: Int) ! Diag.Report {
     }
     let mut holders: List[Int] = []
     let mut cells: List[Int] = []
+    let ffi_call = tc_decl_is_ffi_fn(decl)
     let mut hi = 0
     while hi < args.len() {
         let d = declared.get(hi).unwrap()
         let a = args.get(hi).unwrap()
-        if d != -2 && ffi_is_pointer_holding(d, a) {
+        if d != -2 && ffi_is_pointer_holding(d, a, ffi_call) {
             holders.push(hi)
             cells.push(ffi_holder_cell_tag(a))
         }
@@ -1896,7 +1901,16 @@ fn ffi_value_what(val: Int) -> Str {
 fn emit_ffi_call_store(call: Int, holder: Int, declared: Int, pname: Str, val: Int, vtag: Int, cell: Int) ! Diag.Report {
     let what = ffi_value_what(val)
     let inst = tc_resolve(tc_lookup_node_tid(holder))
-    let param = if pname == "" || pname == "self" { "the receiver `{tc_type_str(inst)}`" } else { "parameter `{pname}: {tc_type_str(declared)}`" }
+    let d = if declared >= 0 { tc_resolve(declared) } else { -1 }
+    // A `Ptr[Void]` parameter holds pointers only through the argument passed to it.
+    let void_param = d >= 0 && tc_tid_kind(d) == TyKind.Ptr && tc_ptr_pointee_is_void(tc_tid_child(d, 0))
+    let param = if pname == "" || pname == "self" {
+        "the receiver `{tc_type_str(inst)}`"
+    } else if void_param {
+        "the argument `{tc_type_str(inst)}` of parameter `{pname}: {tc_type_str(declared)}`"
+    } else {
+        "parameter `{pname}: {tc_type_str(declared)}`"
+    }
     let mut field = ""
     if tc_tid_kind(inst) == TyKind.Ptr {
         let pointee = tc_resolve(tc_tid_child(inst, 0))

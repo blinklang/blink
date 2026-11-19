@@ -46,7 +46,7 @@ import typecheck.{
 }
 import layout.{
     LayoutRecord, Position, SlotForm, Slot, layout_of, carrier_member_layout, tid_of_node,
-    child_tid, ensure_typedef_for, format_spec_of, varargs_spelling, nominal_name_of,
+    child_tid, ensure_typedef_for, format_spec_of, varargs_spelling, nominal_name_of, erased_pointer_spelling,
     tid_of_binder, current_binder_scope, current_inst, decl_has_derive,
     container_slot_spelling, field_layout_of, address_layout_of, fn_pointer_spelling_of,
     binder_scope_push, binder_scope_pop, bind_binder_mut, binder_c_name_of, pointer_spelling, handle_pointee_spelling,
@@ -88,7 +88,7 @@ import cg_eff.{
     cg_eff_enter_inline_frame, cg_eff_leave_inline_frame, cg_eff_binder_is_shared, cg_eff_declare_cell,
 }
 import cg_promote.{cg_promote_on_demand_claim, cg_promote_on_demand_settle, cg_promote_on_demand_queue}
-import cg_decl.{BodySite, cg_decl_body_site, cg_decl_c_name, cg_decl_has_display_dispatch, cg_decl_is_per_instance, cg_decl_takes_ev, display_method}
+import cg_decl.{BodySite, cg_decl_body_site, cg_decl_c_name, cg_decl_direct_foreign_erased, cg_decl_has_display_dispatch, cg_decl_is_per_instance, cg_decl_takes_ev, display_method}
 import cg_derive.{cg_derive_range_debug_fn, cg_derive_range_clone_fn, cg_derive_debug_text, cg_derive_container_debug_text, cg_derive_hash_of}
 import cg_trace.{cg_trace_body_traced, cg_trace_builtin_effect, cg_trace_is_mut_self_call, cg_trace_note_mut_self_call, cg_trace_state}
 import diagnostics.{
@@ -2058,8 +2058,9 @@ fn cc_declared_call(node: Int, decl: Int, recv: Int) -> Int ! Diag.Report {
 // the parameters `decl` declares rather than by where the call writes them.
 fn cc_build_declared_call(node: Int, symbol: Str, recv: Int, decl: Int) -> Int ! Diag.Report {
     let lead = if recv == NO_RECEIVER { 0 } else { 1 }
+    let erased = cg_decl_direct_foreign_erased(decl)
     let call = match cc_args_in_param_order(node, decl, lead) {
-        Some(operands) => cc_build_call_of(node, symbol, recv, CallForm.Declared, cg_decl_takes_ev(decl), operands)
+        Some(operands) => cc_build_call_erasing(node, symbol, recv, CallForm.Declared, cg_decl_takes_ev(decl), operands, erased)
         None => -1
     }
     // Noted once the arguments have lowered, so a call among them does not take its place.
@@ -6907,6 +6908,13 @@ fn cc_build_call(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev: Bo
 // `operands` are the argument nodes after the receiver, in the order the callee declares
 // its parameters, which is the order C passes them in.
 fn cc_build_call_of(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev: Bool, operands: List[Int]) -> Int ! Diag.Report {
+    cc_build_call_erasing(node, symbol, recv, form, takes_ev, operands, [])
+}
+
+// `erased` marks, per declared param, an argument that crosses to a foreign symbol as `void*`
+// (cg_decl_direct_foreign_erased). An `@ffi` call passes any `Ptr[T]` to `Ptr[Void]`, and C
+// takes only `void*` for every pointee type (07 *A `Ptr` at an `@ffi` Call*).
+fn cc_build_call_erasing(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev: Bool, operands: List[Int], erased: List[Bool]) -> Int ! Diag.Report {
     let tid = tid_of_node(node)
     if tid < 0 { return -1 }
     let rec = cc_local(tid, node)
@@ -6925,6 +6933,7 @@ fn cc_build_call_of(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev:
         if args.get(i).unwrap() < 0 { return -1 }
         i = i + 1
     }
+    if erased.len() > 0 { args = cc_erase_args(node, args, erased) }
     // A foreign binding of an entry that can fault reaches its sited form, whether the call
     // was written as a method or as the binding itself.
     let mut callee = symbol
@@ -6940,6 +6949,17 @@ fn cc_build_call_of(node: Int, symbol: Str, recv: Int, form: CallForm, takes_ev:
         return ir_call_runtime(tid, node, rec.c_spelling, callee, rec.slot_form, args)
     }
     ir_call_direct(tid, node, rec.c_spelling, callee, rec.slot_form, args)
+}
+
+fn cc_erase_args(node: Int, args: List[Int], erased: List[Bool]) -> List[Int] {
+    let mut out: List[Int] = []
+    let mut i = 0
+    while i < args.len() {
+        let arg = args.get(i).unwrap()
+        out.push(if erased.get(i) ?? false { ir_cast(ir_tid(arg), node, erased_pointer_spelling(), arg) } else { arg })
+        i = i + 1
+    }
+    out
 }
 
 // A receiver lowered ahead of an argument, read by the call after the statements that

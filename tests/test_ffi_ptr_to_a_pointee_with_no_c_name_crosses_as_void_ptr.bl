@@ -1,0 +1,230 @@
+// §9.1.1, *A `Ptr` at an `@ffi` Call*: in the C of an `@ffi` call, a pointee that is an
+// `@ffi.struct` or an `@ffi.opaque` keeps its C name. Every other pointee (Void, a scalar, a
+// Ptr to these, at any depth) names no C type, so it crosses as `void *`, and a Ptr result
+// comes back by plain assignment. Each row builds on both build paths.
+//
+// Without the rule, `Ptr[Ptr[U8]]` reached the C compiler as `uint8_t **` against the header's
+// `char **`, and the build stopped with GeneratedCDidNotCompile.
+
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_ffi_ptr_void.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// Runs `source` on both build paths and checks that each prints `want`.
+fn runs_and_prints(source: Str, want: Str) ! FS.Write, Process.Spawn, IO.Print {
+    let dir = project(source)
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), want, "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), want, "--no-per-module: {diag(one)}")
+}
+
+test "a Ptr[Ptr[U8]] crosses to strtol, which takes char **" {
+    let src = #"@ffi("strtol", header: "stdlib.h")
+@trusted(audit: "STRTOL")
+fn c_strtol(s: Ptr[U8], end: Ptr[Ptr[U8]], base: I32) -> Int ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let s = scope.cstr("42xyz")
+        let end: Ptr[Ptr[U8]] = scope.alloc[Ptr[U8]]()
+        io.println("{c_strtol(s, end, 10)} {end.deref().deref()}")
+    }
+}
+"#
+    runs_and_prints(src, "42 120")
+}
+
+// Under each build path the unit also binds strtol, whose bad call came before execv's
+// prototype and so hid the header's declaration of execv from the build.
+test "a Ptr[Ptr[U8]] argv crosses to execv, which takes char *const *" {
+    let src = #"@ffi("strtol", header: "stdlib.h")
+@trusted(audit: "STRTOL")
+fn c_strtol(s: Ptr[U8], end: Ptr[Ptr[U8]], base: I32) -> Int ! () {}
+
+@ffi("execv", header: "unistd.h")
+@trusted(audit: "EXECV")
+fn c_execv(path: Ptr[U8], argv: Ptr[Ptr[U8]]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let end: Ptr[Ptr[U8]] = scope.alloc[Ptr[U8]]()
+        let n = c_strtol(scope.cstr("7"), end, 10)
+        let argv: Ptr[Ptr[U8]] = scope.alloc_n[Ptr[U8]](4)
+        argv.write(scope.cstr("sh"))
+        argv.offset(1).write(scope.cstr("-c"))
+        argv.offset(2).write(scope.cstr("echo exec-ok-{n}"))
+        let _ = c_execv(scope.cstr("/bin/sh"), argv)
+        io.println("execv failed")
+    }
+}
+"#
+    runs_and_prints(src, "exec-ok-7")
+}
+
+// The C compiler takes `char *` into `uint8_t *` with a warning only, so the row reads the
+// generated C to see the result come back through `void *`.
+test "a Ptr[U8] result comes back from getenv, which returns char *" {
+    let src = #"@ffi("getenv", header: "stdlib.h")
+@trusted(audit: "GETENV")
+fn c_getenv(name: Ptr[U8]) -> Ptr[U8] ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let none = c_getenv(scope.cstr("BLINK_FFI_PTR_VOID_UNSET_NAME"))
+        let path = c_getenv(scope.cstr("PATH"))
+        io.println("{none.is_null()} {path.is_null()}")
+    }
+}
+"#
+    runs_and_prints(src, "true false")
+    let dir = project(src)
+    let r = blink_in(dir, "build --no-per-module --emit c src/main.bl")
+    let c = sh("cat {dir}/build/main.c").out
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert(c.contains("_cg_ffi_ret1 = getenv(((void*)(b_name)));"), c)
+    assert(c.contains("void* _cg_ffi_ret1"), c)
+}
+
+test "a Ptr[U8] passes to the Ptr[Void] parameter of memset" {
+    let src = #"@ffi("memset", header: "string.h")
+@trusted(audit: "MEMSET")
+fn c_memset(p: Ptr[Void], c: I32, n: Int) -> Ptr[Void] ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let b: Ptr[U8] = scope.alloc_n[U8](4)
+        let back = c_memset(b, 65, 3)
+        io.println("{b.deref()} {b.offset(2).deref()} {b.offset(3).deref()} {back.is_null()}")
+    }
+}
+"#
+    runs_and_prints(src, "65 65 0 false")
+}
+
+fn timespec_program(fields: Str) -> Str {
+    #"@ffi.struct(header: "time.h", name: "timespec")
+type Timespec { "#.concat(fields).concat(#" }
+
+@ffi("clock_gettime", header: "time.h")
+@trusted(audit: "CLOCK")
+fn c_clock_gettime(clock: I32, ts: Ptr[Timespec]) -> I32 ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let ts: Ptr[Timespec] = scope.alloc[Timespec]()
+        io.println("{c_clock_gettime(0, ts)} {ts.tv_sec.read() > 0}")
+    }
+}
+"#)
+}
+
+// A pointee that names a C struct crosses as that struct, not as `void *`, so the C compiler
+// still checks it against the header.
+test "a Ptr to a named mirror keeps its struct type in the generated C" {
+    let src = timespec_program("tv_sec: I64, tv_nsec: I64")
+    runs_and_prints(src, "0 true")
+    let dir = project(src)
+    let r = blink_in(dir, "build --no-per-module --emit c src/main.bl")
+    let c = sh("cat {dir}/build/main.c").out
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert(c.contains("clock_gettime(b_clock, ((BLINK_FFI_STRUCT_timespec*)(b_ts)))"), c)
+}
+
+test "a mirror of the wrong layout behind a Ptr still stops the build at its field" {
+    let dir = project(timespec_program("tv_nsec: I64, tv_sec: I64"))
+    let pm = blink_in(dir, "build --per-module src/main.bl")
+    let one = blink_in(dir, "build --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    for (label, r) in [("--per-module", pm), ("--no-per-module", one)] {
+        assert_eq(r.end, ChildEnd.Exited(101), "{label}: {diag(r)}")
+        assert(r.err_out.contains("`@ffi.struct` `Timespec` does not match C struct `timespec`"), "{label}: {diag(r)}")
+        assert(r.err_out.contains("field `tv_nsec` is at a different offset"), "{label}: {diag(r)}")
+    }
+}
+
+// A binding whose Blink name gives the C name of its symbol has no wrapper: the call names the
+// symbol itself, here the runtime's `const char *` count of code points. The call casts the
+// coerced argument to `void *` where a wrapper would.
+test "a Ptr[I64] passes to the Ptr[Void] parameter of a binding with no wrapper" {
+    let src = #"@ffi("blink_str_count_cps")
+@trusted(audit: "CPS")
+fn str_count_cps(p: Ptr[Void], n: Int) -> Int ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let c: Ptr[I64] = scope.alloc[I64]()
+        c.write(65)
+        io.println("{str_count_cps(c, 8)}")
+    }
+}
+"#
+    runs_and_prints(src, "8")
+}
+
+// An `@ffi.opaque` handle `H` is the C pointer `name *` (§9.1.4), so `Ptr[H]` is `name **`: the
+// out-cell an open function fills. The pointee names a C type, so it keeps that type and the
+// C compiler checks it against the header.
+test "a Ptr to an @ffi.opaque handle crosses as name ** to a header that takes it" {
+    let dir = project(#"@ffi.opaque(header: "mylib.h", name: "mylib_ctx")
+type Ctx
+
+@ffi("mylib", "mylib_open", header: "mylib.h")
+@trusted(audit: "OPEN")
+fn c_open(out: Ptr[Ctx], v: Int) -> I32 ! () {}
+
+@ffi("mylib", "mylib_value", header: "mylib.h")
+@trusted(audit: "VALUE")
+fn c_value(c: Ctx) -> Int ! () {}
+
+fn main() {
+    with ffi.scope() as scope {
+        let cell: Ptr[Ctx] = scope.alloc[Ctx]()
+        let rc = c_open(cell, 42)
+        io.println("{rc} {c_value(cell.deref())}")
+    }
+}
+"#)
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nmylib = \{ type = \"vendored\", path = \"vendor/mylib/mylib.c\", headers = [\"mylib.h\"] }\n").unwrap()
+    let _ = sh("mkdir -p {dir}/vendor/mylib")
+    fs.write("{dir}/vendor/mylib/mylib.h", "#pragma once\n#include <stdint.h>\ntypedef struct mylib_ctx mylib_ctx;\nint32_t mylib_open(mylib_ctx **out, int64_t v);\nint64_t mylib_value(mylib_ctx *c);\n").unwrap()
+    fs.write("{dir}/vendor/mylib/mylib.c", "#include <stdlib.h>\n#include \"mylib.h\"\nstruct mylib_ctx \{ int64_t v; };\nint32_t mylib_open(mylib_ctx **out, int64_t v) \{ mylib_ctx *c = malloc(sizeof *c); c->v = v; *out = c; return 0; }\nint64_t mylib_value(mylib_ctx *c) \{ return c->v; }\n").unwrap()
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let r = blink_in(dir, "build --no-per-module --emit c src/main.bl")
+    let c = sh("cat {dir}/build/main.c").out
+    let _ = sh("rm -rf {dir}")
+    for (label, run) in [("--per-module", pm), ("--no-per-module", one)] {
+        assert_eq(run.end, ChildEnd.Exited(0), "{label}: {diag(run)}")
+        assert_eq(run.out.trim(), "0 42", "{label}: {diag(run)}")
+    }
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert(c.contains("mylib_open(mylib_ctx** b_out, int64_t b_v)"), c)
+}

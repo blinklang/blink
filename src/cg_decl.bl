@@ -19,7 +19,7 @@ import diagnostics.{
 import layout.{
     LayoutRecord, Position, SlotForm, layout_of, field_layout_of, field_embeds_owner, ensure_typedef_for, c_type_of, enum_tag_tid,
     carrier_complete_children,
-    layout_take_typedefs, tid_of_node,
+    layout_take_typedefs, tid_of_node, erased_pointer_spelling,
 }
 import cname.{
     c_builtin_effect_roots, c_effect_default_op_name, c_effect_vtable_slot_name, c_ev_field_name, c_ev_global_name, c_ev_type_name, c_ffi_struct_original, c_ffi_struct_ptr_name,
@@ -52,7 +52,7 @@ import ir.{
 }
 import mono.{has_own_binders, instances, is_poly_impl, poly_impl_is_element_agnostic}
 import typecheck.{
-    TyKind, tc_enum_has_payload, tc_enum_variant_slots, tc_evar_field_slots,
+    TyKind, tc_decl_is_ffi_fn, tc_decl_param_tid, tc_enum_has_payload, tc_enum_variant_slots, tc_evar_field_slots,
     tc_evar_name, tc_evfield_name,
     tc_evfield_tid, tc_resolve, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     make_handler_type, tc_effect_ident, tc_member_tid_at_instance, tc_impl_trait_id, builtin_op_module,
@@ -942,6 +942,10 @@ pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Repo
 // crosses as that struct at every position, whichever prototype the call is checked
 // against: a pointer by a cast, a value by a copy, and the answer back the same way.
 //
+// A pointer whose pointee names no C type is such a type too: `uint8_t **` is not the
+// header's `char **`. It crosses as `void *` at every depth, and its answer comes back the
+// same way, by plain assignment (07 §9.1.1, *A `Ptr` at an `@ffi` Call*).
+//
 // Which prototype that is decides the rest. A symbol the prologue already declares is
 // checked against the prologue's header: a Blink signature cannot spell what such a header
 // can (a pointer to const), so no prototype is written. Any other symbol gets a prototype
@@ -1050,18 +1054,25 @@ fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, pass: ForeignPass, ba
     ir_block(fn_node, stmts)
 }
 
-// A mirror that comes back arrives as the C struct the header names. The answer is first
-// held in a local of that type, so C checks the header's return type against the binding by
-// plain assignment; a cast straight on the call would accept any return, even an integer.
-// Only then does it become the mirror: a pointer by a cast, a value by a copy, since C has
-// no cast between two struct types.
+// A mirror that comes back arrives as the C struct the header names, and a pointer to a
+// pointee that names no C type as `void*`. The answer is first held in a local of that type,
+// so C checks the header's return type against the binding by plain assignment; a cast
+// straight on the call would accept any return, even an integer. Only then does it become
+// the wrapper's type: a `void*` by plain assignment, a mirror pointer by a cast, a mirror
+// value by a copy, since C has no cast between two struct types.
 fn foreign_cast_back_block(fn_node: Int, tid: Int, symbol: Str, ret: Str, header_type: Str, pass: ForeignPass) -> Int {
     let held = c_mint_local("ffi_ret")
     let call = ir_call_direct(tid, fn_node, header_type, symbol, SlotForm.Inline, pass.args)
     let answer = ir_var_ref(tid, fn_node, header_type, held, SlotForm.Inline)
     let mut stmts = pass.prep
     stmts.push(ir_let(tid, fn_node, header_type, held, SlotForm.Inline, call))
-    if crossing_of(tid).ptr_depth > 0 {
+    let cross = crossing_of(tid)
+    if crossing_is_erased(cross) {
+        // `void*` converts to the wrapper's pointer type by plain assignment.
+        stmts.push(ir_return(fn_node, answer))
+        return ir_block(fn_node, stmts)
+    }
+    if cross.ptr_depth > 0 {
         stmts.push(ir_return(fn_node, ir_cast(tid, fn_node, ret, answer)))
         return ir_block(fn_node, stmts)
     }
@@ -1121,9 +1132,12 @@ fn foreign_call_args(fn_node: Int, crossings: List[Crossing], sides: List[Str]) 
 // What a type reaches on its way across: the @ffi.struct mirror behind its pointers, and
 // how many Ptr levels stand in front of it. Those two facts together decide between a cast,
 // a copy, a plain value and a refusal. `decl` is -1 when the type reaches no mirror at all.
+// `handle` says that what the pointers reach is a handle type, whose spelling already names
+// the C type of its header.
 type Crossing {
     decl: Int
     ptr_depth: Int
+    handle: Bool
 }
 
 fn crossing_of(tid: Int) -> Crossing {
@@ -1134,9 +1148,43 @@ fn crossing_of(tid: Int) -> Crossing {
         depth = depth + 1
     }
     let decl = tc_tid_decl_node(t)
-    if decl == DECL_NODE_AMBIGUOUS { return Crossing { decl: decl, ptr_depth: depth } }
-    if cname_ffi_struct_mirror(decl) { return Crossing { decl: decl, ptr_depth: depth } }
-    Crossing { decl: -1, ptr_depth: depth }
+    if decl == DECL_NODE_AMBIGUOUS { return Crossing { decl: decl, ptr_depth: depth, handle: false } }
+    if cname_ffi_struct_mirror(decl) { return Crossing { decl: decl, ptr_depth: depth, handle: false } }
+    Crossing { decl: -1, ptr_depth: depth, handle: decl >= 0 && is_handle_type(decl) }
+}
+
+// A pointer whose pointee names no C type: Void, a scalar, or a pointer to one of these. Its
+// Blink spelling (`uint8_t **`) is a type the header need not share (`char **`), so it crosses
+// as `void *`, which C converts to and from any object pointer (07 §9.1.1, *A `Ptr` at an
+// `@ffi` Call*).
+fn crossing_is_erased(cross: Crossing) -> Bool {
+    cross.decl == -1 && cross.ptr_depth > 0 && !cross.handle
+}
+
+// For each param of an `@ffi` binding with no wrapper, whether its pointer crosses as
+// `void*`. A call of such a binding names the foreign symbol itself, so the call casts where
+// a wrapper would; empty for every other declaration. The types come from the signature, not
+// the node: the call can be lowered inside an instance body that records no type for the
+// callee's params.
+pub fn cg_decl_direct_foreign_erased(decl: Int) -> List[Bool] {
+    let mut out: List[Bool] = []
+    if !tc_decl_is_ffi_fn(decl) { return out }
+    let direct = match cg_decl_body_site(decl) {
+        BodySite.Nothing => true
+        BodySite.ThisUnit => false
+        BodySite.PerInstance => false
+        BodySite.ForeignWrapper => false
+    }
+    if !direct { return out }
+    let sl = node_params(decl)
+    let n = if sl == -1 { 0 } else { sublist_length(sl) }
+    let mut i = 0
+    while i < n {
+        let tid = tc_decl_param_tid(decl, i)
+        out.push(tid >= 0 && crossing_is_erased(crossing_of(tid)))
+        i = i + 1
+    }
+    out
 }
 
 // One Crossing per position: the params in order, then the return last.
@@ -1159,8 +1207,10 @@ fn foreign_crossings(fn_node: Int) -> List[Crossing] ! Diag.Report {
 // and the struct against the header. A mirror that names no C struct keeps its own spelling
 // under a prototype written here. Against a header it becomes `void*`, which C converts to
 // any pointer with no check, because the mirror's layout is the user's @trusted claim: such
-// a binding is only as right as its signature.
+// a binding is only as right as its signature. A pointer to a pointee that names no C type
+// is `void*` under either prototype, so the two agree.
 fn foreign_c_side(cross: Crossing, declared: Bool) -> Str {
+    if crossing_is_erased(cross) { return erased_pointer_spelling() }
     if cross.decl < 0 { return "" }
     let original = c_ffi_struct_original(cross.decl)
     if original == "" && !declared { return "" }

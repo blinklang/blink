@@ -1,0 +1,122 @@
+// §9.1.1, *A `Ptr` at an `@ffi` Call*: at an argument of a call to an `@ffi` fn, and only
+// there, a `Ptr[T]` passes to a `Ptr[Void]` parameter. The pass is one level deep, and it is
+// not a subtype: a `let`, a field, a return and a call of a fn that is not `@ffi` refuse it
+// with TypeError (E0300).
+//
+// Without the rule, a C function that takes `void *` (memset, connect) has no Blink binding
+// that accepts more than one pointee type.
+
+import std.fs
+import std.process.{ChildEnd, ProcessResult}
+import std.json.{json_clear, json_parse, json_get, json_as_str, json_as_int}
+import compile_test_helpers
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+// Checks `src` as a plain program file and gives each error as "CODE@line". The check must
+// end with its status line and the exit code that goes with it, so a check that did not run
+// cannot read as a clean one.
+fn errors(tag: Str, src: Str) -> List[Str] ! FS.Write, Process.Spawn, Env.Read {
+    let dir = "{compile_test_helpers.scratch_root()}/ptr_void_arg_{tag}"
+    sh("rm -rf {dir} && mkdir -p {dir}")
+    fs.write("{dir}/zz_user.bl", src).unwrap()
+    let me = sh("pwd").out.trim()
+    let r = sh("cd {dir} && env -u BLINK_ROOT {me}/build/blink check --json zz_user.bl")
+    sh("rm -rf {dir}")
+    let mut out: List[Str] = []
+    let mut status = ""
+    for line in "{r.out}\n{r.err_out}".split("\n") {
+        if line.starts_with("\{\"status\"") {
+            json_clear()
+            status = json_as_str(json_get(json_parse(line), "status"))
+            continue
+        }
+        if !line.starts_with("\{\"severity\"") { continue }
+        json_clear()
+        let row = json_parse(line)
+        if json_as_str(json_get(row, "severity")) != "error" { continue }
+        out.push("{json_as_str(json_get(row, "code"))}@{json_as_int(json_get(json_get(row, "span"), "line"))}")
+    }
+    let want_status = if out.len() == 0 { "ok" } else { "error" }
+    let want_end = if out.len() == 0 { ChildEnd.Exited(0) } else { ChildEnd.Exited(1) }
+    assert_eq(status, want_status, "{tag}: exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}")
+    assert_eq(r.end, want_end, "{tag}: exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}")
+    out
+}
+
+// Lines 1-10 bind memset and strtol, take a Ptr[Void] in a plain fn and declare a mirror with a
+// Ptr[Void] field. `body` starts at line 15, inside an ffi scope that holds `b: Ptr[U8]`.
+fn program(body: Str) -> Str {
+    "@ffi(\"memset\", header: \"string.h\")\n@trusted(audit: \"P\")\nfn c_memset(p: Ptr[Void], c: I32, n: Int) -> Ptr[Void] ! () \{}\n@trusted(audit: \"P\")\nfn takes(p: Ptr[Void]) -> Bool \{ p.is_null() }\n@ffi(\"strtol\", header: \"stdlib.h\")\n@trusted(audit: \"P\")\nfn c_strtol(s: Ptr[U8], end: Ptr[Ptr[Void]], base: I32) -> Int ! () \{}\n@ffi.struct(header: \"sys/uio.h\", name: \"iovec\")\ntype Iovec \{ iov_base: Ptr[Void], iov_len: U64 }\n@trusted(audit: \"P\")\nfn main() \{\n    with ffi.scope() as scope \{\n        let b: Ptr[U8] = scope.alloc_n[U8](4)\n{body}\n    }\n}\n"
+}
+
+fn expect(label: Str, got: List[Str], want: List[Str]) {
+    assert(got.join(",") == want.join(","), "{label}: want [{want.join(", ")}], got [{got.join(", ")}]")
+}
+
+test "a Ptr[U8] passes to a Ptr[Void] parameter of an @ffi fn" {
+    expect("u8", errors("u8", program("        io.println(\"\{c_memset(b, 0, 4).is_null()}\")")), [])
+}
+
+test "a Ptr[Ptr[U8]] passes to a Ptr[Void] parameter of an @ffi fn" {
+    let body = "        let pp: Ptr[Ptr[U8]] = scope.alloc[Ptr[U8]]()\n        io.println(\"\{c_memset(pp, 0, 8).is_null()}\")"
+    expect("ptr_ptr", errors("ptr_ptr", program(body)), [])
+}
+
+test "a Ptr[Ptr[U8]] does not pass to a Ptr[Ptr[Void]] parameter of an @ffi fn" {
+    let body = "        let pp: Ptr[Ptr[U8]] = scope.alloc[Ptr[U8]]()\n        io.println(\"\{c_strtol(b, pp, 10)}\")"
+    expect("deep", errors("deep", program(body)), ["E0300@16"])
+}
+
+test "a let of type Ptr[Void] refuses a Ptr[U8] with E0300" {
+    let body = "        let v: Ptr[Void] = b\n        io.println(\"\{v.is_null()}\")"
+    expect("let", errors("let", program(body)), ["E0300@15"])
+}
+
+test "a Ptr[Void] parameter of a fn that is not @ffi refuses a Ptr[U8] with E0300" {
+    expect("plain_call", errors("plain_call", program("        io.println(\"\{takes(b)}\")")), ["E0300@15"])
+}
+
+test "a Ptr[Void] field refuses a Ptr[U8] with E0300" {
+    let body = "        let v = Iovec \{ iov_base: b, iov_len: 4 }\n        io.println(\"\{v.iov_len}\")"
+    expect("field", errors("field", program(body)), ["E0300@15"])
+}
+
+test "a return of type Ptr[Void] refuses a Ptr[U8] with E0300" {
+    let src = "@trusted(audit: \"P\")\nfn back(p: Ptr[U8]) -> Ptr[Void] \{\n    p\n}\n\nfn main() \{}\n"
+    expect("return", errors("return", src), ["E0300@3"])
+}
+
+// Lines 1-3 bind memcpy with two Ptr[Void] params. `body` starts at line 7, inside an outer
+// ffi scope that holds `pp: Ptr[Ptr[U8]]`.
+fn memcpy_program(body: Str) -> Str {
+    "@ffi(\"memcpy\", header: \"string.h\")\n@trusted(audit: \"P\")\nfn c_memcpy(d: Ptr[Void], s: Ptr[Void], n: Int) -> Ptr[Void] ! () \{}\n@trusted(audit: \"P\")\nfn main() \{\n    with ffi.scope() as outer \{ let pp: Ptr[Ptr[U8]] = outer.alloc[Ptr[U8]]()\n{body}\n    }\n}\n"
+}
+
+// The parameter is Ptr[Void], which holds no pointer, but the argument is Ptr[Ptr[U8]], which
+// does: the scope check reads the argument.
+test "an inner-scope pointer stored through a coerced Ptr[Void] argument is E0601" {
+    let body = "        with ffi.scope() as inner \{\n            let b: Ptr[U8] = inner.alloc_n[U8](8)\n            let _ = c_memcpy(pp, b, 8)\n        }"
+    expect("escape", errors("escape", memcpy_program(body)), ["E0601@9"])
+}
+
+test "a same-scope pointer stored through a coerced Ptr[Void] argument passes" {
+    let body = "        let q: Ptr[U8] = outer.alloc_n[U8](8)\n        let _ = c_memcpy(pp, q, 8)"
+    expect("same_scope", errors("same_scope", memcpy_program(body)), [])
+}
+
+// Outside an `@ffi` call the argument cannot reach a Ptr[Void] parameter, so the one error is
+// the refused pass and the scope check adds none.
+test "a coerced-looking store through a fn that is not @ffi is E0300 alone" {
+    let src = "@trusted(audit: \"P\")\nfn keep(d: Ptr[Void], s: Ptr[U8]) -> Bool \{ d.is_null() && s.is_null() }\n@trusted(audit: \"P\")\nfn main() \{\n    with ffi.scope() as outer \{ let pp: Ptr[Ptr[U8]] = outer.alloc[Ptr[U8]]()\n        with ffi.scope() as inner \{\n            let b: Ptr[U8] = inner.alloc_n[U8](8)\n            io.println(\"\{keep(pp, b)}\")\n        }\n    }\n}\n"
+    expect("plain_escape", errors("plain_escape", src), ["E0300@8"])
+}
+
+// The pass belongs to a call that names the `@ffi` declaration. A fn value of that declaration
+// has a plain fn type, so a call through it refuses the pass as any other call does.
+test "a call through a fn value of an @ffi fn refuses a Ptr[U8] for Ptr[Void] with E0300" {
+    let body = "        let f = c_memset\n        io.println(\"\{f(b, 0, 4).is_null()}\")"
+    expect("fn_value", errors("fn_value", program(body)), ["E0300@16"])
+}
