@@ -1,0 +1,205 @@
+// The stdlib archive does not define the evidence vector, so it cannot hold a body that
+// names the vector or calls a function that takes it. Such a body, and each archive body
+// that reaches it through a call, a method call or a fn value, is left for the user unit,
+// and the archive lists them on the first line of its header. Here a copy of lib/ adds
+// those shapes to std.list, so the test does not depend on what std holds today.
+import compile_test_helpers
+import std.process.{ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(900)) }).unwrap()
+}
+
+let FIXTURE = #"
+pub fn rowkeep_each_doubled[T](xs: List[T], f: fn(T) -> T ! _) -> List[T] ! _ {
+    let mut out: List[T] = []
+    for x in xs { out.push(f(f(x))) }
+    out
+}
+
+fn rowkeep_quadrupled(xs: List[Int]) -> List[Int] {
+    rowkeep_each_doubled(xs, fn(x: Int) -> Int { x * 2 })
+}
+
+pub fn rowkeep_sum(xs: List[Int]) -> Int {
+    let mut n = 0
+    for x in rowkeep_quadrupled(xs) { n = n + x }
+    n
+}
+
+pub fn rowkeep_via_value(xs: List[Int]) -> Int {
+    let f = rowkeep_sum
+    f(xs)
+}
+
+pub trait RowkeepTotal {
+    fn rowkeep_total(self) -> Int
+}
+
+pub type RowkeepBag { xs: List[Int] }
+
+impl RowkeepTotal for RowkeepBag {
+    fn rowkeep_total(self) -> Int { rowkeep_sum(self.xs) }
+}
+
+pub fn rowkeep_bag_total(xs: List[Int]) -> Int {
+    RowkeepBag { xs: xs }.rowkeep_total()
+}
+
+effect RowkeepAsk {
+    effect Get {
+        fn ask() -> Int
+    }
+}
+
+fn rowkeep_asks() -> Int ! RowkeepAsk.Get {
+    rowkeepask.ask() + 1
+}
+
+pub fn rowkeep_handled() -> Int {
+    with handler RowkeepAsk {
+        fn ask() -> Int { 41 }
+    } {
+        rowkeep_asks()
+    }
+}
+
+pub fn rowkeep_handled_inline() -> Int {
+    with handler RowkeepAsk {
+        fn ask() -> Int { 40 }
+    } {
+        rowkeepask.ask() + 2
+    }
+}
+
+pub fn rowkeep_plain(xs: List[Int]) -> Int {
+    xs.len()
+}
+"#
+
+let CALLS = #"import std.list
+
+fn main() ! IO {
+    io.println("{list.rowkeep_sum([1, 2, 3])} {list.rowkeep_bag_total([5])} {list.rowkeep_via_value([1])} {list.rowkeep_plain([1, 2])}")
+}
+"#
+
+let HANDLES = #"import std.list
+
+fn main() ! IO {
+    io.println("{list.rowkeep_handled()} {list.rowkeep_handled_inline()}")
+}
+"#
+
+let PLAIN = #"fn main() ! IO {
+    io.println("hello")
+}
+"#
+
+// A root whose lib/std/list.bl holds the fixture, with its own copy of the compiler: a
+// compiler reads std from lib/std beside itself before BLINK_ROOT. The archive build reads
+// the one-file runtime.h of build/; bootstrap/runtime.h includes files it does not copy.
+fn root(name: Str) -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let d = "{compile_test_helpers.scratch_root()}/_stdlib_archive_kept_{name}_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}/bin {d}/build {d}/cache && cp -rL lib {d}/lib && ln -s $(pwd)/bootstrap {d}/bootstrap && cp -L build/runtime.h {d}/build/runtime.h && cp build/blink {d}/bin/blink")
+    let list_src = fs.read("{d}/lib/std/list.bl").unwrap()
+    fs.write("{d}/lib/std/list.bl", list_src.concat(FIXTURE)).unwrap()
+    fs.write("{d}/calls.bl", CALLS).unwrap()
+    fs.write("{d}/handles.bl", HANDLES).unwrap()
+    fs.write("{d}/plain.bl", PLAIN).unwrap()
+    d
+}
+
+fn blink(d: Str, args: Str) -> ProcessResult ! Process.Spawn {
+    sh("cd {d} && env -u BLINK_COMPILER_ARCHIVE BLINK_ROOT={d} BLINK_CACHE_DIR={d}/cache BLINK_BIN={d}/bin/blink {d}/bin/blink {args} < /dev/null 2>&1")
+}
+
+fn read_or_empty(path: Str) -> Str ! FS.Read {
+    match fs.read(path) {
+        Ok(text) => text
+        Err(_) => ""
+    }
+}
+
+// The symbols the first line of the archive's header names: `/* <marker> sym... */`.
+fn kept_symbols(d: Str) -> List[Str] ! FS.Read {
+    let mut out: List[Str] = []
+    let first = read_or_empty("{d}/build/libblink_std.h").split("\n").get(0) ?? ""
+    let words = first.split(" ")
+    let mut i = 2
+    while i + 1 < words.len() {
+        out.push(words.get(i).unwrap())
+        i = i + 1
+    }
+    out
+}
+
+// A C symbol spells each `_` of a Blink name as `_1`, and ends with the fn's own name.
+fn names_fn(kept: List[Str], name: Str) -> Bool {
+    let spelled = name.replace("_", "_1")
+    for s in kept {
+        if s.ends_with("_{spelled}") { return true }
+    }
+    false
+}
+
+test "the archive leaves each body that needs the vector, and each caller of one, to the user unit" {
+    let d = root("calls")
+    let arc = blink(d, "__build-stdlib-archive")
+    let calls = blink(d, "run calls.bl")
+    let handles = blink(d, "run handles.bl")
+    let plain = blink(d, "run plain.bl")
+    let kept = kept_symbols(d)
+    sh("rm -rf {d}")
+    assert(arc.success(), "the archive build failed:\n{arc.out}")
+    assert_eq(calls.out.trim(), "24 20 4 2")
+    assert_eq(handles.out.trim(), "42 42")
+    assert_eq(plain.out.trim(), "hello")
+    for name in ["rowkeep_quadrupled", "rowkeep_sum", "rowkeep_via_value", "rowkeep_total", "rowkeep_bag_total", "rowkeep_handled", "rowkeep_handled_inline"] {
+        assert(names_fn(kept, name), "the header's kept line does not name {name}: {kept.join(" ")}")
+    }
+    assert(!names_fn(kept, "rowkeep_plain"), "the header's kept line names rowkeep_plain, which needs no vector: {kept.join(" ")}")
+}
+
+// An installed tree over the real archive: an installed archive is checked against its
+// stamp, where a dev archive is rebuilt instead. Each test drops the header's first line
+// only when it is the kept line, so the header stays whole C.
+fn install_tree(tree: Str) -> Str ! Process.Spawn, FS.Write {
+    let arc = sh("dirname \"$(readlink -f build/libblink_std.h)\"").out.trim()
+    sh("rm -rf {tree} && mkdir -p {tree}/bin {tree}/share/blink && cp $(readlink -f build/blink) {tree}/bin/blink && cp -L {arc}/libblink_std.a {arc}/libblink_std.h {arc}/skip_modules.txt {arc}/.archive-id {tree}/share/blink/ && cp -L build/runtime.h {tree}/share/blink/runtime.h")
+    fs.write("{tree}/plain.bl", PLAIN).unwrap()
+    arc
+}
+
+fn build_installed(tree: Str) -> ProcessResult ! Process.Spawn {
+    sh("cd {tree} && env -u BLINK_ROOT BLINK_CACHE_DIR= {tree}/bin/blink build plain.bl -o {tree}/plain < /dev/null 2>&1")
+}
+
+test "an installed archive whose header lost its kept line is refused by its stamp" {
+    let tree = "{compile_test_helpers.scratch_root()}/_kept_line_stamp_{getpid()}"
+    let _ = install_tree(tree)
+    let h = "{tree}/share/blink/libblink_std.h"
+    sh("sed '1\{/^.. blink:kept_for_user /d\}' {h} > {h}.new && mv {h}.new {h}")
+    let r = build_installed(tree)
+    let built = compile_test_helpers.path_exists("{tree}/plain")
+    sh("rm -rf {tree}")
+    assert(!r.success(), "an archive whose header does not match its stamp linked:\n{r.out}")
+    assert(r.out.contains("IncompatibleStdlibArchive"), "expected IncompatibleStdlibArchive:\n{r.out}")
+    assert(!built, "a binary was produced from the refused archive")
+}
+
+test "an installed archive whose stamp matches a header with no kept line is refused" {
+    let tree = "{compile_test_helpers.scratch_root()}/_kept_line_missing_{getpid()}"
+    let _ = install_tree(tree)
+    let h = "{tree}/share/blink/libblink_std.h"
+    let id = "{tree}/share/blink/.archive-id"
+    sh("sed '1\{/^.. blink:kept_for_user /d\}' {h} > {h}.new && mv {h}.new {h} && s=$(sha256sum {h} | cut -c1-64) && awk -F'|' -v OFS='|' -v h=$s '\{$2 = h; print\}' {id} > {id}.new && mv {id}.new {id}")
+    let r = build_installed(tree)
+    let built = compile_test_helpers.path_exists("{tree}/plain")
+    sh("rm -rf {tree}")
+    assert(!r.success(), "an archive with no kept line linked:\n{r.out}")
+    assert(r.out.contains("IncompatibleStdlibArchive"), "expected IncompatibleStdlibArchive:\n{r.out}")
+    assert(r.out.contains("blink:kept_for_user"), "the error does not name the missing kept line:\n{r.out}")
+    assert(!built, "a binary was produced from the refused archive")
+}

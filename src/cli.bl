@@ -57,7 +57,7 @@ import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice
 import cname.{c_ffi_symbol, c_module_header_name, c_module_private_header_name, c_program_types_header_guard, c_program_types_header_name}
 import ir.{ir_track_sources, ir_sources_read}
 import build_compiler_archive.{build_compiler_archive, compiler_archive_env, compiler_archive_link_args, compiler_archive_of_unit, compiler_archive_skip_keys}
-import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced}
+import build_stdlib.{build_stdlib_archive, build_stdlib_archive_in, list_stdlib_module_keys, resolve_runtime_h, stdlib_rebuild_forced, std_kept_of}
 import stdlib_native_deps.{
     stdlib_native_dep_names, stdlib_native_dep_gate_macro, stdlib_native_dep_source_paths,
     stdlib_native_dep_header_dir, stdlib_native_dep_compile_defs, stdlib_native_dep_link_flag_dynamic,
@@ -103,6 +103,7 @@ import lsp.{lsp_start}
 import comment_attach.{attach_comments_pass}
 // Generated registry; refresh via scripts/gen_embedded_stdlib.sh (auto-run by `task regen`).
 import embedded_stdlib_registry.{init_embedded_stdlib}
+import archive_keep.{read_kept, kept_header_line}
 
 pub let blink_cli_version: Str = "dev"
 const embedded_llms_full: Str = #embed("../llms-full.md")
@@ -926,8 +927,8 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         emit_only_module: env.var("BLINK_ONLY_MODULE") ?? "", skip_modules: skip_modules,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
         compiler_archive_modules: layer_modules, test_build: if test_build { 1 } else { 0 },
-        unit_c_fault: unit_c_fault(source_path) }
-    let c_output = generate(final_program, cfg)
+        unit_c_fault: unit_c_fault(source_path), std_kept: Some(read_kept(resolve_archive_dir())) }
+    let c_output = if diag_count > 0 { "" } else { generate(final_program, cfg) }
 
     if diag_ice_count > 0 {
         diag_flush()
@@ -2369,12 +2370,11 @@ let BUILD_STATUS_NONE = 2
 fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, release_mode: Int, test_build: Bool, emit_mode: Str, targets: List[Str], status_mode: Int, strict_mode: Int, unit_jobs: Int, per_module_flag: Bool, checked: Option[DaemonBuild]) -> Int ! Lex.Tokenize, Parse, Parse.Build, Diag.Report, TypeCheck, Format.Emit, Codegen, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     let _ = fs.delete(output_path)
     // Before the compile: it checks a compiler archive against the stdlib archive's
-    // stamp, which a rebuild here would change.
-    if emit_mode != "c" {
-        let arc_rc = ensure_dev_archive()
-        if arc_rc != 0 {
-            return arc_rc
-        }
+    // stamp, which a rebuild here would change, and the C it writes, `--emit c` too, holds
+    // the std bodies that archive leaves for the user unit.
+    let arc_rc = ensure_dev_archive()
+    if arc_rc != 0 {
+        return arc_rc
     }
     if unit_jobs != 0 {
         let reason = per_module_fallback_reason(emit_mode)
@@ -2744,7 +2744,7 @@ fn unit_c_fault(source_path: Str) -> Int ! Env.Read {
 }
 
 // The std modules the archive holds are declared, not compiled, as in the one-unit build.
-fn units_cg_config(debug_mode: Int, test_build: Bool, source_path: Str) -> CgConfig ! FS.Read, Env.Read {
+fn units_cg_config(debug_mode: Int, test_build: Bool, source_path: Str) -> CgConfig ! Diag.Report, FS.Read, Env.Read {
     let mut skip: Map[Str, Int] = Map()
     for k in list_stdlib_module_keys() {
         skip.insert(k, 1)
@@ -2754,7 +2754,7 @@ fn units_cg_config(debug_mode: Int, test_build: Bool, source_path: Str) -> CgCon
         emit_only_module: "", skip_modules: skip,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
         compiler_archive_modules: Map(), test_build: if test_build { 1 } else { 0 },
-        unit_c_fault: unit_c_fault(source_path) }
+        unit_c_fault: unit_c_fault(source_path), std_kept: Some(read_kept(resolve_archive_dir())) }
 }
 
 // The units of a per-module build in its units directory, and what its record needs.
@@ -6895,10 +6895,20 @@ fn cmd_emit_archive_header(args_list: List[Str]) ! Lex.Tokenize, Parse, Parse.Bu
         env.exit(1)
     }
 
+    let kept = std_kept_of(final_program)
+    if diag_ice_count > 0 {
+        diag_flush()
+        env.exit(101)
+    }
+    if diag_count > 0 {
+        diag_flush()
+        env.exit(1)
+    }
     let hdr_cfg = CgConfig { debug_mode: 0, trace_codegen: cli_trace.codegen,
         deterministic: cli_deterministic, emit_only_module: "", skip_modules: Map(),
-        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
-    let header = generate_archive_header(final_program, hdr_cfg)
+        user_tu_mode: 0, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map(),
+        std_kept: Some(kept) }
+    let header = "{kept_header_line(kept)}\n{generate_archive_header(final_program, hdr_cfg)}"
 
     if diag_ice_count > 0 {
         diag_flush()

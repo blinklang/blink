@@ -16,12 +16,13 @@ import typecheck.{TypeCheck, check_types}
 import compiler.{compile_entry_to_program, check_unused_imports, embedded_keys}
 import cg.{Codegen, CgConfig, generate, generate_archive_header}
 import check_pipeline.{run_build_analyses}
-import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush}
+import diagnostics.{Diag, diag_count, diag_ice_count, diag_flush, diag_ice, STD_ARCHIVE_NEEDS_KEPT_BODY}
 import cli.{resolve_install_root, run_cc, spawn_cc, process_compiler_sha, blink_cli_version, declared_guard_flags}
 import build_fs
 import stdlib_native_deps.{peeled_module_keys, peeled_module_dotted, peeled_module_underscored}
 import std_cache_key.{compute_cache_key, archive_compiler_path, sha256_of_file_first, sha256_of_manifest}
 import std.path.{path_join}
+import archive_keep.{new_scan, kept_symbols, kept_header_line}
 
 pub fn resolve_runtime_h() -> Str ! FS.Read, Env.Read {
     let blink_root = env.var("BLINK_ROOT") ?? ""
@@ -194,6 +195,18 @@ fn write_skip_modules_file(path: Str, keys: List[Str]) -> Bool ! IO, FS.Write {
     build_fs.write_or_report(path, sb.to_str())
 }
 
+// A first emit, printed nowhere, finds the bodies the archive must leave for the user unit,
+// so the header and the monolith never print one. Each writer of an archive header calls it.
+pub fn std_kept_of(program: Int) -> Map[Str, Int] ! Codegen, Diag.Report {
+    let scan = new_scan()
+    let scan_cfg = CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
+        emit_only_module: "", skip_modules: Map(), user_tu_mode: 0,
+        blink_ev_extern_only: 0, archive_build_mode: 1, archive_over_std: 0, compiler_archive_modules: Map(),
+        body_scan: Some(scan) }
+    let _ = generate(program, scan_cfg)
+    kept_symbols(scan)
+}
+
 fn bail_on_diag() -> Int ! Diag.Report, IO {
     if diag_ice_count > 0 {
         diag_flush()
@@ -280,22 +293,36 @@ pub fn build_stdlib_archive_in(build_dir: Str, peeled: List[Str], force_rebuild:
     let esc_rc = bail_on_diag()
     if esc_rc != 0 { return esc_rc }
 
+    let kept = std_kept_of(program)
+    let scan_rc = bail_on_diag()
+    if scan_rc != 0 { return scan_rc }
+
     // The archive is the whole stdlib in one TU: no module filter, nothing skipped.
     let hdr_cfg = CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
         emit_only_module: "", skip_modules: Map(), user_tu_mode: 0,
-        blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map() }
+        blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0, compiler_archive_modules: Map(),
+        std_kept: Some(kept) }
     let header = generate_archive_header(program, hdr_cfg)
     let hdr_rc = bail_on_diag()
     if hdr_rc != 0 { return hdr_rc }
-    if !build_fs.write_or_report("{cache_dir}/libblink_std.h", header) { return 1 }
+    // The kept list leads the header, so the stamp's header SHA covers it.
+    if !build_fs.write_or_report("{cache_dir}/libblink_std.h", "{kept_header_line(kept)}\n{header}") { return 1 }
     if !build_fs.copy_text_or_report(rt_path_final, "{cache_dir}/runtime.h") { return 1 }
 
+    let check = new_scan()
     let mono_cfg = CgConfig { debug_mode: 0, trace_codegen: 0, deterministic: 0,
         emit_only_module: "", skip_modules: Map(), user_tu_mode: 0,
-        blink_ev_extern_only: 0, archive_build_mode: 1, archive_over_std: 0, compiler_archive_modules: Map() }
+        blink_ev_extern_only: 0, archive_build_mode: 1, archive_over_std: 0, compiler_archive_modules: Map(),
+        std_kept: Some(kept), body_scan: Some(check) }
     let monolith_c = generate(program, mono_cfg)
     let mono_rc = bail_on_diag()
     if mono_rc != 0 { return mono_rc }
+    // Each body the monolith prints must need nothing the archive left out.
+    let leak = kept_symbols(check)
+    if leak.len() > 0 {
+        diag_ice("StdArchiveNeedsKeptBody", STD_ARCHIVE_NEEDS_KEPT_BODY, "the stdlib monolith prints bodies that need what the archive leaves for the user unit: {leak.keys().sort().join(" ")}", 0, 0, "")
+        return bail_on_diag()
+    }
     if !build_fs.write_or_report("{cache_dir}/monolith.c", monolith_c) { return 1 }
     // Peeled modules (e.g. std/db_sqlite) are excluded from monolith.c
     // entirely, so no BLINK_USE_<dep> macros are needed for the archive.

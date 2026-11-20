@@ -1,0 +1,190 @@
+// The std bodies the stdlib archive leaves for the user unit, and the list file that names them.
+//
+// The stdlib archive does not define the evidence vector, so it cannot hold a body that
+// names the vector, or that calls a body the archive does not hold. Such a body stays out
+// of the archive, and so does each archive body that reaches it through a call, a method
+// call or a fn value. The decision comes from the lowered IR of each body, before the
+// archive prints any of them. The archive writes the list as the first line of its header,
+// libblink_std.h, whose SHA its stamp holds, so the list can never be stale or apart from
+// the archive. A user unit reads that line and writes those bodies itself.
+
+import ir.{IrKind, ir_c_name, ir_kind, ir_node_count}
+import mono.{instances}
+import cg_decl.{BodySite, cg_decl_body_site, cg_decl_c_name}
+import cg_reg.{cg_reg_entry_point, cg_reg_fn_decls, cg_reg_impl_methods}
+import diagnostics.{Diag, diag_error_no_loc, INCOMPATIBLE_STDLIB_ARCHIVE}
+import build_fs
+import std.path.{path_join}
+
+// The start of the header's first line. The line is a C comment, so cc reads past it.
+pub let KEPT_MARKER = "/* blink:kept_for_user"
+
+// One printed body: the declaration, the C symbol it was printed under, the symbols its
+// calls and fn values name, and whether it names the evidence vector.
+pub type BodyFacts {
+    decl: Int
+    symbol: Str
+    refs: List[Str]
+    names_ev: Bool
+}
+
+// The facts of each body one archive emit printed, in print order.
+pub type BodyScan {
+    bodies: List[BodyFacts]
+}
+
+pub fn new_scan() -> BodyScan {
+    BodyScan { bodies: [] }
+}
+
+// Records the body printed from IR ids `start` up to the next free id. A body's closures and
+// fn-value thunks are lowered and printed with it, so their ids fall in the same range.
+pub fn note_body(scan: Option[BodyScan], decl: Int, symbol: Str, start: Int) {
+    match scan {
+        Some(s) => s.bodies.push(facts_of(decl, symbol, start))
+        None => {}
+    }
+}
+
+fn facts_of(decl: Int, symbol: Str, start: Int) -> BodyFacts {
+    let mut refs: List[Str] = []
+    let mut names_ev = false
+    let end = ir_node_count()
+    let mut id = start
+    while id < end {
+        match ir_kind(id) {
+            IrKind.CallDirect => refs.push(ir_c_name(id))
+            IrKind.ClosureNew => refs.push(ir_c_name(id))
+            IrKind.EvidenceVector => names_ev = true
+            IrKind.EvidenceAddress => names_ev = true
+            IrKind.EffectPerform => names_ev = true
+            IrKind.HandlerInstall => names_ev = true
+            IrKind.PanicHook => names_ev = true
+            _ => {}
+        }
+        id = id + 1
+    }
+    BodyFacts { decl: decl, symbol: symbol, refs: refs, names_ev: names_ev }
+}
+
+// The C symbol of each declaration the archive must leave for the user unit, read from the
+// facts of one emit of the archive's program. A generic is named by its own symbol, not by
+// an instance's, so the whole generic stays out when one instance must.
+//
+// A symbol counts as held when the emit printed a body under it, or when the declaration
+// needs no Blink body (a foreign binding). Every other symbol of a std declaration is one
+// the archive does not hold. A symbol of no std declaration (a runtime call, a foreign
+// function, a thunk) is outside the question.
+pub fn kept_symbols(scan: BodyScan) -> Map[Str, Int] {
+    let mut decl_of: Map[Str, Int] = Map()
+    let mut held: Map[Str, Int] = Map()
+    let entry = cg_reg_entry_point()
+    for d in all_decls() {
+        if d == entry { continue }
+        let sym = cg_decl_c_name(d)
+        decl_of.insert(sym, d)
+        match cg_decl_body_site(d) {
+            BodySite.ForeignWrapper => held.insert(sym, 1)
+            BodySite.Nothing => held.insert(sym, 1)
+            BodySite.ThisUnit => {}
+            BodySite.PerInstance => {}
+        }
+    }
+    for inst in instances() {
+        decl_of.insert(inst.c_name, inst.base_decl_node)
+    }
+    for b in scan.bodies {
+        held.insert(b.symbol, 1)
+    }
+    let mut kept: Map[Int, Int] = Map()
+    let mut grew = true
+    while grew {
+        grew = false
+        for b in scan.bodies {
+            if kept.contains_key(b.decl) { continue }
+            if b.names_ev || names_unheld(b.refs, decl_of, held, kept) {
+                kept.insert(b.decl, 1)
+                grew = true
+            }
+        }
+    }
+    let mut out: Map[Str, Int] = Map()
+    for d in kept.keys() {
+        out.insert(cg_decl_c_name(d), 1)
+    }
+    out
+}
+
+fn all_decls() -> List[Int] {
+    let mut out: List[Int] = []
+    for f in cg_reg_fn_decls() { out.push(f) }
+    for m in cg_reg_impl_methods() { out.push(m) }
+    out
+}
+
+fn names_unheld(refs: List[Str], decl_of: Map[Str, Int], held: Map[Str, Int], kept: Map[Int, Int]) -> Bool {
+    for r in refs {
+        match decl_of.get(r) {
+            Some(d) => {
+                if !held.contains_key(r) || kept.contains_key(d) { return true }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+// Whether `symbol` is a std declaration the stdlib archive left for the user unit.
+pub fn is_kept(kept: Option[Map[Str, Int]], symbol: Str) -> Bool {
+    match kept {
+        Some(k) => k.contains_key(symbol)
+        None => false
+    }
+}
+
+// The header's first line: the marker, then each symbol, sorted and one space apart. A
+// C symbol never holds `*/` or a space, so the line stays one comment.
+pub fn kept_header_line(kept: Map[Str, Int]) -> Str {
+    let mut sb = StringBuilder.new()
+    sb.write(KEPT_MARKER)
+    for s in kept.keys().sort() {
+        sb.write(" ")
+        sb.write(s)
+    }
+    sb.write(" */")
+    sb.to_str()
+}
+
+// The list a header's first line names, or None when the line is not a kept line. Only
+// the first line counts, so no symbol or comment later in the header can stand for it.
+pub fn parse_kept_line(line: Str) -> Option[Map[Str, Int]] {
+    if !line.starts_with("{KEPT_MARKER} ") || !line.ends_with(" */") {
+        return None
+    }
+    let mut out: Map[Str, Int] = Map()
+    let inner = line.byte_slice(KEPT_MARKER.byte_len(), line.byte_len() - 2)
+    for s in inner.split(" ") {
+        if s != "" { out.insert(s, 1) }
+    }
+    Some(out)
+}
+
+// The list of the stdlib archive in `arc_dir`, from the first line of its header. A
+// header with no kept line is an error and never an empty list: a user unit that leaves
+// out a body the archive does not hold fails only at link, and far from the cause.
+pub fn read_kept(arc_dir: Str) -> Map[Str, Int] ! Diag.Report, FS.Read {
+    let path = path_join(arc_dir, "libblink_std.h")
+    if !build_fs.path_exists(path) {
+        diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "the stdlib archive header {path} is missing", "build the stdlib archive (or reinstall: task install)")
+        return Map()
+    }
+    let header = build_fs.read_or_empty(path)
+    let first = header.byte_slice(0, header.byte_index_of("\n", 0) ?? header.byte_len())
+    match parse_kept_line(first) {
+        Some(kept) => kept
+        None => {
+            diag_error_no_loc("IncompatibleStdlibArchive", INCOMPATIBLE_STDLIB_ARCHIVE, "the stdlib archive header {path} does not start with `{KEPT_MARKER} ... */`, the list of std bodies a program must compile itself", "rebuild the stdlib archive (or reinstall: task install)")
+            Map()
+        }
+    }
+}

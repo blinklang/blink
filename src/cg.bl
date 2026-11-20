@@ -49,8 +49,9 @@ import cg_derive.{
     cg_derive_emit_bodies, cg_derive_emit_decls, cg_derive_emit_key_tables, cg_derive_key_table_keys,
     cg_derive_key_table_names, cg_derive_key_table_uses, cg_derive_reset, KeyTableUse,
 }
-import ir.{ir_begin_body, ir_block, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify_in_frame}
+import ir.{ir_begin_body, ir_block, ir_node_count, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify_in_frame}
 import mono.{instances, named_instance_rows, program_calls_trace_log, program_spawns, set_named_instance_rows}
+import archive_keep.{BodyScan, is_kept, note_body}
 import typecheck.{TYPE_INT, TYPE_VOID, TyKind, tc_enter_body_module, tc_program_has_panic_hook, tc_leave_body_module, tc_resolve, tc_tid_kind}
 import cg_stmt.{
     PANIC_HOOK_ADAPTER, PanicHookAdapter, cg_stmt_panic_hook_adapter, cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
@@ -116,6 +117,12 @@ pub type CgConfig {
     // 1 when the BLINK_DEV_UNIT_C_FAULT dev knob names this build's source: the entry unit
     // then holds C that no C compiler accepts.
     unit_c_fault: Int = 0
+    // The C symbols of the std declarations the stdlib archive left for the user unit, from
+    // the first line of the archive's header (archive_keep). The stdlib archive's own build
+    // sets it from a first emit of its program, so it never prints a body it leaves out.
+    std_kept: Option[Map[Str, Int]] = None
+    // Set on that first emit only: the facts of each body it prints.
+    body_scan: Option[BodyScan] = None
 }
 
 
@@ -212,7 +219,13 @@ fn emit_root_signatures(cfg: CgConfig, decls: List[Int], methods: List[Int]) ! D
 // archive writes its own copy. A program that calls the function writes another, so the
 // archive's copy is internal.
 fn is_archive_private_copy(cfg: CgConfig, decl: Int) -> Bool {
-    cfg.archive_over_std != 0 && cfg.skip_modules.contains_key(cg_reg_module_of(decl)) && cg_decl_takes_ev(decl)
+    cfg.archive_over_std != 0 && cfg.skip_modules.contains_key(cg_reg_module_of(decl)) && left_out_of_std_archive(cfg, decl)
+}
+
+// A declaration the stdlib archive does not hold: one whose signature names the evidence
+// vector, or one archive_keep found that needs the vector or reaches a body that does.
+fn left_out_of_std_archive(cfg: CgConfig, decl: Int) -> Bool {
+    cg_decl_takes_ev(decl) || is_kept(cfg.std_kept, cg_decl_c_name(decl))
 }
 
 // A header offers what other units may call, and an internal copy is not callable from
@@ -258,8 +271,12 @@ fn emit_instance_decls(decl: Int, is_static: Bool) ! Diag.Report {
 // declaration, so with none there is no copy to write. A site that does reach it stops at
 // the site when the pass recorded no instance for it (method_is_mono_gap names each), which
 // also catches a site whose instance is missing while other instances exist.
-fn emit_instance_bodies(decl: Int, is_static: Bool) ! Diag.Report {
-    for row in instance_rows_of(decl) { emit_instance_body(decl, row, is_static) }
+fn emit_instance_bodies(cfg: CgConfig, decl: Int, is_static: Bool) ! Diag.Report {
+    for row in instance_rows_of(decl) {
+        let start = ir_node_count()
+        emit_instance_body(decl, row, is_static)
+        note_body(cfg.body_scan, decl, instances().get(row).unwrap().c_name, start)
+    }
 }
 
 fn emit_instance_body(decl: Int, row: Int, is_static: Bool) ! Diag.Report {
@@ -491,34 +508,36 @@ fn is_entry_point(fn_node: Int) -> Bool {
     fn_node == cg_reg_entry_point()
 }
 
-// A module compiled into the archive is declared by the user's unit, not compiled again
-// — except for the declarations the archive could not hold. A signature that takes the
-// evidence vector names a type the stdlib archive does not define, and one archive serves
-// many programs, so the stdlib archive left those out. The archive layered over it does
-// define the vector, and a unit that links that archive takes the vector from it, so a
-// function of one of its modules that takes the vector is the archive's to define. A
-// generic has no body of its own at all: what a program links are its instances, and which
-// instances a program needs follows from that program's call sites, which the archive was
-// compiled without. Those are left for the user's unit. An archive layered over the stdlib
-// archive is in the same position for a std generic: it writes its own copy of each
-// instance its bodies call.
+// A module compiled into the archive is declared by the user's unit, not compiled again —
+// except for the declarations the archive could not hold. The stdlib archive does not
+// define the evidence vector, and one archive serves many programs, so it left out each
+// function whose signature takes the vector, each whose body names it, and each that
+// reaches one of those through a call, a method call or a fn value (archive_keep). The
+// archive layered over it does define the vector, and a unit that links that archive takes
+// the vector from it, so a function of one of its modules that takes the vector is the
+// archive's to define. A generic has no body of its own at all: what a program links are
+// its instances, and which instances a program needs follows from that program's call
+// sites, which the archive was compiled without. Those are left for the user's unit. An
+// archive layered over the stdlib archive is in the same position for a std generic: it
+// writes its own copy of each instance its bodies call.
 fn kept_for_user(cfg: CgConfig, decl: Int) -> Bool {
     if cfg.user_tu_mode == 0 && cfg.archive_over_std == 0 { return false }
     if cg_decl_is_per_instance(decl) { return true }
-    cg_decl_takes_ev(decl) && !cfg.compiler_archive_modules.contains_key(cg_reg_module_of(decl))
+    left_out_of_std_archive(cfg, decl) && !cfg.compiler_archive_modules.contains_key(cg_reg_module_of(decl))
 }
 
 // The archive holds no entry point: one archive serves many programs. The stdlib archive
 // also holds no function that takes the evidence vector, since it does not define the
-// vector such a signature names; those are compiled into the user's unit instead. The
-// archive layered over it defines the vector and holds them. A foreign binding may carry
-// a non-empty row but is a plain C wrapper that reads no evidence, which is why the
-// signature is asked rather than the effects list.
+// vector such a signature names, and none that needs the vector in its body or reaches a
+// function the archive does not hold (archive_keep); those are compiled into the user's
+// unit instead. The archive layered over it defines the vector and holds them. A foreign
+// binding may carry a non-empty row but is a plain C wrapper that reads no evidence, which
+// is why the signature is asked rather than the effects list.
 fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for f in decls_in_scope(cfg, module_key, cg_reg_fn_decls(), declare_only) {
         if shared && is_entry_point(f) { continue }
-        if shared && cg_decl_takes_ev(f) && cfg.archive_over_std == 0 { continue }
+        if shared && left_out_of_std_archive(cfg, f) && cfg.archive_over_std == 0 { continue }
         out.push(f)
     }
     out
@@ -529,7 +548,7 @@ fn fns_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool
 fn methods_in_scope(cfg: CgConfig, module_key: Str, shared: Bool, declare_only: Bool) -> List[Int] {
     let mut out: List[Int] = []
     for m in decls_in_scope(cfg, module_key, cg_reg_impl_methods(), declare_only) {
-        if shared && cg_decl_takes_ev(m) && cfg.archive_over_std == 0 { continue }
+        if shared && left_out_of_std_archive(cfg, m) && cfg.archive_over_std == 0 { continue }
         out.push(m)
     }
     out
@@ -600,9 +619,11 @@ fn emit_bodies(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
         match cg_decl_body_site(d) {
             BodySite.ThisUnit => {
                 cg_trace_arm(d)
+                let start = ir_node_count()
                 cg_decl_emit_fn_def(d, is_archive_private_copy(cfg, d), lower_body(d))
+                note_body(cfg.body_scan, d, cg_decl_c_name(d), start)
             }
-            BodySite.PerInstance => emit_instance_bodies(d, instance_is_private_copy(cfg, d))
+            BodySite.PerInstance => emit_instance_bodies(cfg, d, instance_is_private_copy(cfg, d))
             BodySite.ForeignWrapper => cg_decl_emit_foreign_wrapper(d)
             BodySite.Nothing => {}
         }
