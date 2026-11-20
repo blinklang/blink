@@ -213,13 +213,32 @@ pub let mut parse_desugar_enabled: Int = 1
 // line and column per node. The parser keeps no paren nodes and a BinOp's own place is its
 // operator, so a fix that rewrites an operand reads the operand's place here. 0 means nothing
 // was recorded.
+// `type_marks`: TYPE_MARK_* bits of a type node, as the parser keeps no paren node.
+// `row_starts`, `row_ends`: where the row of a fn type was written, from its `!` through its
+// last token, packed as the written places are. 0 means the fn type has no row.
+// `row_prevs`: for an item after the comma that ends a bare row (§4.15.1), or after an item
+// so kept, the item before it plus one. If the item names an effect, the writer meant it as a
+// further effect of that row. 0 means no such item.
 type NodeSideTables {
     source_module: Map[Int, Str]
     written_starts: List[Int]
     written_ends: List[Int]
+    type_marks: List[Int]
+    row_starts: List[Int]
+    row_ends: List[Int]
+    row_prevs: List[Int]
 }
 
-let mut node_sides: NodeSideTables = NodeSideTables { source_module: Map(), written_starts: [], written_ends: [] }
+let mut node_sides: NodeSideTables = node_sides_empty()
+
+fn node_sides_empty() -> NodeSideTables {
+    NodeSideTables { source_module: Map(), written_starts: [], written_ends: [], type_marks: [], row_starts: [], row_ends: [], row_prevs: [] }
+}
+
+// Parentheses around the type: grouping (§3.8), which decides who owns a row after it.
+pub const TYPE_MARK_GROUPED = 1
+// The fn type's row is in parentheses, `! (A, B)`.
+pub const TYPE_MARK_ROW_PARENS = 2
 
 // A daemon recheck keeps the nodes of each source whose bytes did not change, so the pool must
 // go back to what the parses wrote before each check. Every write to a node or a closed
@@ -497,7 +516,7 @@ pub fn parser_reset() {
     annotations = PendingAnnotations { item: [], program: [] }
     // The build sets wanted before the front end, which resets the parser first.
     fn_bodies = FnBodies { wanted: fn_bodies.wanted, deferred: fn_bodies.deferred, depth: 0, tok_firsts: [], tok_lasts: [], item_firsts: [], item_kinds: [] }
-    node_sides = NodeSideTables { source_module: Map(), written_starts: [], written_ends: [] }
+    node_sides = node_sides_empty()
     pos = 0
     parse_desugar_enabled = 1
     journal = node_journal_empty(journal.keep)
@@ -509,6 +528,12 @@ fn written_trim() {
         node_sides.written_starts.pop()
         node_sides.written_ends.pop()
     }
+    while node_sides.type_marks.len() > columns.count {
+        node_sides.type_marks.pop()
+        node_sides.row_starts.pop()
+        node_sides.row_ends.pop()
+        node_sides.row_prevs.pop()
+    }
 }
 
 fn written_put(id: Int, start: Int, end: Int) {
@@ -518,6 +543,54 @@ fn written_put(id: Int, start: Int, end: Int) {
     }
     node_sides.written_starts.set(id, start)
     node_sides.written_ends.set(id, end)
+}
+
+fn type_sides_grow(id: Int) {
+    while node_sides.type_marks.len() <= id {
+        node_sides.type_marks.push(0)
+        node_sides.row_starts.push(0)
+        node_sides.row_ends.push(0)
+        node_sides.row_prevs.push(0)
+    }
+}
+
+fn type_mark_add(id: Int, mark: Int) {
+    if id < 0 { return }
+    type_sides_grow(id)
+    node_sides.type_marks.set(id, node_sides.type_marks.get(id).unwrap() | mark)
+}
+
+pub fn node_type_marks(id: Int) -> Int {
+    written_at(node_sides.type_marks, id)
+}
+
+// The item before `id` in its list when a bare row ends that item or it is itself so kept,
+// or -1.
+pub fn node_row_prev(id: Int) -> Int {
+    written_at(node_sides.row_prevs, id) - 1
+}
+
+fn row_prev_set(item: Int, prev: Int) {
+    type_sides_grow(item)
+    node_sides.row_prevs.set(item, prev + 1)
+}
+
+// Whether the row of a fn type ends item `prev`, or `prev` is itself kept after such a row.
+// A default value after the row ends the row first.
+fn row_runs_after(prev: Int) -> Bool {
+    if prev < 0 { return false }
+    if node_kind(prev) == NodeKind.Param && node_value(prev) != -1 { return false }
+    let t = if node_kind(prev) == NodeKind.Param { node_type_ann(prev) } else { prev }
+    type_bare_row_owner(t) != -1 || node_row_prev(prev) != -1
+}
+
+// (line, col, end line, end col) of the row of fn type `id`, from its `!`. All 0 when it has
+// no row.
+pub fn node_row_span(id: Int) -> (Int, Int, Int, Int) {
+    let s = written_at(node_sides.row_starts, id)
+    let e = written_at(node_sides.row_ends, id)
+    if s == 0 || e == 0 { return (0, 0, 0, 0) }
+    (s >> 24, s & 16777215, e >> 24, e & 16777215)
 }
 
 fn written_at(places: List[Int], id: Int) -> Int {
@@ -3887,12 +3960,25 @@ fn parse_type_annotation_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.R
             node_push(AstNode { kind: NodeKind.TypeAnn, name: "Void", op: COMPILER_KNOWN_TYPE_ANN, line: peek_line(), col: peek_col() })
             return ua
         }
+        let first = parse_type_annotation()
+        // One type in parentheses is that type (§3.8); the mark keeps the parentheses for the
+        // owner of a row after them and for fmt.
+        skip_newlines()
+        if !at(TokenKind.Comma) {
+            expect(TokenKind.RParen)
+            type_mark_add(first, TYPE_MARK_GROUPED)
+            return first
+        }
         let elems = new_sublist()
-        sublist_push(elems, parse_type_annotation())
+        sublist_push(elems, first)
+        let mut prev = first
         while at(TokenKind.Comma) {
             advance()
             skip_newlines()
-            sublist_push(elems, parse_type_annotation())
+            let item = parse_type_annotation()
+            mark_after_bare_row(prev, item)
+            sublist_push(elems, item)
+            prev = item
         }
         skip_newlines()
         expect(TokenKind.RParen)
@@ -3908,11 +3994,15 @@ fn parse_type_annotation_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.R
         let mut elems = -1
         if !at(TokenKind.RParen) {
             elems = new_sublist()
-            sublist_push(elems, parse_type_annotation())
+            let mut prev = parse_type_annotation()
+            sublist_push(elems, prev)
             while at(TokenKind.Comma) {
                 advance()
                 skip_newlines()
-                sublist_push(elems, parse_type_annotation())
+                let item = parse_type_annotation()
+                mark_after_bare_row(prev, item)
+                sublist_push(elems, item)
+                prev = item
             }
             finalize_sublist(elems)
         }
@@ -3926,12 +4016,43 @@ fn parse_type_annotation_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.R
             ret_name = node_name(rt)
             ret_ann = rt
         }
+        // A bare row holds one effect or `_`: a comma after it ends it (§4.15.1).
+        let mut row = -1
+        let mut row_marks = 0
+        let mut row_start = 0
+        if at(TokenKind.Bang) {
+            row_start = written_pack(peek_line(), peek_col())
+            advance()
+            row = new_sublist()
+            if at(TokenKind.LParen) {
+                advance()
+                skip_newlines()
+                row_marks = TYPE_MARK_ROW_PARENS
+                while !at(TokenKind.RParen) && !at(TokenKind.EOF) {
+                    sublist_push(row, parse_effect_name_node())
+                    skip_newlines()
+                    if !at(TokenKind.Comma) { break }
+                    advance()
+                    skip_newlines_and_comments()
+                }
+                expect(TokenKind.RParen)
+            } else {
+                sublist_push(row, parse_effect_name_node())
+            }
+            finalize_sublist(row)
+        }
         let ta = node_count()
         node_push(AstNode {
             kind: NodeKind.TypeAnn, name: "Fn", op: COMPILER_KNOWN_TYPE_ANN, elements: elems,
-            return_type: ret_name, type_ann: ret_ann,
+            return_type: ret_name, type_ann: ret_ann, effects: row,
             line: peek_line(), col: peek_col(),
         })
+        if row != -1 {
+            type_sides_grow(ta)
+            node_sides.row_starts.set(ta, row_start)
+            node_sides.row_ends.set(ta, written_pack(tokens.lines.get(pos - 1).unwrap(), tokens.end_cols.get(pos - 1).unwrap()))
+            type_mark_add(ta, row_marks)
+        }
         return ta
     }
     if at(TokenKind.Handler) {
@@ -3957,11 +4078,15 @@ fn parse_type_annotation_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.R
     if at(TokenKind.LBracket) {
         advance()
         elems = new_sublist()
-        sublist_push(elems, parse_type_annotation())
+        let mut prev = parse_type_annotation()
+        sublist_push(elems, prev)
         while at(TokenKind.Comma) {
             advance()
             skip_newlines()
-            sublist_push(elems, parse_type_annotation())
+            let item = parse_type_annotation()
+            mark_after_bare_row(prev, item)
+            sublist_push(elems, item)
+            prev = item
         }
         expect(TokenKind.RBracket)
         finalize_sublist(elems)
@@ -3982,6 +4107,33 @@ fn parse_type_annotation_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.R
     ta
 }
 
+// The fn type whose bare row ends type `t`, or -1. A fn type that ends in a fn type result
+// with no parentheses ends where that result ends.
+pub fn type_bare_row_owner(t: Int) -> Int {
+    let mut cur = t
+    while cur >= 0 && is_fn_type_ann(cur) && (node_type_marks(cur) & TYPE_MARK_GROUPED) == 0 {
+        if node_effects(cur) != -1 {
+            if (node_type_marks(cur) & TYPE_MARK_ROW_PARENS) != 0 { return -1 }
+            return cur
+        }
+        cur = node_type_ann(cur)
+    }
+    -1
+}
+
+pub fn is_fn_type_ann(t: Int) -> Bool {
+    node_kind(t) == NodeKind.TypeAnn && node_name(t) == "Fn" && node_op(t) == COMPILER_KNOWN_TYPE_ANN
+}
+
+// Keeps `item` after `prev` when a bare row ends `prev`, or `prev` is itself so kept, so the
+// check can read a name after the comma as a further effect of that row.
+fn mark_after_bare_row(prev: Int, item: Int) {
+    if item < 0 || !row_runs_after(prev) { return }
+    if node_kind(item) == NodeKind.TypeAnn && node_elements(item) == -1 && node_op(item) != COMPILER_KNOWN_TYPE_ANN && (node_type_marks(item) & TYPE_MARK_GROUPED) == 0 {
+        row_prev_set(item, prev)
+    }
+}
+
 // ── Effect declarations ─────────────────────────────────────────────
 
 // An operation with a body is a derived operation (§4.7.1): a handler that omits it runs this
@@ -3995,14 +4147,16 @@ fn parse_effect_op_sig() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let params_sl = new_sublist()
     skip_newlines()
     if !at(TokenKind.RParen) {
-        sublist_push(params_sl, parse_param())
+        let mut prev_param = parse_param()
+        sublist_push(params_sl, prev_param)
         while at(TokenKind.Comma) {
             advance()
             skip_newlines()
             if at(TokenKind.RParen) {
                 break
             }
-            sublist_push(params_sl, parse_param())
+            prev_param = parse_param_after(prev_param)
+            sublist_push(params_sl, prev_param)
         }
         skip_newlines()
     }
@@ -4183,6 +4337,7 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let p = parse_param()
         if kw_only { node_set_int_val(p, 1) }
         sublist_push(params, p)
+        let mut prev_param = p
         while at(TokenKind.Comma) {
             advance()
             skip_newlines()
@@ -4193,9 +4348,10 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 advance()
                 kw_only = true
             }
-            let p2 = parse_param()
+            let p2 = parse_param_after(prev_param)
             if kw_only { node_set_int_val(p2, 1) }
             sublist_push(params, p2)
+            prev_param = p2
         }
         skip_newlines()
     }
@@ -4240,6 +4396,16 @@ fn parse_fn_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         advance()
         effects_sl = new_sublist()
         sublist_push(effects_sl, parse_effect_name_node())
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines_and_comments()
+            sublist_push(effects_sl, parse_effect_name_node())
+        }
+        finalize_sublist(effects_sl)
+    } else if ret_ann != -1 && type_bare_row_owner(ret_ann) != -1 && at(TokenKind.Comma) {
+        // `-> fn() -> T ! A, B`: the returned fn type took `! A`, and the row has two owners
+        // (E1135). The rest of the list is read so the body still parses.
+        effects_sl = new_sublist()
         while at(TokenKind.Comma) {
             advance()
             skip_newlines_and_comments()
@@ -4464,6 +4630,25 @@ fn parse_test_failing_block(line: Int, col: Int) -> Int ! Parse.Advance, Parse.B
     nd
 }
 
+// A parameter after the comma that ends a bare row (§4.15.1), or after a name so read. A name
+// with no type there may be a further effect of that row, so it is kept for the check to
+// read; a dotted name can be nothing else, and is kept whole as the parameter's name.
+fn parse_param_after(prev: Int) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    if !row_runs_after(prev) { return parse_param() }
+    if at(TokenKind.Ident) && peek_kind_at(pos + 1) == TokenKind.Dot {
+        let line = peek_line()
+        let col = peek_col()
+        let name = parse_effect_name()
+        let nd = node_count()
+        node_push(AstNode { kind: NodeKind.Param, name: name, line: line, col: col })
+        row_prev_set(nd, prev)
+        return nd
+    }
+    let p = parse_param()
+    if node_type_ann(p) == -1 && node_value(p) == -1 { row_prev_set(p, prev) }
+    p
+}
+
 fn parse_param() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let mut is_mut = 0
     if at(TokenKind.Mut) {
@@ -4523,6 +4708,7 @@ fn parse_closure() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         let cp = parse_param()
         if cl_kw_only { node_set_int_val(cp, 1) }
         sublist_push(params, cp)
+        let mut prev_param = cp
         while at(TokenKind.Comma) {
             advance()
             skip_newlines()
@@ -4533,9 +4719,10 @@ fn parse_closure() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 advance()
                 cl_kw_only = true
             }
-            let cp2 = parse_param()
+            let cp2 = parse_param_after(prev_param)
             if cl_kw_only { node_set_int_val(cp2, 1) }
             sublist_push(params, cp2)
+            prev_param = cp2
         }
         skip_newlines()
     }

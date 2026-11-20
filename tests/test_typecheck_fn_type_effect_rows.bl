@@ -1,0 +1,305 @@
+// A fn type takes an effect row in every type position (sections/04_effects.md §4.15.1).
+// A bare row holds one effect; a comma after it ends the row (RowListNeedsParens, E1136).
+// A bare row after a fn type whose result is a fn type has two owners (RowOwnerAmbiguous,
+// E1135). Parentheses around a type are grouping, never a 1-tuple (§3.8).
+
+import compile_test_helpers
+
+fn must_hold(output: Str, needle: Str, label: Str) {
+    assert(output.contains(needle), "{label}: expected '{needle}' in {output}")
+}
+
+fn must_be_clean(output: Str, label: Str) {
+    assert(!output.contains("\"severity\":\"error\""), "{label}: expected a clean compile, got {output}")
+}
+
+fn count(text: Str, part: Str) -> Int {
+    text.split(part).len() - 1
+}
+
+fn shout_src(rest: Str) -> Str {
+    #"fn shout(x: Int) -> Int ! IO.Print {
+    io.println("{x}")
+    x
+}
+
+fn double(x: Int) -> Int { x * 2 }
+
+"#.concat(rest)
+}
+
+test "a fn type in a parameter takes a row" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn ap(f: fn(Int) -> Int ! IO.Print, x: Int) -> Int ! IO.Print { f(x) }
+
+fn main() {
+    io.println("{ap(shout, 1)}")
+}
+"#), "fn_row_param")
+    must_be_clean(out, "a row on a parameter's fn type")
+}
+
+test "a fn type in a let annotation takes a row" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn main() {
+    let g: fn(Int) -> Int ! IO.Print = shout
+    io.println("{g(2)}")
+}
+"#), "fn_row_let")
+    must_be_clean(out, "a row on a let's fn type")
+}
+
+test "a fn type in a type argument takes a row" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"type E[T] { L(T), N }
+
+fn main() {
+    let a: E[fn(Int) -> Int ! IO.Print] = E.L(shout)
+    match a {
+        E.L(f) => io.println("{f(3)}")
+        E.N => io.println("none")
+    }
+}
+"#), "fn_row_type_arg")
+    must_be_clean(out, "a row on a type argument's fn type")
+}
+
+test "a parenthesized fn type return takes a row" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn mk() -> (fn(Int) -> Int ! IO.Print) {
+    shout
+}
+
+fn main() {
+    io.println("{mk()(4)}")
+}
+"#), "fn_row_paren_return")
+    must_be_clean(out, "a row inside a parenthesized return type")
+}
+
+test "a row after a parenthesized fn type return belongs to the declaration" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn mk() -> (fn(Int) -> Int) ! IO.Print {
+    io.println("mk")
+    double
+}
+
+fn main() {
+    io.println("{mk()(5)}")
+}
+"#), "fn_row_paren_return_decl_row")
+    must_be_clean(out, "the declaration's row after a parenthesized fn type")
+}
+
+test "a parenthesized row holds two effects" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn ap(f: fn(Int) -> Int ! (IO.Print, Env.Read), x: Int) -> Int ! IO.Print, Env.Read { f(x) }
+
+fn main() {
+    io.println("{ap(shout, 6)}")
+}
+"#), "fn_row_paren_list")
+    must_be_clean(out, "`! (A, B)` on a fn type")
+}
+
+test "a wildcard row on a fn type parses" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn ap(f: fn(Int) -> Int ! _, x: Int) -> Int { f(x) }
+
+fn main() {
+    io.println("{ap(double, 7)}")
+}
+"#), "fn_row_wildcard")
+    must_be_clean(out, "`! _` on a fn type")
+}
+
+test "parentheses around one type are grouping, not a 1-tuple" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() {
+    let t: (Int) = 3
+    io.println("{t + 1}")
+}
+"#, "paren_type_grouping")
+    must_be_clean(out, "`(Int)` is `Int`")
+}
+
+test "a row on a fn type does not change which values it accepts yet" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"type E[T] { L(T), N }
+
+fn take(e: E[fn(Int) -> Int]) -> Int {
+    match e {
+        E.L(f) => f(1)
+        E.N => 0
+    }
+}
+
+fn main() {
+    let a: E[fn(Int) -> Int ! IO.Print] = E.L(double)
+    io.println("{take(a)}")
+}
+"#), "fn_row_comparison_off")
+    must_be_clean(out, "a rowful fn type nested in a type argument meets a rowless one")
+}
+
+test "a comma after a bare row in a parameter list is E1136" {
+    let out = compile_test_helpers.compile_and_capture(#"fn t(f: fn(Int) -> Int ! IO.Print, IO.Log) {
+}
+
+fn main() {
+}
+"#, "fn_row_list_needs_parens")
+    must_hold(out, "\"code\":\"E1136\"", "a second effect after a comma")
+    must_hold(out, "write `! (IO.Print, IO.Log)`", "the help writes the parenthesized row")
+    assert_eq(count(out, "\"severity\":\"error\""), 1)
+}
+
+test "a comma after a bare row in a type argument list is E1136 when an effect follows" {
+    let out = compile_test_helpers.compile_and_capture(#"type P[A, B] { a: A, b: B }
+
+fn t(p: P[fn(Int) -> Int ! IO.Print, IO.Log]) {
+}
+
+fn main() {
+}
+"#, "fn_row_list_needs_parens_type_arg")
+    must_hold(out, "\"code\":\"E1136\"", "a second effect after a comma in a type argument list")
+    assert_eq(count(out, "\"severity\":\"error\""), 1)
+}
+
+test "a type after a bare row in a type argument list is the next argument" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"type P[A, B] { a: A, b: B }
+
+fn main() {
+    let p: P[fn(Int) -> Int ! IO.Print, Int] = P { a: shout, b: 2 }
+    io.println("{(p.a)(p.b)}")
+}
+"#), "fn_row_then_type_arg")
+    must_be_clean(out, "a comma after a bare row starts the next type argument")
+}
+
+test "a bare row after a declaration's fn type return is E1135" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn mk() -> fn(Int) -> Int ! IO.Print {
+    shout
+}
+
+fn main() {
+}
+"#), "fn_row_owner_ambiguous_decl")
+    must_hold(out, "\"code\":\"E1135\"", "the row has two owners")
+    must_hold(out, "write `-> (fn(Int) -> Int ! IO.Print)`", "the help that gives the row to the returned fn type")
+    must_hold(out, "write `-> (fn(Int) -> Int) ! IO.Print`", "the help that gives the row to `mk`")
+    assert_eq(count(out, "\"severity\":\"error\""), 1)
+}
+
+test "a bare row after a fn type whose result is a fn type is E1135" {
+    let out = compile_test_helpers.compile_and_capture(#"fn t(f: fn(Int) -> fn(Int) -> Int ! IO.Print) {
+}
+
+fn main() {
+}
+"#, "fn_row_owner_ambiguous_type")
+    must_hold(out, "\"code\":\"E1135\"", "the row has two owners in a type position")
+    assert_eq(count(out, "\"severity\":\"error\""), 1)
+}
+
+test "an empty row on a fn type is E0564" {
+    let out = compile_test_helpers.compile_and_capture(#"fn t(f: fn(Int) -> Int ! ()) {
+}
+
+fn main() {
+}
+"#, "fn_row_empty")
+    must_hold(out, "\"code\":\"E0564\"", "`! ()` outside an @ffi decl")
+}
+
+test "an unknown effect in a fn type's row is reported" {
+    let out = compile_test_helpers.compile_and_capture(#"fn t(f: fn(Int) -> Int ! Nope) {
+}
+
+fn main() {
+}
+"#, "fn_row_unknown_effect")
+    must_hold(out, "unknown effect `Nope`", "a row name that names no effect")
+}
+
+test "a default value after a fn type's bare row ends the row" {
+    let out = compile_test_helpers.compile_and_capture(#"fn one() -> Int { 1 }
+
+fn t(n: Int, -- f: fn() -> Int = one, g: fn() -> Int ! IO.Print = one, k: Int) -> Int ! IO.Print { f() + g() + n + k }
+
+fn main() {
+    io.println("{t(1, k: 2)}")
+}
+"#, "fn_row_default_ends_row")
+    assert(!out.contains("\"code\":\"E1136\""), "a default after the row: {out}")
+}
+
+test "a `_` closure parameter after a fn type's bare row is a binder" {
+    let out = compile_test_helpers.compile_and_capture(#"fn call2(h: fn(fn(Int) -> Int ! IO.Print, Int) -> Int) -> Int {
+    h(fn(x: Int) -> Int { x }, 5)
+}
+
+fn main() {
+    io.println("{call2(fn(f: fn(Int) -> Int ! IO.Print, _) { f(1) })}")
+}
+"#, "fn_row_underscore_binder")
+    must_be_clean(out, "`_` after a bare row")
+}
+
+test "an empty row after a declaration's fn type return is only E0564" {
+    let out = compile_test_helpers.compile_and_capture(#"fn mk() -> fn() -> Int ! () {
+    fn() -> Int { 1 }
+}
+
+fn main() {
+}
+"#, "fn_row_empty_decl_return")
+    must_hold(out, "\"code\":\"E0564\"", "`! ()` on the returned fn type")
+    assert(!out.contains("\"code\":\"E1135\""), "an empty row has no owner to choose: {out}")
+}
+
+test "a type error names a fn type with its row" {
+    let out = compile_test_helpers.compile_and_capture(#"fn main() {
+    let g: fn(Int) -> Int ! IO.Print = 3
+}
+"#, "fn_row_in_type_text")
+    must_hold(out, "! IO.Print", "the rowful fn type in the message")
+}
+
+test "an @ffi decl's row after a fn type return is E1135 with a fix that gives it to the decl" {
+    let out = compile_test_helpers.compile_and_capture(#"@ffi("mk_cb")
+fn mk() -> fn() -> Int ! FFI
+
+fn main() {
+}
+"#, "fn_row_owner_ambiguous_ffi")
+    must_hold(out, "\"code\":\"E1135\"", "the row has two owners on an @ffi decl")
+    must_hold(out, "\"text\":\"(fn() -> Int) ! FFI\",\"span\":\{\"file\":", "the fix writes the decl form")
+    must_hold(out, "\"line\":2,\"col\":12,\"end_line\":2,\"end_col\":29}}", "the fix covers the return type and its row")
+    assert(!out.contains("to the returned fn type, write"), "an @ffi decl gets only the declaration help: {out}")
+}
+
+test "a generic's fn type keeps its row when its type parameter is bound" {
+    let out = compile_test_helpers.compile_and_capture(shout_src(#"fn pass[T](f: fn(T) -> T ! IO.Print) -> (fn(T) -> T ! IO.Print) { f }
+
+fn main() {
+    let s: Str = pass(shout)
+}
+"#), "fn_row_generic_bound")
+    must_hold(out, "declared type Str but got Fn(Int) -> Int ! IO.Print", "the bound fn type keeps its row")
+}
+
+test "two spellings of one effect in a fn type's row give one type" {
+    let lib = #"pub effect Log {
+    effect Put {
+        fn put(msg: Str) -> Int
+    }
+}
+"#
+    let entry = #"import fnrow_lib
+import fnrow_lib.{Log}
+
+fn one() -> Int ! Log { 1 }
+
+fn main() {
+    let g: fn() -> Int ! Log = one
+    let h: List[fn() -> Int ! fnrow_lib.Log] = [g]
+    let s: Str = h
+}
+"#
+    let out = compile_test_helpers.compile_xmod_capture(entry, "fnrow_lib", lib, "fn_row_two_spellings")
+    must_hold(out, "declared type Str but got List[Fn() -> Int ! Log]", "the qualified spelling names the effect the bare one does")
+    assert(!out.contains("! fnrow_lib.Log"), "the type keeps no spelling of the effect: {out}")
+}

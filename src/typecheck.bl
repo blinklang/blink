@@ -2,14 +2,14 @@ import ast.{NodeKind, node_kind_name, is_block_bearing, trace_gate_on, nk_is_typ
 import builtin_effects.{env_op_for_old_slot, env_op_names, builtin_effect_children, builtin_effect_tree_roots, reserved_effect_handles, reserved_effect_root_of, builtin_op_root_of_handle, builtin_op_roots, builtin_root_has_handler_ops, is_builtin_effect_handle, is_builtin_op_root}
 import std.str.{str_to_lower}
 import pkg.manifest.{manifest_name, manifest_header_is_declared}
-import unparse.{type_ann_text, type_ann_text_renamed, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
+import unparse.{type_ann_text, type_ann_text_renamed, fn_type_row_text, unparse_expr, unparse_binop_with_lhs, unparse_range_membership, unparse_coalesce_start}
 import free_names.{closure_read_names}
 import formatter.{effect_op_sig_text, format_param_renamed, fn_sig_text, fn_sig_text_renamed, type_param_list_text, format_type_param_binder, format_pattern}
 import layout.{tid_has_c_shape}
 import diag_catalog.{diag_catalog_name}
 import import_edit.{ImportEdit, ImportNeed, import_aliased_edit, import_module_edit, import_need}
 import parser.{
-    node_written_span, type_ann_is_unit, effect_derived_ops, effect_ops, effect_decl_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
+    node_written_span, node_type_marks, node_row_span, type_bare_row_owner, is_fn_type_ann, TYPE_MARK_GROUPED, node_row_prev, type_ann_is_unit, effect_derived_ops, effect_ops, effect_decl_ops, node_load_rank, parser_load_order_moved, parser_live_ranges,
     ann_str_val, positional_str_arg, positional_str_arg_count, impl_provided_by_closeable, closeable_impl_of, sublist_remove_members, get_annotation, is_foreign_binding, is_handle_type, runtime_handle_annotation, get_str_named_arg, has_annotation, is_literal_string_part,
     node_args, node_assoc_types, node_arms, node_body, node_captures, node_col, node_condition,
     node_effects, node_elements, node_else_body, node_end, node_fields, node_for_binder, node_guard,
@@ -39,7 +39,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, CODEGEN_STAGE_NOT_BUILT_NAME, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, INVALID_RUNTIME_BINDING, FFI_INCOMPATIBLE_TYPE, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, ROW_OWNER_AMBIGUOUS, ROW_LIST_NEEDS_PARENS, INVALID_RUNTIME_BINDING, FFI_INCOMPATIBLE_TYPE, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -161,6 +161,8 @@ pub type TypePoolEntry {
     inner2: Int
     params_start: Int
     params_count: Int
+    // A fn type's effect row (§4.15.1), as its sorted effect names joined by ", "; "" is none.
+    row: Str
 }
 pub let mut ty_pool: List[TypePoolEntry] = []
 pub let mut ty_param_list: List[Int] = []
@@ -2514,7 +2516,7 @@ let mut tc_suppress_ann_validation: Int = 0
 
 fn new_type(kind: TyKind, name: Str) -> Int {
     let idx = ty_pool.len()
-    ty_pool.push(TypePoolEntry { kind: kind, name: name, inner1: -1, inner2: -1, params_start: -1, params_count: 0 })
+    ty_pool.push(TypePoolEntry { kind: kind, name: name, inner1: -1, inner2: -1, params_start: -1, params_count: 0, row: "" })
     idx
 }
 
@@ -2599,7 +2601,13 @@ fn ty_intern_simple(kind: TyKind, name: Str, inner1: Int, inner2: Int) -> Int {
 // there is nothing to roll back. A MISS pushes exactly once, in the original order,
 // reproducing the pre-interning body byte-for-byte.
 fn ty_intern_variadic(kind: TyKind, name: Str, inner1: Int, args: List[Int]) -> Int {
-    let key = ty_intern_key(kind, name, inner1, -1, args)
+    ty_intern_variadic_keyed(kind, name, name, inner1, args)
+}
+
+// `key_name` stands for `name` in the intern key only, so two entries of one name can still
+// be two types.
+fn ty_intern_variadic_keyed(kind: TyKind, name: Str, key_name: Str, inner1: Int, args: List[Int]) -> Int {
+    let key = ty_intern_key(kind, key_name, inner1, -1, args)
     match ty_intern.get(key) {
         Some(v) => return v
         None => {}
@@ -2649,6 +2657,38 @@ pub fn make_result_type(ok_type: Int, err_type: Int) -> Int {
 // producer.
 pub fn make_fn_type(ret_type: Int, param_types: List[Int]) -> Int {
     ty_intern_variadic(TyKind.Fn, "Fn", ret_type, param_types)
+}
+
+// The row of a fn type (TypePoolEntry.row) is not yet compared: tc_tid_same_type and tc_unify
+// read a fn type's shape alone, so a row splits the interned tid and nothing else. Mono's
+// canon_tid rebuilds each fn type through make_fn_type, so mono keys, layout and C names see
+// no row; else one shape would give one C type per row.
+
+// The TypePoolEntry.row key of the row written on fn type annotation `ann`: each name as the
+// effect it names (tc_effect_path_here), sorted, each once, so `! (A, B)` and `! (B, A)` are one
+// row, and so are `! lib.Log` and `! Log` for one effect. "" when it has no row, or `! ()`,
+// which is E0564 outside an @ffi declaration.
+fn tc_fn_type_ann_row_key(ann: Int) -> Str {
+    if ann == -1 { return "" }
+    let row = node_effects(ann)
+    if row == -1 { return "" }
+    let mut names: List[Str] = []
+    let mut i = 0
+    while i < sublist_length(row) {
+        let n = tc_effect_path_here(node_name(sublist_get(row, i)))
+        if !names.contains(n) { names.push(n) }
+        i = i + 1
+    }
+    names.sort().join(", ")
+}
+
+// A fn type with effect row `row` (TypePoolEntry.row); "" is no row, which is make_fn_type.
+fn make_fn_type_with_row(ret_type: Int, param_types: List[Int], row: Str) -> Int {
+    if row == "" { return make_fn_type(ret_type, param_types) }
+    let t = ty_intern_variadic_keyed(TyKind.Fn, "Fn", "Fn ! {row}", ret_type, param_types)
+    let e = ty_pool.get(t).unwrap()
+    if e.row != row { ty_pool.set(t, TypePoolEntry { row: row, ..e }) }
+    t
 }
 
 // INTERNS — safe because tc_tid_same_type compares TyKind.Typevar by
@@ -6862,7 +6902,7 @@ pub fn substitute_typevar_tid(t0: Int, binds: Map[Str, Int]) -> Int {
             i = i + 1
         }
         if changed == 0 { return t }
-        return make_fn_type(ret, params)
+        return make_fn_type_with_row(ret, params, e.row)
     }
     // Every scalar/nominal kind: no embedded typevar to rewrite.
     t
@@ -13931,6 +13971,8 @@ fn resolve_type_ann(ann_node: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
         // than hand -1 in and expect a no-info tid back.
         return make_metavar()
     }
+    // An effect name that a comma split from a bare row has its report (E1136) and is no type.
+    if node_row_prev(ann_node) != -1 && tc_row_spill_owner(ann_node) != -1 { return tc_error_recovery_tid() }
     resolve_type_parts(node_name(ann_node), node_elements(ann_node), ann_node)
 }
 
@@ -14838,7 +14880,7 @@ fn tc_resolve_compiler_known_type(name: Str, elems_sl: Int, ann_node: Int) -> In
                 i = i + 1
             }
         }
-        return make_fn_type(ret_t, param_types)
+        return make_fn_type_with_row(ret_t, param_types, tc_fn_type_ann_row_key(ann_node))
     }
     if name == "Never" { return TYPE_NEVER }
     if name == "StringBuilder" { return type_stringbuilder() }
@@ -19203,6 +19245,7 @@ fn check_effect_row_spellings() ! Diag.Report {
         let mut id = ranges.get(r).unwrap()
         while id < ranges.get(r + 1).unwrap() {
             if node_kind(id) == NodeKind.FnDef { check_fn_effect_row_spelling(id) }
+            if is_fn_type_ann(id) { check_fn_type_row(id) }
             id = id + 1
         }
         r = r + 2
@@ -19229,6 +19272,109 @@ fn check_fn_effect_row_spelling(fn_node: Int) ! Diag.Report {
         let row_end_col = node_empty_row_end_col(fn_node)
         diag_error_span_label_at_notes("EmptyRowOutsideFfi", EMPTY_ROW_OUTSIDE_FFI, "`! ()` is only for `@ffi` declarations", fn_node, row_line, row_col, row_end_col, "no row already means no effects", "remove `! ()`; it is required only on an `@ffi` decl whose foreign code has no effects (§9.1)", [])
     }
+    check_decl_row_owner(fn_node)
+}
+
+// The fn type in the chain of results that starts at `t` and has no parentheses around it,
+// whose row the reader cannot tell apart from the row of the type or declaration before it.
+fn tc_fn_chain_row_owner(t: Int) -> Int {
+    let mut cur = t
+    while cur >= 0 && is_fn_type_ann(cur) && (node_type_marks(cur) & TYPE_MARK_GROUPED) == 0 {
+        if node_effects(cur) != -1 { return cur }
+        cur = node_type_ann(cur)
+    }
+    -1
+}
+
+fn tc_row_names(sl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    if sl == -1 { return out }
+    let mut i = 0
+    while i < sublist_length(sl) {
+        out.push(node_name(sublist_get(sl, i)))
+        i = i + 1
+    }
+    out
+}
+
+// `text` without the row of `owner`, which type_ann_text writes last.
+fn tc_text_without_row(text: Str, owner: Int) -> Str {
+    let row = fn_type_row_text(owner)
+    if row != "" && text.ends_with(row) { return text.byte_slice(0, text.byte_len() - row.byte_len()) }
+    text
+}
+
+// `fn mk() -> fn(A) -> B ! R` has no default owner for `R` (§4.15.1). The parser gave the row to
+// the fn type, and a list after a comma to the declaration, so both are read here as one row.
+fn check_decl_row_owner(fn_node: Int) ! Diag.Report {
+    let ret = node_type_ann(fn_node)
+    let owner = tc_fn_chain_row_owner(ret)
+    if owner == -1 { return }
+    let mut names = tc_row_names(node_effects(owner))
+    let decl_row = node_effects(fn_node)
+    for n in tc_row_names(decl_row) { names.push(n) }
+    let is_ffi = has_annotation(fn_node, "ffi") != 0
+    // Outside `@ffi`, `! ()` on the fn type is E0564, which already names the repair.
+    if names.len() == 0 && !is_ffi { return }
+    let row = if names.len() == 0 { "()" } else { names.join(", ") }
+    let inner_row = if names.len() == 1 { row } else { "({row})" }
+    let rowless = tc_text_without_row(type_ann_text(ret), owner)
+    let name = node_name(fn_node)
+    let (line, col, row_end_line, row_end_col) = node_row_span(owner)
+    let mut end_line = row_end_line
+    let mut end_col = row_end_col
+    if decl_row != -1 && sublist_length(decl_row) > 0 {
+        let last = sublist_get(decl_row, sublist_length(decl_row) - 1)
+        end_line = node_line(last)
+        end_col = node_end_col(last)
+    }
+    let to_fn_type = "to give `{row}` to the returned fn type, write `-> ({rowless} ! {inner_row})`"
+    let to_decl = "to give `{row}` to `{name}`, write `-> ({rowless}) ! {row}`"
+    // An `@ffi` decl needs its row on the declaration (§4.15.1).
+    let help = if is_ffi { to_decl } else { "{to_fn_type}\n{to_decl}" }
+    let msg = "a row after a fn type result has two owners"
+    tc_errors.push(msg)
+    let before = diag_entry_count()
+    diag_error_span_label_at_notes("RowOwnerAmbiguous", ROW_OWNER_AMBIGUOUS, msg, fn_node, line, col, if end_line == line { end_col } else { 0 }, "`{row}` can belong to `{name}` or to the returned fn type", help, [])
+    // Only `@ffi` has one right owner, so only there is the repair machine-applicable.
+    if is_ffi && diag_entry_count() > before {
+        let (ret_line, ret_col, _, _) = node_written_span(ret)
+        diag_set_last_fix_at("give the row to `{name}`", "({rowless}) ! {row}", ret_line, ret_col, end_line, end_col)
+    }
+}
+
+// A row on fn type `t` is `! ()` (E0564), or follows a result that is itself a fn type with no
+// parentheses, so it has two owners (E1135).
+fn check_fn_type_row(t: Int) ! Diag.Report {
+    let own = node_effects(t)
+    if own != -1 && sublist_length(own) == 0 {
+        let (line, col, end_line, end_col) = node_row_span(t)
+        diag_error_span_label_at_notes("EmptyRowOutsideFfi", EMPTY_ROW_OUTSIDE_FFI, "`! ()` is only for `@ffi` declarations", t, line, col, if end_line == line { end_col } else { 0 }, "no row already means no effects", "in a fn type, no row already means pure; remove `! ()`", [])
+    }
+    let ret = node_type_ann(t)
+    let owner = tc_fn_chain_row_owner(ret)
+    if owner == -1 { return }
+    let row_names = tc_row_names(node_effects(owner))
+    // `! ()` here is E0564 above or at its own fn type, which already names the repair.
+    if row_names.len() == 0 { return }
+    let row = row_names.join(", ")
+    let row_text = fn_type_row_text(owner)
+    let mut params: List[Str] = []
+    let elems = node_elements(t)
+    if elems != -1 {
+        let mut i = 0
+        while i < sublist_length(elems) {
+            params.push(type_ann_text(sublist_get(elems, i)))
+            i = i + 1
+        }
+    }
+    let head = "fn({params.join(", ")}) -> "
+    let rowless = tc_text_without_row(type_ann_text(ret), owner)
+    let help = "to give `{row}` to the inner fn type, write `{head}({rowless}{row_text})`\nto give `{row}` to the outer fn type, write `{head}({rowless}){row_text}`"
+    let msg = "a row after a fn type result has two owners"
+    tc_errors.push(msg)
+    let (line, col, end_line, end_col) = node_row_span(owner)
+    diag_error_span_label_at_notes("RowOwnerAmbiguous", ROW_OWNER_AMBIGUOUS, msg, t, line, col, if end_line == line { end_col } else { 0 }, "`{row}` can belong to the outer or to the inner fn type", help, [])
 }
 
 // `@effects(...)` as the author wrote it, for the help. An annotation over several lines has
@@ -32685,6 +32831,7 @@ fn nr_check_field_defaults(td: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.
 fn nr_refuse_untyped_params(fn_node: Int, is_method: Bool) ! Diag.Report {
     let params_sl = node_params(fn_node)
     if params_sl == -1 { return }
+    nr_refuse_row_spill_params(params_sl)
     let mut i = 0
     while i < sublist_length(params_sl) {
         let p = sublist_get(params_sl, i)
@@ -32693,6 +32840,91 @@ fn nr_refuse_untyped_params(fn_node: Int, is_method: Bool) ! Diag.Report {
         if !receiver && nr_param_is_untyped(p) { nr_report_untyped_param(p, "") }
         i = i + 1
     }
+}
+
+// A comma ends a bare row (§4.15.1), so the names after it that name effects were meant as more
+// of that row. They are reported once, as the row, and are no parameters of their own.
+fn nr_refuse_row_spill_params(params_sl: Int) ! Diag.Report {
+    let n = sublist_length(params_sl)
+    let mut i = 0
+    while i < n {
+        let p = sublist_get(params_sl, i)
+        i = i + 1
+        let owner = type_bare_row_owner(node_type_ann(p))
+        if owner == -1 { continue }
+        let mut more: List[Str] = []
+        let mut last = -1
+        while i < n && nr_param_spills_row(sublist_get(params_sl, i)) {
+            last = sublist_get(params_sl, i)
+            nr_walk.untyped_params.insert(last)
+            more.push(node_name(last))
+            i = i + 1
+        }
+        if last != -1 { nr_report_row_spill(owner, more, node_line(last), node_col(last) + node_name(last).byte_len()) }
+    }
+}
+
+fn nr_param_spills_row(p: Int) -> Bool {
+    node_row_prev(p) != -1 && tc_names_row_spill(p)
+}
+
+fn nr_type_item_spills_row(t: Int) -> Bool {
+    node_row_prev(t) != -1 && tc_names_row_spill(t)
+}
+
+// The fn type whose bare row a comma split `item` from (E1136), or -1: `item` and each item
+// back to that fn type name effects.
+fn tc_row_spill_owner(item: Int) -> Int {
+    let mut cur = item
+    while true {
+        let prev = node_row_prev(cur)
+        if prev == -1 || !tc_names_row_spill(cur) { return -1 }
+        let owner = type_bare_row_owner(if node_kind(prev) == NodeKind.Param { node_type_ann(prev) } else { prev })
+        if owner != -1 { return owner }
+        cur = prev
+    }
+    -1
+}
+
+// A parameter after a bare row with no type and a dotted name can only be an effect. `_` is a
+// binder or a type hole there, never a second effect.
+fn tc_names_row_spill(item: Int) -> Bool {
+    let name = node_name(item)
+    if name == "_" { return false }
+    if node_kind(item) != NodeKind.Param { return nr_names_effect(name) }
+    if node_type_ann(item) != -1 || node_type_name(item) != "" || node_value(item) != -1 { return false }
+    name.contains(".") || nr_names_effect(name)
+}
+
+// Whether `name` names an effect here, with no report: the row check reads the name first.
+fn nr_names_effect(name: Str) -> Bool {
+    if name == "_" || name == "FFI" { return true }
+    match name.byte_index_of(".", 0) {
+        Some(dot) => {
+            let head = name.byte_slice(0, dot)
+            let tail = name.byte_slice(dot + 1, name.byte_len())
+            let target = nr_qualifier_module_here(head)
+            if target != "" { return nr_effect_decl_in_module(target, tail, 0) != -1 }
+            match tc_sub_effects_here(head) {
+                Some(kids) => kids.contains(tail)
+                None => false
+            }
+        }
+        None => tc_is_undotted_effect_name(name) || tc_effect_decl_here(name) != -1
+    }
+}
+
+// E1136 from the row of `owner` through the end of its last spilled name.
+fn nr_report_row_spill(owner: Int, more: List[Str], end_line: Int, end_col: Int) ! Diag.Report {
+    let mut names = tc_row_names(node_effects(owner))
+    for m in more { names.push(m) }
+    let row = "! ({names.join(", ")})"
+    let (line, col, _, _) = node_row_span(owner)
+    let msg = "a row of two or more effects needs parentheses here"
+    tc_errors.push(msg)
+    let before = diag_entry_count()
+    diag_error_span_label_at_notes("RowListNeedsParens", ROW_LIST_NEEDS_PARENS, msg, owner, line, col, if end_line == line { end_col } else { 0 }, "a comma ends a bare row", "write `{row}`", [])
+    if diag_entry_count() > before { diag_set_last_fix_at("write the row in parentheses", row, line, col, end_line, end_col) }
 }
 
 fn nr_param_is_untyped(p: Int) -> Bool {
@@ -32967,14 +33199,42 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
     }
     let elems_sl = node_elements(ann_node)
     if elems_sl != -1 {
+        let n = sublist_length(elems_sl)
         let mut i = 0
-        while i < sublist_length(elems_sl) {
-            nr_check_type_ann_visibility(sublist_get(elems_sl, i))
+        while i < n {
+            let child = sublist_get(elems_sl, i)
+            nr_check_type_ann_visibility(child)
             i = i + 1
+            let owner = type_bare_row_owner(child)
+            if owner == -1 { continue }
+            // A comma ends a bare row (§4.15.1): an effect name after it is a lost part of
+            // that row, not a type.
+            let mut more: List[Str] = []
+            let mut last = -1
+            while i < n && nr_type_item_spills_row(sublist_get(elems_sl, i)) {
+                last = sublist_get(elems_sl, i)
+                more.push(node_name(last))
+                i = i + 1
+            }
+            if last != -1 {
+                let (_, _, end_line, end_col) = node_written_span(last)
+                nr_report_row_spill(owner, more, end_line, end_col)
+            }
         }
     }
     // `fn(A, B) -> R` keeps its parameters in `elements` and its return in `type_ann`.
-    if core == "Fn" { nr_check_type_ann_visibility(node_type_ann(ann_node)) }
+    if core == "Fn" {
+        nr_check_type_ann_visibility(node_type_ann(ann_node))
+        let row = node_effects(ann_node)
+        if row != -1 {
+            let mut i = 0
+            while i < sublist_length(row) {
+                let at = sublist_get(row, i)
+                nr_check_effect_name(node_name(at), at)
+                i = i + 1
+            }
+        }
+    }
 }
 
 // A call's bracketed type arguments. A name there that is no type but is a value in scope
@@ -34530,6 +34790,7 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
         tc_check_param_defaults(node)
         let params_sl = node_params(node)
         if params_sl != -1 {
+            nr_refuse_row_spill_params(params_sl)
             let mut i = 0
             while i < sublist_length(params_sl) {
                 let cp = sublist_get(params_sl, i)
@@ -49505,7 +49766,10 @@ fn type_to_str(tid0: Int) -> Str {
             params = params.concat(type_to_str(ty_param_list.get(start + i).unwrap()))
             i = i + 1
         }
-        return "Fn({params}) -> {type_to_str(t.inner1)}"
+        let row = t.row
+        if row == "" { return "Fn({params}) -> {type_to_str(t.inner1)}" }
+        if row.contains(", ") { return "Fn({params}) -> {type_to_str(t.inner1)} ! ({row})" }
+        return "Fn({params}) -> {type_to_str(t.inner1)} ! {row}"
     }
     if k == TyKind.Tuple {
         let start = t.params_start
