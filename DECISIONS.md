@@ -140,7 +140,8 @@ Decided by expert panel vote. See [OPEN_QUESTIONS.md](OPEN_QUESTIONS.md) for ful
 | Method resolution: effect handles | Effect handles are reserved names, cannot be shadowed by local variables | 5-0 |
 | Method resolution: trait ambiguity | Multiple traits with same method → compile error at call site, use `Trait.method(x)` to disambiguate | 5-0 |
 | Inherent methods | Rejected. All methods must belong to traits. No `impl Foo { fn bar(self) }` | 4-1 (Sys: wanted inherent) |
-| Test effect model | Pure by default. No implicit effects in test blocks. Use `with` handlers | 5-0 |
+| Test effect model | *Superseded by "A test block is a root" below.* Pure by default. No implicit effects in test blocks. Use `with` handlers | 5-0 |
+| A test block is a root (§2.20, §4.6, §4.12, §8.10.4, E0539) | **Q1 (6-0)**: a test block is a root, as `main` is. A root holds the effects that the runtime installs a handler for, plus `State`. A test holds every built-in effect that `main`'s root holds, plus `State`, so it needs no `with` and no effect row for one. The runner's seeded `Rand` handler (§8.10.4) is the root `Rand` handler of a test. A `with` in the test body overrides a root handler (`mock_net`, `mock_env`, `capture_print`, ...). A user-declared effect that reaches a test with no `with` stays E0539. No nameable real handler (`real_fs()`) and no effect row on `test`. Async and `io.print*` follow the same rule. Whether `main` has a `DB` or `Crypto` root handler is not decided here. **Q2 (6-0, C-OUT)**: the spec does not say how the runner captures `IO.Print`/`IO.Eprint` per test; the root IO handler serves `io.println` and `capture_print` overrides it. The §2.20 foreign-code subsection (`@ffi ... ! Rand`, "Install the real handler") is cut: an `@ffi` row names world effects only, so no user-declared effect comes only from foreign code, and no built-in effect is unhandled at a test root. Supersedes the "Test effect model" row above. See [rationale](decisions/test-root-effects.md) | Q1 6-0 (web and plt moved from a declared test row after Phase B); Q2 6-0 (devops moved from C-IN); AI-First 5/5 pass |
 | Test assertions (original) | Three built-ins: `assert`, `assert_eq`, `assert_ne` | 4-1 (PLT: minimal only) |
 | Test filtering | Name + path + `@tags(...)` annotation for structured filtering | 4-1 (AI/ML: name-only) |
 | Test scope | Top-level only. Tests in a file see all items (pub and private) in that file's module. *(Updated: `mod { }` scoping removed per inline-module-blocks decision 4-1)* | 4-1 (AI/ML: top-level only) |
@@ -1001,6 +1002,7 @@ Full deliberation records for each decision. Each file contains expert votes, re
 | A Closure Is Charged at Its Call | [decisions/closure-effects-charged-at-call.md](decisions/closure-effects-charged-at-call.md) |
 | A `Ptr` at an `@ffi` Call | [decisions/ffi-pointer-prototype.md](decisions/ffi-pointer-prototype.md) |
 | A Handle Type Has No Body | [decisions/handle-type-no-body.md](decisions/handle-type-no-body.md) |
+| A Test Block Is a Root | [decisions/test-root-effects.md](decisions/test-root-effects.md) |
 
 ---
 

@@ -1064,7 +1064,7 @@ blink test notests/           # exit 2: the directory holds no test file (§8.10
 
 #### 8.10.1 Test Effect Handlers: `capture_log`
 
-Tests are pure by default (see §4.7). Code that uses effects like `IO.Log` requires explicit handlers in test blocks. The `std.testing` module provides `capture_log` — a handler factory that intercepts `io.log()` calls and collects messages into a list for assertion.
+A test block holds the built-in effects as `main` does (§2.20), so a test needs a handler only to replace one, for example to collect `IO.Log` messages. The `std.testing` module provides `capture_log` — a handler factory that intercepts `io.log()` calls and collects messages into a list for assertion.
 
 ```blink
 import std.testing.{capture_log}
@@ -1496,7 +1496,7 @@ test "timeout fires after configured interval" {
 
 **`time.read()`** returns the current mock instant. **`time.monotonic()`** returns the mock reading: the offset of the mock instant from `start`, so it is zero at `start`. **`time.sleep(d)`** records `d` and does not block. **`.advance(d)`** moves the mock instant and the mock monotonic reading forward by `d` — used by tests that need to drive a timeout, retry loop, or rate-limiter past a threshold without consuming wall-clock time. It panics when `d` is negative, and the message contains the value: `mock_clock.advance: duration must not be negative, got -1s`. **`.elapsed()`** returns the recorded `List[Duration]` of `time.sleep` calls; tests assert on the sequence of sleeps the code under test issued. `.elapsed()` returns a copy: later handler activity does not change it. Call it again to see later sleeps, and call it once after the run, not in a loop, because each call copies the list.
 
-Every `std.testing` mock of a `@handle_all` effect implements every primitive operation of the effect, because a test has no outer handler to forward to. An operation that finds no handler panics at run time (§2.20 *Test blocks*, §4.7.1). A later operation that moves the mock wall clock backward, or jumps it, must keep a separate monotonic reading, because `monotonic` here comes from `now`.
+Every `std.testing` mock of a `@handle_all` effect implements every primitive operation of the effect, so that no call reaches the root handler of the test (§2.20), which is the real clock for `Time`. A later operation that moves the mock wall clock backward, or jumps it, must keep a separate monotonic reading, because `monotonic` here comes from `now`.
 
 ##### `mock_env` — capturing `Env` handler that does not terminate the runner
 

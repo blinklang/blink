@@ -59,7 +59,7 @@ All decided through independent design and cross-team voting. None are revisitab
 | Visibility | `pub` keyword | Public items use `pub`. Everything else is module-private. See [2.12](#212-visibility). |
 | Scoped resources | `with expr as name { }` | Deterministic resource cleanup. `Closeable` trait + LIFO close order. Reuses `with` from effect handlers; the type of the item disambiguates, and `as` only binds a name. 3-0 over `defer`. |
 | Constants | `const NAME = expr` | Compile-time constants. Distinct from `let` (runtime). Literals + arithmetic + boolean ops + references to other consts. See [2.21](#221-const-declarations). |
-| Tests | `test "name" { }` | First-class syntax. Pure by default (no implicit effects). Four built-in assertions. `panic()`, `todo()` and `unreachable()` diverge. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
+| Tests | `test "name" { }` | First-class syntax. A test block is a root: it holds the built-in effects and `State` (a user-declared effect needs `with`). Four built-in assertions. `panic()`, `todo()` and `unreachable()` diverge. Module-scoped tests access private items. `@tags(...)` for filtering. See [2.20](#220-test-blocks). |
 | Spread/rest operator | `..` | General spread/rest sigil. Patterns: `{ name, .. }`, `[first, ..]` (ignore rest). Construction: `{ field: val, ..source }` (copy rest), `[..list1, x, ..list2]` (list spread). See [2.16](#216-spread--rest-operator-). |
 
 **Local bindings.** These forms bind a name in a local scope:
@@ -2379,82 +2379,45 @@ fn main() {
 
 A program from `blink build` has no test runner. `./app --test` runs `main`, and `env.args()` holds `--test`.
 
-#### Effect Model: Pure by Default
+#### Effect Model: A Test Block Is a Root
 
-Test blocks have **no implicit effects**, with one exception: like `main`, a test block holds `State` (§4.16.1), so it can read and write module-level `let mut` bindings. A test that calls an effectful function without a handler is a compile error — the same rule as any other function with an empty effect row. Effect handlers within the body introduce effects locally.
+A test block is a root, as `main` is (§4.6). A root holds the effects that the runtime installs a handler for, plus `State` (§4.16.1). A test block holds every built-in effect that `main`'s root holds, plus `State`. A test needs no `with` for a built-in effect, and it needs no effect row: a test has no caller, so no row would bind anyone.
+
+A user-declared effect has no root handler at either root (§4.12). A user-declared effect that reaches a test block with no `with` that discharges it is `UnhandledEffect` (E0539). `main` follows the same rule (§4.6 *Unhandled user effects*).
 
 ```blink
-// Pure test — no effects needed
-test "deposit increases balance" {
-    let acct = open_account(1, "Test")
-    let result = deposit(acct, 500)
-    assert(result.is_ok())
-    assert_eq(result.unwrap().balance, 500)
+// A test uses the files, the child processes, the environment and the output as `main` does
+test "temp file round trip" {
+    let path = "/tmp/round_trip.txt"
+    fs.write(path, "abc").unwrap()
+    assert_eq(fs.read(path).unwrap(), "abc")
 }
 
-// Effectful test — handlers provide effects explicitly
-test "fetch with mock" {
-    with mock_net(responses) {
-        let result = fetch_data("https://example.com")
-        assert_eq(result.unwrap(), "ok")
+test "child process runs" {
+    let out = process.run("echo", ["ok"]).unwrap()
+    assert_eq(out.out.trim(), "ok")
+}
+
+test "path is set" {
+    assert(env.var("PATH").is_some())
+}
+
+test "two tasks" {
+    async.scope {
+        let a = async.spawn(fn() { 1 + 1 })
+        let b = async.spawn(fn() { 2 + 2 })
+        assert_eq(a.await + b.await, 6)
     }
 }
 
-// Multiple effect handlers compose via with
-test "integration test with shared environment" {
-    with mock_db(fixtures), capture_log([]) {
-        run_migration()
-        assert_eq(get_user(1).unwrap().name, "Alice")
-    }
+test "debug line" {
+    io.println("state = {42}")
 }
 ```
 
-This is consistent with Blink's effect system design — effects are explicit, never hidden. The compiler produces actionable errors when a test calls effectful code without a handler:
+`blink check` and `blink test` accept each test above. The root handler of the effect serves each call. For `io.println`, the runner's root IO handler serves the call. The spec does not say where that handler writes the text: a runner can install a handler that keeps the text of each test. `capture_print` overrides the root IO handler (see *A `with` overrides a root handler* below). A call to `fs.write` in a test reaches the real file system, unless a `with` in the test body overrides the `FS` handler.
 
-```
-error[UnhandledEffect]: unhandled effect `Net` in test "fetch data"
-  --> src/api.bl:45:9
-   |
-45 |     let result = fetch_data(url)
-   |                  ^^^^^^^^^^ `fetch_data` requires `! Net`
-   |
-   = hint: wrap in `with mock_net(...) { ... }` to provide a handler
-```
-
-This is `UnhandledEffect` (E0539). `main` is the other root, and the same code reports a user-declared effect that `main` does not discharge (§4.6 *Unhandled user effects*).
-
-**An effect that comes only from foreign code.** A `with mock_rand(...)` hint is wrong when no handler can see the call that needs the effect. The hint changes when every supplier of the unhandled effect `E` ends at an `@ffi` decl, and no operation of `E` is on the way. The compiler follows the named calls from the test to find the suppliers. The new hint names the chain that it followed, so a reader can check it.
-
-```blink
-@trusted(audit: "SODIUM-1")
-@ffi("sodium", "shim_randombytes_fill", header: "shim_sodium.h")
-fn randombytes(mut buf: Bytes) ! Rand {}
-
-fn make_token() -> Bytes ! Rand {
-    let mut out = Bytes.zeroed(16)
-    randombytes(out)
-    out
-}
-
-test "token has 16 bytes" {
-    let t = make_token()
-    assert_eq(t.len(), 16)
-}
-```
-
-```
-error[UnhandledEffect]: unhandled effect `Rand` in test "token has 16 bytes"
-  --> src/token.bl:14:13
-   |
-14 |     let t = make_token()
-   |             ^^^^^^^^^^^^ `make_token` requires `! Rand`
-   |
-   = hint: `Rand` here comes from foreign code (`randombytes` via `make_token`); a handler cannot intercept it. Install the real handler, or call `rand.bytes(n)` so a mock can see it.
-```
-
-A `with mock_rand(...)` block would not help here: the foreign call does not go through an operation of `Rand`, so a mock never sees it. The hint gives two fixes. One installs the real handler. The other calls `rand.bytes(n)` in `make_token`, so that a mock can see the call.
-
-Any operation of `E` on the way keeps the hint above. A closure on the way keeps it, and so does a `! _` row, because the compiler cannot say where the effect comes from. In the next test, the effect comes from an operation, and a mock sees it:
+**`Rand` at a test root.** The runner's seeded `Rand` handler (§8.10.4) is the root `Rand` handler of a test. A `rand.*` call in a test is not an error, and the seeded stream answers it:
 
 ```blink
 test "id has 16 bytes" {
@@ -2463,21 +2426,71 @@ test "id has 16 bytes" {
 }
 ```
 
+**A `with` overrides a root handler.** A `with` in the body of a test nests inside the root, so its handler answers the calls in its block. A mock, a capture handler and the other handlers of `std.testing` work in this way:
+
+```blink
+test "fetch with mock" {
+    with mock_net(responses) {
+        let result = fetch_data("https://example.com")
+        assert_eq(result.unwrap(), "ok")
+    }
+}
+
+test "run with a fixed environment" {
+    with mock_env(initial) {
+        assert_eq(env.var("MODE").unwrap(), "test")
+    }
+}
+
+test "integration test with shared environment" {
+    with mock_db(fixtures), capture_log([]) {
+        run_migration()
+        assert_eq(get_user(1).unwrap().name, "Alice")
+    }
+}
 ```
-error[UnhandledEffect]: unhandled effect `Rand` in test "id has 16 bytes"
-  --> src/token.bl:19:14
-   |
-19 |     let id = rand.bytes(16)
-   |              ^^^^^^^^^^^^^^ `rand.bytes` requires `! Rand`
-   |
-   = hint: wrap in `with mock_rand(...) { ... }` to provide a handler
+
+A test does not name a real handler: there is no `real_fs()` or `with fs.real()`, and a `test` block takes no effect row. The root already holds each built-in effect, so such a name would add nothing.
+
+**A user-declared effect needs a `with`.** In the next test, nothing discharges `Store`:
+
+```blink
+effect Store {
+    fn get(key: Str) -> Int
+}
+
+fn load() -> Int ! Store {
+    store.get("count")
+}
+
+test "load reads the count" {
+    assert_eq(load(), 1)
+}
 ```
 
-The spec fixes no limit on the number of calls that the compiler follows. A chain that it cannot follow to the end keeps the hint above.
+```
+error[UnhandledEffect]: unhandled effect `Store` in test "load reads the count"
+  --> src/count.bl:10:16
+   |
+10 |     assert_eq(load(), 1)
+   |               ^^^^^^ `load` requires `! Store`
+   |
+   = help: user-declared effects have no root handler; wrap the call in `with <handler> { ... }` (§4.12)
+```
 
-Pure-by-default enables the compiler to safely parallelize test execution — a test whose row is empty, with no effect handlers and no `State`, is guaranteed side-effect-free.
+This is `UnhandledEffect` (E0539). `main` is the other root, and the same code reports a user-declared effect that `main` does not discharge (§4.6 *Unhandled user effects*). The fix is a handler in a `with`:
 
-**Panel vote: 5-0 unanimous** for pure by default. See [DECISIONS.md](../DECISIONS.md).
+```blink
+test "load reads the count" {
+    with memory_store() {
+        assert_eq(load(), 1)
+    }
+}
+```
+
+A test is free of side effects only when its effective row is empty: it reaches no built-in effect and touches no module state (§4.16.1). A test that calls `fs.write`, or that uses `State`, is not free of side effects.
+
+**Panel vote: 6-0** that a test block is a root that holds the built-in effects, and 6-0 that this rule does not set how the runner captures output. See [DECISIONS.md](../DECISIONS.md) and [decisions/test-root-effects.md](../decisions/test-root-effects.md).
 
 #### Error Propagation: `?` in Test Bodies
 
@@ -3763,7 +3776,7 @@ Doc-tests verify that documentation stays in sync with implementation. They are 
 
 - `test` is a keyword — first-class syntax, not a macro or library
 - Test names are static `Str` literals (no interpolation)
-- Pure by default — no implicit effects. Use `with` handlers for effectful tests
+- A test block is a root, as `main` is: it holds every built-in effect that `main` holds, plus `State`. A `with` in the test body overrides a root handler. A user-declared effect needs a `with` (E0539)
 - `?` operator is valid inside a test body — the body is implicitly elaborated to `Result[(), TestError]`. `TestError` is sealed; `Display[E]` is required at each `?` site. No annotation form (`test "name" -> Result[...] { }`) exists or will be added
 - Four built-in assertions: `assert`, `assert_eq`, `assert_ne`, `assert_matches`
 - All assertions accept an optional trailing `Str` message for context

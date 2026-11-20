@@ -3514,6 +3514,19 @@ This is the one normative statement of these rules. §9.1 (*The Effect Row*, *`@
 
 `main` is the root of the capability tree. It implicitly holds all effects. The root has a handler for each built-in effect (§4.3) except `State`, and those are the capabilities `main` holds. `main` also holds `State`, which has no handler (§4.16.1). A user-declared effect has no root handler (§4.12): `main` must discharge it with `with`, or the program does not compile (see *Unhandled user effects* below).
 
+**A root holds the effects that the runtime installs a handler for, plus `State`.** `main` is a root. A test block (§2.20) is the other root. A test block holds every built-in effect that `main`'s root holds, plus `State`, so a test needs no `with` and no effect row for a built-in effect. The runner's seeded `Rand` handler (§8.10.4) is the root `Rand` handler of a test. A `with` in the body of `main` or of a test overrides a root handler for the calls in its block.
+
+```blink
+fn main() {
+    let text = fs.read("config.toml")       // root FS handler
+}
+
+test "config file is there" {
+    let text = fs.read("config.toml")       // root FS handler, as in `main`
+    assert(text.is_ok())
+}
+```
+
 ```blink
 // Valid -- main implicitly has all effects
 fn main() {
@@ -3540,7 +3553,7 @@ The LSP displays `main`'s actual effect set as an inlay hint, computed from the 
 
 #### Unhandled user effects
 
-A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included (a closure is charged at its call, §4.15.4), and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `Scoped` type whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20). In a test, the hint changes when the effect comes only from foreign code (§2.20).
+A user-declared effect that reaches `main`'s body with no `with` that discharges it is a compile error, `UnhandledEffect` (E0539). The check uses the effect rows of the program (§4.5, §4.15), closures and `! _` rows included (a closure is charged at its call, §4.15.4), and the same discharge rule as `with` (§4.7, and §4.7.2 *Scoped effect handlers* for a `Scoped` type whose `Context` is `Handler[E]`). Test blocks are the other root, and the same code reports them (§2.20). The header names the root. A built-in effect that a root holds never gives E0539 at that root.
 
 ```blink
 effect Store {
@@ -4466,7 +4479,7 @@ warning[PartialHandler]: handler for `Time` does not implement `monotonic`
   = help: build the reading with `Monotonic.from_offset(d)` (§3.2.3), or forward on purpose: `fn monotonic() -> Monotonic { default.monotonic() }`
 ```
 
-The forward fix is wrong for `Time` in a test. A test block has no outer `Time` handler (§2.20), so `default.monotonic()` finds no handler and panics at run time (*Completeness and auto-delegation*). The fix itself does not change. It stays `default.op(args)`, and the help only says which way to answer.
+In a test, the forward goes to the root `Time` handler. A test block holds it (§2.20), so `default.monotonic()` reads the real clock, which is not the clock of this handler. A test that needs one clock answers `monotonic` from the same state. The fix itself does not change. It stays `default.op(args)`, and the help only says which way to answer.
 
 To silence the warning, write the operation. Any body counts: `default.op(args)` to forward on purpose, a constant, or a panic. An explicit `default.op(args)` gives the same program as the omitted operation. `@allow(PartialHandler)` on a function and the `[lints]` table also work (§4.16.8).
 
@@ -5230,7 +5243,7 @@ Only the declaration changes. Functions can then narrow their rows to `! Store.R
 
 **Standard library handlers:**
 
-The standard library ships default handlers for built-in effects (real filesystem, real network, real database drivers). `State` is the exception: it has no handler, and the roots hold it (§4.16.1). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible. A user-defined effect that reaches `main` or a test block with no `with` that discharges it is `UnhandledEffect` (E0539, §4.6 *Unhandled user effects*). No operation answers a default value: an operation that finds no handler at run time panics (§4.7.1 *Completeness and auto-delegation*).
+The standard library ships default handlers for built-in effects (real filesystem, real network, real database drivers). `State` is the exception: it has no handler, and the roots hold it (§4.16.1). `main` and each test block hold the built-in effects, so neither needs a `with` for one (§4.6, §2.20). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible. A user-defined effect that reaches `main` or a test block with no `with` that discharges it is `UnhandledEffect` (E0539, §4.6 *Unhandled user effects*). No operation answers a default value: an operation that finds no handler at run time panics (§4.7.1 *Completeness and auto-delegation*).
 
 ```blink
 fn main() {
