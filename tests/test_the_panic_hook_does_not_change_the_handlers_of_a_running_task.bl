@@ -1,0 +1,52 @@
+// Each operation in the panic hook goes to the handlers in scope at its `with` (sections/02_syntax.md
+// §2.20 *The row of the hook*). That holds for the hook only: a task that still runs while the hook
+// runs keeps the handlers at its `async.spawn` site (§2.8 *Handlers in a spawned task*). Channels
+// make the task read its handler while the hook runs. If the hook does not run, the program
+// waits forever, so its run has a time limit.
+
+import compile_test_helpers.{compile_and_run_within}
+
+test "a task that runs during the hook keeps the handlers at its spawn site" {
+    let src = #"import std.panic.{PanicInfo}
+
+effect Tag {
+    effect Get {
+        fn tag() -> Str
+    }
+}
+
+fn boom(i: Int) -> Int {
+    let mut xs = [1, 2]
+    xs.set(i, 5)
+    xs.len()
+}
+
+fn main() ! IO, Env, Async, Tag {
+    let go = channel.new[Int](buffer: 1)
+    let done = channel.new[Int](buffer: 1)
+    let report = fn(_p: PanicInfo) -> Never {
+        go.send(1)
+        let _ = done.recv()
+        env.exit(70)
+    }
+    with handler Tag { fn tag() -> Str { "with-site" } } {
+        with on_panic(report) {
+            with handler Tag { fn tag() -> Str { "main-inner" } } {
+                async.scope {
+                    let a = async.spawn(fn() {
+                        let _ = go.recv()
+                        io.println("task sees tag: {tag.tag()}")
+                        done.send(1)
+                    })
+                    io.println("{boom(10)}")
+                    a.await
+                }
+            }
+        }
+    }
+}
+"#
+    let r = compile_and_run_within(src, "ph_task_tag_{getpid()}", Duration.seconds(60))
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "task sees tag: main-inner\n")
+}

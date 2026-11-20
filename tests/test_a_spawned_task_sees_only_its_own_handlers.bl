@@ -1,0 +1,108 @@
+// A task performs effect operations with the handlers in force at its `async.spawn` site
+// (sections/02_syntax.md §2.8 *Handlers in a spawned task*, sections/04_effects.md §4.13). A
+// `with` on one task installs a handler for that task's body only: another task that runs at the
+// same time keeps its own handlers. Channels order each step, so every check runs at a point
+// where the other task's `with` is open.
+
+effect Tag {
+    effect Get {
+        fn tag() -> Str
+    }
+}
+
+fn tagged(name: Str) -> Handler[Tag] {
+    handler Tag {
+        fn tag() -> Str { name }
+    }
+}
+
+test "a with on a spawned task does not reach main" {
+    let installed = channel.new[Int](buffer: 1)
+    let checked = channel.new[Int](buffer: 1)
+    let mut main_saw = ""
+    let mut task_saw = ""
+    with tagged("main") {
+        async.scope {
+            let h = async.spawn(fn() {
+                with tagged("task") {
+                    installed.send(1)
+                    let _ = checked.recv()
+                    tag.tag()
+                }
+            })
+            let _ = installed.recv()
+            main_saw = tag.tag()
+            checked.send(1)
+            task_saw = h.await
+        }
+    }
+    assert_eq(main_saw, "main")
+    assert_eq(task_saw, "task")
+}
+
+test "a with on main does not reach a task spawned before it" {
+    let opened = channel.new[Int](buffer: 1)
+    let checked = channel.new[Int](buffer: 1)
+    let mut task_saw = ""
+    with tagged("spawn site") {
+        async.scope {
+            let h = async.spawn(fn() {
+                let _ = opened.recv()
+                let t = tag.tag()
+                checked.send(1)
+                t
+            })
+            with tagged("main later") {
+                opened.send(1)
+                let _ = checked.recv()
+            }
+            task_saw = h.await
+        }
+    }
+    assert_eq(task_saw, "spawn site")
+}
+
+test "a task sees the handlers at its spawn site after the with there has ended" {
+    let go = channel.new[Int](buffer: 1)
+    let mut task_saw = ""
+    with tagged("outer") {
+        async.scope {
+            let mut h = async.spawn(fn() { "unused" })
+            with tagged("inner") {
+                h = async.spawn(fn() {
+                    let _ = go.recv()
+                    tag.tag()
+                })
+            }
+            go.send(1)
+            task_saw = h.await
+        }
+    }
+    assert_eq(task_saw, "inner")
+}
+
+test "a task that spawns a task hands on its own handlers, not main's" {
+    let go = channel.new[Int](buffer: 1)
+    let mut inner_saw = ""
+    with tagged("main") {
+        async.scope {
+            let outer = async.spawn(fn() {
+                let mut saw = ""
+                async.scope {
+                    let mut inner = async.spawn(fn() { "unused" })
+                    with tagged("outer task") {
+                        inner = async.spawn(fn() {
+                            let _ = go.recv()
+                            tag.tag()
+                        })
+                    }
+                    go.send(1)
+                    saw = inner.await
+                }
+                saw
+            })
+            inner_saw = outer.await
+        }
+    }
+    assert_eq(inner_saw, "outer task")
+}

@@ -104,7 +104,7 @@ c_derive_method_name cname
 c_variant_discriminant cname
 c_vtable_type_name cname
 c_ev_type_name cname
-c_ev_global_name cname
+c_ev_current cname
 c_ev_param_name cname
 c_ev_field_name cname
 c_effect_default_op_name cname

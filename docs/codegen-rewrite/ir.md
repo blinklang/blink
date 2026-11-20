@@ -121,7 +121,7 @@ a value node; *stmt* any statement; *Block* the `Block` kind; *Const* the
 | `CallVirtual` | `ir_call_virtual(tid, span, c_spelling, slot, slot_form, receiver, args)` | `[receiver: value, arg_0 .. : value]` | the vtable slot name | caller |
 | `CallRuntime` | `ir_call_runtime(tid, span, c_spelling, symbol, slot_form, args)` | `[arg_0 .. : value]` | a `blink_*` runtime symbol | caller |
 | `ClosureNew` | `ir_closure_new(tid, span, c_spelling, fn_symbol, capture_descs, promoter, captures)` | `[capture_0 .. : value]` | the lifted function's C symbol; the descriptor table and promoter are two more slots, empty when absent | `InlineWord` |
-| `EvidenceVector` | `ir_evidence_vector(span, c_spelling, c_name, slot_form)` | none | `__ev` (PointerBoxed param) or `__blink_ev` (Inline global) | caller |
+| `EvidenceVector` | `ir_evidence_vector(span, c_spelling, c_name, slot_form)` | none | `__ev` (PointerBoxed param) or `(*__blink_ev_cur)` (Inline: the running task's vector) | caller |
 | `EvidenceAddress` | `ir_evidence_address(span, vector)` | `[vector: EvidenceVector held inline]` | empty; the vector owns the name | `InlineWord` |
 | `PromoteCtx` | `ir_promote_ctx(span, target)` or `ir_promote_ctx_param(span, c_name)` | `[target: ArenaTarget]` for a boundary, none for a walker's parameter | empty at a boundary; the parameter name in a walker | `InlineWord` |
 | `EffectPerform` | `ir_effect_perform(tid, span, c_spelling, slot, slot_form, slot_read, args)` | `[slot_read: FieldGet over an EvidenceVector, held by pointer; arg_0 .. : value]` | the handler vtable slot | caller |
@@ -134,8 +134,8 @@ writes it as `<extend_symbol>(<tmp>, <source>)` in place of the append for that
 kid; a `ContainerSpread` reached anywhere else is a misplaced-kind ICE.
 
 `EvidenceAddress` is what a call to an effectful function passes for the vector
-parameter when the caller holds the global instance inline rather than a vector
-parameter of its own. The printer writes it as `(&__blink_ev)`.
+parameter when the caller reads the running task's vector inline rather than a
+vector parameter of its own. The printer writes it as `(&(*__blink_ev_cur))`.
 
 It is a kind of its own rather than a `Unary` `&` over an `EvidenceVector`. The
 vector has no Blink type, and nor has its address, so a `Unary` holding it would

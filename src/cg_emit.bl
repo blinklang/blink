@@ -256,10 +256,12 @@ pub fn closure_thunk_params(params: List[Str]) -> List[Str] {
 // A spawned closure's task wrapper is the one function the pool thread calls: it unpacks
 // the pair the submit site allocated, calls the closure through its own fn_ptr the way an
 // inline call would, and stashes the answer in the handle. Every wrapper shares one pair
-// shape -- two pointers, neither depending on the closure's own return type -- so one
-// typedef serves every spawn site in the unit, printed once and reused.
+// shape -- two pointers and the spawn site's vector, none depending on the closure's own
+// return type -- so one typedef serves every spawn site in the unit, printed once and reused.
+// The task does its effect ops with the handlers at its spawn site, so the pair carries a
+// copy of the vector there, and the task's own `with`s write that copy.
 pub fn em_spawn_pair_typedef(pair_spelling: Str) {
-    em_line("typedef struct \{ const blink_closure* closure; blink_handle* handle; } {pair_spelling};")
+    em_line("typedef struct \{ const blink_closure* closure; blink_handle* handle; blink_ev ev; } {pair_spelling};")
 }
 
 // `boxed` and `slot_word` are the same two facts Position.ContainerSlot answers for a
@@ -277,11 +279,19 @@ pub fn em_spawn_pair_typedef(pair_spelling: Str) {
 pub fn em_spawn_task_wrapper(pair_spelling: Str, ret_spelling: Str, task_symbol: Str, is_void: Bool, boxed: Bool, slot_word: Str) {
     em_open_brace("static void {task_symbol}(void* __arg)")
     em_line("{pair_spelling}* __p = ({pair_spelling}*)__arg;")
+    // The pool thread may run another task after this one, so it gets back the vector it had.
+    // A panic cannot skip the restore: on a pool thread it is caught inside the closure or it
+    // ends the process.
+    let cur = em_ev_cur_name()
+    em_line("blink_ev* __ev_saved = {cur};")
+    em_line("{cur} = &__p->ev;")
     if is_void {
         em_line("(({ret_spelling}(*)(const blink_closure*))__p->closure->fn_ptr)(__p->closure);")
+        em_line("{cur} = __ev_saved;")
         em_line("blink_handle_set_result(__p->handle, (void*)0);")
     } else {
         em_line("{ret_spelling} __r = (({ret_spelling}(*)(const blink_closure*))__p->closure->fn_ptr)(__p->closure);")
+        em_line("{cur} = __ev_saved;")
         if boxed {
             em_line("{ret_spelling}* __box = ({ret_spelling}*)blink_alloc(sizeof({ret_spelling}));")
             em_line("*__box = __r;")
@@ -444,11 +454,11 @@ pub fn em_ev_typedef_body(vtables: List[Str], fields: List[Str]) {
 // A TU that only refers to the vector declares it extern and defines no default.
 pub fn em_ev_default_fn(vtables: List[Str], fields: List[Str], ev_storage: Str) {
     if ev_storage == "extern " {
-        em_line("extern blink_ev __blink_ev;")
+        em_ev_storage(ev_storage)
         return
     }
     em_ev_default_def("BLINK_UNUSED static ", vtables, fields)
-    em_line("{ev_storage}blink_ev __blink_ev;")
+    em_ev_storage(ev_storage)
 }
 
 // The archive layered over the stdlib archive defines the one default every program that
@@ -456,12 +466,26 @@ pub fn em_ev_default_fn(vtables: List[Str], fields: List[Str], ev_storage: Str) 
 // bodies were compiled with. The program still owns the vector itself.
 pub fn em_ev_default_external(vtables: List[Str], fields: List[Str]) {
     em_ev_default_def("", vtables, fields)
-    em_line("extern blink_ev __blink_ev;")
+    em_ev_storage("extern ")
 }
 
 pub fn em_ev_default_decl() { em_line("blink_ev blink_ev_default(void);") }
 
-pub fn em_ev_storage(ev_storage: Str) { em_line("{ev_storage}blink_ev __blink_ev;") }
+// The thread-local pointer to the running task's vector, as the printer spells it. cname's
+// c_ev_current reads through the same pointer.
+pub fn em_ev_cur_name() -> Str { "__blink_ev_cur" }
+
+// Boehm does not promise to scan thread-local storage, so each vector lives in memory it
+// scans (main's global, a task's spawn pair) and only the pointer to it is thread-local. A
+// new thread's pointer starts at main's vector.
+pub fn em_ev_storage(ev_storage: Str) {
+    em_line("{ev_storage}blink_ev __blink_ev;")
+    if ev_storage == "extern " {
+        em_line("extern __thread blink_ev* {em_ev_cur_name()};")
+    } else {
+        em_line("{ev_storage}__thread blink_ev* {em_ev_cur_name()} = &__blink_ev;")
+    }
+}
 
 fn em_ev_default_def(storage: Str, vtables: List[Str], fields: List[Str]) {
     em_open_brace("{storage}blink_ev blink_ev_default(void)")
@@ -514,7 +538,7 @@ pub fn rs_cleanup_name(exit_symbol: Str) -> Str { "__blink_rs_cleanup_{exit_symb
 
 // The runner has the `void (*)(void*, int)` shape the runtime's cleanup stack calls; the
 // attribute cleanup pops the stack entry the scope pushed and runs it with the recorded ok.
-// An exit that takes the effect vector gets the program's one vector, read when the runner
+// An exit that takes the effect vector gets the running task's vector, read when the runner
 // runs: each handler installed inside the with, the item's own Context handler too, has
 // restored its slot by then, on the attribute cleanup and on the cleanup stack alike, so
 // exit sees the handlers around the with.
@@ -528,7 +552,7 @@ pub fn em_resource_guard_support(exit_symbol: Str, resource_spelling: Str, passe
     em_line("if (st->done) \{ return; }")
     em_line("st->done = 1;")
     let ok_arg = if passes_ok { ", ok" } else { "" }
-    let ev_arg = if passes_ev { ", (&__blink_ev)" } else { "" }
+    let ev_arg = if passes_ev { ", {em_ev_cur_name()}" } else { "" }
     em_line("{exit_symbol}(st->resource{ok_arg}{ev_arg});")
     em_close_brace("")
     em_open_brace("static void {rs_cleanup_name(exit_symbol)}({st}* st)")
