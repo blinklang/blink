@@ -47,6 +47,61 @@ fn c_cos(x: Float) -> Float ! ()
 
 Prefer the two-argument form. It names the library that supplies the symbol, so a reader and `blink audit` can see where the symbol comes from. The one-argument form does not make a third-party symbol legal: a symbol that is not in `c` or `m` must use the two-argument form with a declared library. The one-argument form binds only `c` and `m` symbols. It does not bind a `blink_*` runtime symbol. No `@ffi` form binds one (*A `blink_` Symbol Belongs to the Runtime*); `lib/std` binds those with `@runtime` (*`@runtime` — The Runtime Bridge*). Every `@ffi` declaration, in either form, follows the rules of *Signature Types*.
 
+**What `header:` does.** `header:` puts the named C header into the C unit that the compiler writes. The unit reads each header after the runtime prologue, in a fixed order, with one `#include` for each distinct header. The prototype test (below) reads the same includes and the same feature macros as the unit.
+
+The rule for the C call is per symbol, not per binding:
+
+- If any header that the unit reads declares the symbol, the call goes through the prototype of that header, and C converts the arguments. This holds whether or not the binding names that header.
+- If no header that the unit reads declares the symbol, the signature of the declaration is the C prototype of the call.
+
+The Blink signature always governs the Blink side. It is the claim of the author about C, and the prototype test checks it (E0861). The test does not check a scalar width: `blink audit` marks those (§9.1, *`blink audit` — FFI Inventory*).
+
+Name `header:` when that header declares the symbol. Then the C compiler, not the author, gives the prototype and the link name. Two cases show why:
+
+```blink
+@ffi("cos", header: "math.h")
+@trusted(audit: "LIBM-COS")
+fn c_cos(x: Float) -> Float ! ()               // the call goes through `double cos(double)` of math.h
+
+@ffi("sqrtf", header: "math.h")
+@trusted(audit: "LIBM-SQRTF")
+fn c_sqrtf(x: Float) -> Float ! ()             // math.h gives `float sqrtf(float)`: C converts `x` and the result
+
+@ffi("readlink", header: "unistd.h")
+@trusted(audit: "UNISTD-READLINK")
+fn c_readlink(path: Ptr[U8], buf: Ptr[U8], n: Int) -> Int ! ()   // `n` becomes `size_t`, the result `ssize_t`
+
+@ffi("vendor_frob", "vendorlib")
+@trusted(audit: "VENDOR-FROB")
+fn c_frob(x: I32) -> I32 ! ()                  // no header declares `vendor_frob`: this signature is the C prototype
+```
+
+On macOS a header can give the call a link name that a bare declaration would not use. `stdlib.h` declares `realpath` so that the call binds `_realpath$DARWIN_EXTSN`, and `fts.h` declares `fts_open` and its family so that they bind the `$INODE64` names. A binding that names the header gets the right symbol. The prototype of the header wins:
+
+```blink
+@ffi("realpath", header: "stdlib.h")
+@trusted(audit: "STDLIB-REALPATH")
+fn c_realpath(path: Ptr[U8], out: Ptr[U8]) -> Ptr[U8] ! ()   // on macOS: binds `_realpath$DARWIN_EXTSN`
+```
+
+**Feature macros.** The unit and the prototype test define the same, fixed set of feature macros before they read any header, so a header shows the same prototypes in both. The set depends on the libc of the target and not on the host:
+
+| libc of the target | Macros |
+|--------------------|--------|
+| glibc | `_DEFAULT_SOURCE`, `_GNU_SOURCE` |
+| macOS | `_DARWIN_C_SOURCE` |
+
+`_GNU_SOURCE` changes some prototypes. The GNU `strerror_r` returns `char *`, where the XSI form returns `int`. With the set above, glibc gives the GNU form, and the prototype test checks a declaration against it:
+
+```blink
+@ffi("strerror_r", header: "string.h")
+@trusted(audit: "STRING-STRERROR-R")
+fn c_strerror_r(e: I32, buf: Ptr[U8], n: Int) -> I32 ! ()
+// blink build on glibc: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `strerror_r` returns `char *` for this build; this declaration returns an integer
+// fix: declare the result `Ptr[U8]`
+```
+
 **The header test.** `blink check` does not look at the C headers. `blink build` and `blink test` do. Before the unit compile, each of them tests every header that an `@ffi` declaration names. The test uses the same C compiler, target, include paths and vendored native directories as the unit compile, so it gives no error for a program that builds. It reads only pass or fail, and it does not read the text of the C compiler. A header that the test cannot find is `ForeignHeaderNotFound` (E0859) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3).
 
 ```blink
@@ -108,11 +163,41 @@ fn c_pipe(fds: Ptr[SockIn]) -> I32 ! () {}
 //   `pipe` takes `int *`; this declaration passes `struct sockaddr_in *`
 ```
 
+**What the prototype test covers.** The test compiles every `@ffi` wrapper that the unit compiles, with the includes of the unit. A binding with no `header:` is in the test. If another header that the unit reads declares its symbol, the call goes through that prototype (*What `header:` does*), and a wrong claim is `ForeignPrototypeMismatch` (E0861) at the `@ffi` line, exit `1`. It is never I0017. The note names the header that declares the symbol:
+
+```blink
+@ffi("getpid", header: "unistd.h")
+@trusted(audit: "UNISTD-GETPID")
+fn c_getpid() -> I32 ! ()
+
+@ffi("pipe")
+@trusted(audit: "UNISTD-PIPE")
+fn c_pipe(fds: Ptr[SockIn]) -> I32 ! ()
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `pipe` takes `int *`; this declaration passes `struct sockaddr_in *`
+//   note: `unistd.h` declares `pipe`; this unit reads it because another declaration names it
+```
+
+A binding names a header, the header is found, but it does not declare the symbol on this target. That is E0861 at the `@ffi` line, exit `1`, from `blink build` and `blink test` only. The message says that the header does not declare the symbol for this target. It does not say that the header or the symbol is missing, and it does not name a feature macro. The help gives one fix: remove `header:`. The call then uses the prototype of this declaration, unchecked. Blink has no conditional compilation (*`@ffi let`*), so no help offers a per-target binding:
+
+```blink
+@ffi("memfd_create", header: "sys/mman.h")
+@trusted(audit: "MMAN-MEMFD-CREATE")
+fn c_memfd_create(name: Ptr[U8], flags: U32) -> I32 ! ()
+// blink build on macOS: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `sys/mman.h` does not declare `memfd_create` for this target (aarch64-macos)
+//   help: remove `header:`; the call then uses this declaration's prototype, unchecked
+//   note: if the target does not have `memfd_create`, it is not available for this target,
+//         and the link step stops instead (E0857)
+```
+
+On Linux the same declaration passes, because the header declares `memfd_create` there.
+
 `blink build` and `blink test` run three C tests, in this order, before they compile the unit: the header test (E0859), the layout test of each `@ffi.struct` mirror (E0862, §9.1.3 *Static layout assertions*), and the prototype test (E0861). If the header is there, the layout test and the prototype test pass, but the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype that the test did not find can also cause it (§8.10.5). An example is a build with `tcc`.
 
 #### `@ffi` Binds a Module-Level Function
 
-`@ffi` on a function binds a C symbol to a function that is declared at the top level of a module. The symbol gets the C signature that the declaration gives (*Signature Types*). A function in an `impl` block or in a `trait` block is a method or an associated function of a type. Its first parameter can be a receiver, which has no C form, and the impl chooses its C name. So no such function is a target of `@ffi`, with or without a receiver. A type-scoped function `fn T.name(...)` (§2.12.3) is not a target either.
+`@ffi` on a function binds a C symbol to a function that is declared at the top level of a module. The Blink signature governs the Blink side of the call (*Signature Types*). The C side follows *What `header:` does*: the prototype of a header that the unit reads governs the call, and with no such header the signature of the declaration is the C prototype. A function in an `impl` block or in a `trait` block is a method or an associated function of a type. Its first parameter can be a receiver, which has no C form, and the impl chooses its C name. So no such function is a target of `@ffi`, with or without a receiver. A type-scoped function `fn T.name(...)` (§2.12.3) is not a target either.
 
 `@ffi` on a function in an `impl` or `trait` block, or on a type-scoped function, is `UnexpectedAnnotation` (E1110) at the `@ffi`, in `blink check`. The help says to declare a module-level `@ffi` function and to call it from the method. A wrapper with the same body costs nothing at run time after inlining.
 

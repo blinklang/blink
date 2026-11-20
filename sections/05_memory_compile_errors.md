@@ -744,7 +744,7 @@ A stop of `blink build` is outside the Blink source when the cause is in the hos
 |-------|----------------------------|------|
 | A header that an `@ffi` declaration names is not on the host | `ForeignHeaderNotFound` (E0859), at the `@ffi` line (§9.1) | `1` |
 | An `@ffi.struct` mirror does not match its C struct on the target (§9.1.3) | `ForeignStructMismatch` (E0862), at the `@ffi.struct` line | `1` |
-| The prototype of an `@ffi` declaration does not match the C call: a `Ptr` to a different named C type | `ForeignPrototypeMismatch` (E0861), at the `@ffi` line (§9.1) | `1` |
+| The prototype of an `@ffi` declaration does not match the C call: a `Ptr` to a different named C type, a binding with no `header:` against the prototype of another header of the unit, or a named header that does not declare the symbol for the target | `ForeignPrototypeMismatch` (E0861), at the `@ffi` line (§9.1) | `1` |
 | The C name of an `@ffi let` is not an integer constant on the target, or its value does not fit | `ForeignConstInvalid` (E0855), at the declaration | `1` |
 | The link step fails: a native library is missing or lacks a symbol | `LinkFailed` (E0857) | `1` |
 | A vendored native dependency does not compile | `NativeDependencyBuildFailed` (E0858) | `1` |
