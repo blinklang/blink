@@ -1728,6 +1728,8 @@ build/blink check src/main.bl --format json
 # blink build and blink run give the same diagnostics; I0017 and other I-codes exit 101, the others exit 1.
 # E0859 a header that an @ffi declaration names is not on the host: the build tests each header
 # before the unit compile, at the @ffi line, exit 1. blink check reads no header.
+# E0861 a call that an @ffi declaration gives does not compile against the prototype in its header:
+# the build tests each call after the header test, before the unit compile, at the @ffi line, exit 1.
 # I0018: a test build failed and printed no diagnostic. I0021 CompilerPanic: a panic in blink or blinkc (exit 101).
 build/blink test --json
 # Human output: dots, then BUILD FAILED <file> and its diagnostics, ABORTED <file> and how it

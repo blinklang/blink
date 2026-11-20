@@ -75,6 +75,8 @@ import escape.{ffi_scope_resource_name}
 import check_pipeline.{check_source, run_build_analyses, check_exit_code, check_status_line, build_passed_check}
 import fix_edits.{FixEdit, fix_plan, fix_apply, fix_byte_offset}
 import foreign_decl_probe
+import foreign_proto_probe.{ForeignPrototypes, foreign_prototypes_in, report_prototype_mismatch}
+import foreign_proto_probe
 import ffi_layout_probe.{LayoutMismatch, layout_probe_of, layout_mismatches, layout_mismatch_text}
 import cc_flags.{unit_cc_flags, generated_c_flags, cc_error_limit_flag}
 import foreign_const_probe.{ForeignConst, ForeignHeader, ProbeVerdict, SPELLING_PROBE_FILE, ffi_struct_mirrors_in, mirrors_named, spelling_ask, spelling_probe_of, foreign_const_header, foreign_consts_in, foreign_headers_in, own_ffi_note, report_header_not_found, is_runtime_lib, report_undeclared_lib, probe_of, probe_verdicts, report_verdicts, text_verdict, triple_of_machine}
@@ -737,6 +739,8 @@ type CompiledText {
     headers: List[ForeignHeader]
     // Every mirror the units can name, stdlib ones too, for the layout check.
     mirrors: List[ForeignHeader]
+    // The calls the prototype test checks against their headers.
+    prototypes: ForeignPrototypes
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
     entry: EntryMain
@@ -921,7 +925,8 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         trace_codegen: cli_trace.codegen, deterministic: cli_deterministic,
         emit_only_module: env.var("BLINK_ONLY_MODULE") ?? "", skip_modules: skip_modules,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
-        compiler_archive_modules: layer_modules, test_build: if test_build { 1 } else { 0 } }
+        compiler_archive_modules: layer_modules, test_build: if test_build { 1 } else { 0 },
+        unit_c_fault: unit_c_fault(source_path) }
     let c_output = generate(final_program, cfg)
 
     if diag_ice_count > 0 {
@@ -939,7 +944,8 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         }
     }
 
-    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), mirrors: ffi_struct_mirrors_in(final_program), ffi_note: own_ffi_note(final_program), entry: entry_main_of(final_program) })
+    let prototypes = prototypes_of(final_program, test_build)?
+    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), mirrors: ffi_struct_mirrors_in(final_program), prototypes: prototypes, ffi_note: own_ffi_note(final_program), entry: entry_main_of(final_program) })
 }
 
 // Whether the compiler archive's evidence vector has a slot for every effect `program`
@@ -1169,12 +1175,21 @@ fn words_after_first(words: List[Str]) -> List[Str] {
 }
 
 fn cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str ! IO, FS.Read, Env.Read {
+    cc_command_cached(args, debug_mode, release_mode, target, true)
+}
+
+// A probe's file has a new path each build, so ccache could only miss on it and keep the copy.
+fn probe_cc_command(args: Str, debug_mode: Int, release_mode: Int, target: Str) -> Str ! IO, FS.Read, Env.Read {
+    cc_command_cached(args, debug_mode, release_mode, target, false)
+}
+
+fn cc_command_cached(args: Str, debug_mode: Int, release_mode: Int, target: Str, cached: Bool) -> Str ! IO, FS.Read, Env.Read {
     let mut compiler = "cc"
     let mut pipe = "-pipe "
     if target != "" {
         compiler = "zig cc -target {target}"
         pipe = ""
-    } else if has_ccache() != 0 {
+    } else if cached && has_ccache() != 0 {
         compiler = "ccache cc"
     }
     let opt_flags = cc_opt_flags(debug_mode, release_mode).join(" ")
@@ -2261,6 +2276,46 @@ fn one_unit_struct_defines(c_path: Str, c_source: Str, target: Str, vendored: St
     flags
 }
 
+// The include flags of the one-unit compile, as its guard probe in do_link_target gets them.
+fn one_unit_tail(inc_flags: Str, compiler_archive: Str) -> Str ! IO, FS.Read, Env.Read {
+    let layer_inc = if compiler_archive != "" { " -I{compiler_archive}" } else { "" }
+    "{inc_flags}{layer_inc} -I{resolve_archive_dir()}"
+}
+
+// The prototype test (§9.1) for one target, after the header test and before any unit
+// compiles: each `@ffi` call that the prototype in its header refuses is an E0861, and the build
+// stops. `tail` is the include flags of the unit compile. The probes are in a private dir
+// beside the output; a dir that cannot be made gives no verdict, and the unit compile reports
+// what is wrong.
+// The prototype list is built after the emit and its diagnostic check, so an internal error
+// that it raises must stop the build here.
+fn prototypes_of(program: Int, test_build: Bool) -> Result[ForeignPrototypes, Int] ! IO, Diag.Report {
+    let ice_before = diag_ice_count
+    let prototypes = foreign_prototypes_in(program, test_build)
+    if diag_ice_count > ice_before {
+        diag_flush()
+        return Err(101)
+    }
+    Ok(prototypes)
+}
+
+fn check_foreign_prototypes(prototypes: ForeignPrototypes, target: Str, tail: Str, debug_mode: Int, release_mode: Int, output_path: Str) -> Int ! IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read, Diag.Report {
+    if prototypes.protos.is_empty() { return 0 }
+    let mut out_dir = path_dirname(output_path)
+    if out_dir == "" { out_dir = "." }
+    build_fs.reap_dead(out_dir, [".ptprobe"])
+    let dir = build_fs.private_dir(out_dir, ".ptprobe")
+    if dir == "" { return 0 }
+    let label = if target == "" { "host" } else { target }
+    let cc = probe_cc_command("-c {unit_cc_flags().join(" ")}", debug_mode, release_mode, target)
+    let refused = foreign_proto_probe.refused(prototypes, dir, cc, tail, cc_error_limit_flag(process_cc_id(target)), label)
+    let _ = build_fs.remove_tree(dir)
+    if refused.is_empty() { return 0 }
+    for p in refused { report_prototype_mismatch(p) }
+    diag_flush()
+    1
+}
+
 // The one report of a mirror that does not match its C struct (§9.1.3): one diagnostic at
 // each such `@ffi.struct`, then the build stops with the code this answers.
 fn report_ffi_struct_mismatches(mismatches: List[LayoutMismatch], target: Str) -> Int ! IO, Process.Spawn, Diag.Report {
@@ -2404,6 +2459,10 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
             }
             None => return 1
         }
+        let prc = check_foreign_prototypes(compiled.prototypes, target, one_unit_tail(inc_flags, compiler_archive), debug_mode, release_mode, output_path)
+        if prc != 0 {
+            return prc
+        }
         let lrc = do_link_target(output_path, c_path, c_source, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, compiler_archive, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
@@ -2425,6 +2484,20 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         Some(f) => f
         None => return 1
     }
+    // Every target passes the prototype test before the first one links (§9.1).
+    let mut target_incs: List[Str] = []
+    for alias in targets {
+        let triple = resolve_target_triple(alias)
+        let target_inc_flags = match one_unit_struct_defines(c_path, c_source, triple, inc_flags, compiler_archive, debug_mode, release_mode, output_path, compiled.mirrors) {
+            Ok(d) => "{inc_flags}{d}"
+            Err(rc) => return rc
+        }
+        let prc = check_foreign_prototypes(compiled.prototypes, triple, one_unit_tail(target_inc_flags, compiler_archive), debug_mode, release_mode, output_path)
+        if prc != 0 {
+            return prc
+        }
+        target_incs.push(target_inc_flags)
+    }
     if link && status_mode == BUILD_STATUS_JSON {
         io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
     }
@@ -2439,10 +2512,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let target_inc_flags = match one_unit_struct_defines(c_path, c_source, triple, inc_flags, compiler_archive, debug_mode, release_mode, output_path, compiled.mirrors) {
-            Ok(d) => "{inc_flags}{d}"
-            Err(rc) => return rc
-        }
+        let target_inc_flags = target_incs.get(i).unwrap()
         let lrc = do_link_target(out, c_path, c_source, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, compiler_archive, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
@@ -2663,8 +2733,18 @@ fn units_bail_on_diag() -> Int ! Diag.Report, IO {
     0
 }
 
+// Dev knob: BLINK_DEV_UNIT_C_FAULT=<source file> puts C that no C compiler accepts in the entry
+// unit of a build of that file, so a test reaches the generated-C failure path with source that
+// passes every check. The name matches whole path components, so main.bl does not name
+// domain.bl. Both build paths call this, and nothing else reads the variable.
+fn unit_c_fault(source_path: Str) -> Int ! Env.Read {
+    let named = env.var("BLINK_DEV_UNIT_C_FAULT") ?? ""
+    if named == "" { return 0 }
+    if source_path == named || source_path.ends_with("/{named}") { 1 } else { 0 }
+}
+
 // The std modules the archive holds are declared, not compiled, as in the one-unit build.
-fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig ! FS.Read, Env.Read {
+fn units_cg_config(debug_mode: Int, test_build: Bool, source_path: Str) -> CgConfig ! FS.Read, Env.Read {
     let mut skip: Map[Str, Int] = Map()
     for k in list_stdlib_module_keys() {
         skip.insert(k, 1)
@@ -2673,7 +2753,8 @@ fn units_cg_config(debug_mode: Int, test_build: Bool) -> CgConfig ! FS.Read, Env
         trace_codegen: cli_trace.codegen, deterministic: cli_deterministic,
         emit_only_module: "", skip_modules: skip,
         user_tu_mode: 1, blink_ev_extern_only: 0, archive_build_mode: 0, archive_over_std: 0,
-        compiler_archive_modules: Map(), test_build: if test_build { 1 } else { 0 } }
+        compiler_archive_modules: Map(), test_build: if test_build { 1 } else { 0 },
+        unit_c_fault: unit_c_fault(source_path) }
 }
 
 // The units of a per-module build in its units directory, and what its record needs.
@@ -2696,6 +2777,8 @@ type CompiledUnits {
     headers: List[ForeignHeader]
     // Every mirror the units can name, stdlib ones too, for the layout check.
     mirrors: List[ForeignHeader]
+    // The calls the prototype test checks against their headers.
+    prototypes: ForeignPrototypes
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
     entry: EntryMain
@@ -2735,7 +2818,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
         Err(rc) => return Err(rc)
     }
     let foreign = foreign_consts_in(program)
-    let cfg = units_cg_config(debug_mode, test_build)
+    let cfg = units_cg_config(debug_mode, test_build, source_path)
     let modules = enumerate_program_modules(program)
     let erc = units_bail_on_diag()
     if erc != 0 { return Err(erc) }
@@ -2757,7 +2840,8 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 }
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
-                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
+                let prototypes = prototypes_of(program, test_build)?
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), prototypes: prototypes, ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
             }
             None => {}
         }
@@ -2911,7 +2995,8 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let recordable = diag_entry_count() == entries_before && diag_ice_count == ice_before
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
+    let prototypes = prototypes_of(program, test_build)?
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), prototypes: prototypes, ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
@@ -3168,7 +3253,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.mirrors, compiled.ffi_note, compiled.entry, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.mirrors, compiled.prototypes, compiled.ffi_note, compiled.entry, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -3191,7 +3276,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], mirrors: List[ForeignHeader], ffi_note: Str, entry: EntryMain, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], mirrors: List[ForeignHeader], prototypes: ForeignPrototypes, ffi_note: Str, entry: EntryMain, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
@@ -3246,6 +3331,10 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
             }
             None => return 1
         }
+        let prc = check_foreign_prototypes(prototypes, target, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, output_path)
+        if prc != 0 {
+            return prc
+        }
         let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build, ffi_note, link)
         if lrc != 0 {
             return lrc
@@ -3266,6 +3355,20 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         Some(f) => f
         None => return 1
     }
+    // Every target passes the prototype test before the first one links (§9.1).
+    let mut target_incs: List[Str] = []
+    for alias in targets {
+        let triple = resolve_target_triple(alias)
+        let target_inc_flags = match ffi_struct_defines(types_file, types_text, "", triple, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, mirrors) {
+            Ok(d) => "{inc_flags}{d}"
+            Err(rc) => return rc
+        }
+        let prc = check_foreign_prototypes(prototypes, triple, "-I{resolve_archive_dir()} {target_inc_flags}", debug_mode, release_mode, output_path)
+        if prc != 0 {
+            return prc
+        }
+        target_incs.push(target_inc_flags)
+    }
     if link && status_mode == BUILD_STATUS_JSON {
         io.print_raw("\{\"status\":\"ok\",\"outputs\":[")
     }
@@ -3280,10 +3383,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
-        let target_inc_flags = match ffi_struct_defines(types_file, types_text, "", triple, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, mirrors) {
-            Ok(d) => "{inc_flags}{d}"
-            Err(rc) => return rc
-        }
+        let target_inc_flags = target_incs.get(i).unwrap()
         let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, ffi_note, link)
         if lrc != 0 {
             return lrc

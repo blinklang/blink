@@ -36,7 +36,7 @@ import cg_print.{
     print_effect_default_vtable, print_effect_vtable_typedef,
     print_ev, print_ev_with_external_default, print_ev_typedef, print_epilogue, print_fn, print_fn_decl, print_vtable_slot_fn, print_vtable_slot_fn_decl, print_foreign_decl, print_global_decl,
     print_global_init, print_prologue, print_prologue_declares, print_foreign_includes, print_ffi_layout_asserts, print_ffi_struct_spellings,
-    print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef,
+    print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef, print_swap_lines, print_take,
     print_typedef_blocks,
 }
 import cg_reg.{
@@ -993,6 +993,43 @@ pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
     emit_display_dispatch_def(fn_node, false)
 }
 
+// The C types of the call that the wrapper of an `@ffi` fn makes when a header declares its
+// symbol, for the prototype test (§9.1): one type for each argument, and the type that holds
+// the answer, or "" when the call answers nothing. It reads the same sides as the wrapper, so
+// the test checks the call that the unit compiles. None when this stage writes no such call,
+// which the wrapper reports. A type with no C spelling is I0001, as in the wrapper.
+pub type ForeignCallShape {
+    args: List[Str]
+    ret: Str
+}
+
+pub fn cg_decl_foreign_call_shape(fn_node: Int) -> Option[ForeignCallShape] ! Diag.Report {
+    let crossings = foreign_crossings(fn_node)
+    let sl = node_params(fn_node)
+    let n = crossings.len() - 1
+    let mut spellings: List[Str] = []
+    let mut sides: List[Str] = []
+    let mut i = 0
+    while i <= n {
+        let cross = crossings.get(i).unwrap()
+        if cross.decl == DECL_NODE_AMBIGUOUS { return None }
+        let side = foreign_c_side(cross, true)
+        if cross.decl >= 0 && cross.ptr_depth == 0 && side == "" { return None }
+        sides.push(side)
+        if i < n {
+            spellings.push(cg_decl_require_spelling(tid_of_node(sublist_get(sl, i)), Position.Param))
+        }
+        i = i + 1
+    }
+    let args = foreign_c_param_types(spellings, sides)
+    let back = sides.get(n) ?? ""
+    if back != "" { return Some(ForeignCallShape { args: args, ret: back }) }
+    let tid = fn_ret_tid(fn_node)
+    let k = tc_tid_kind(tc_resolve(tid))
+    if k == TyKind.Void || k == TyKind.Never { return Some(ForeignCallShape { args: args, ret: "" }) }
+    Some(ForeignCallShape { args: args, ret: cg_decl_require_spelling(tid, Position.Return) })
+}
+
 // Whether the wrapper written for an undeclared symbol, from `sides`, passes the same
 // arguments when a header declares it, so the build may drop its prototype. C then checks
 // each argument against the header's parameter type, and a pointer type that C does not
@@ -1379,6 +1416,22 @@ pub fn cg_decl_emit_prologue(user_tu: Bool, over_std: Bool, define_storage: Bool
         UnitLinkage.WholeUnit
     }
     print_prologue(user_tu || over_std, define_storage, test_build, header_guard, self_header, program_native_gates(), shims_decls_only)
+    emit_foreign_prologue()
+}
+
+// The prologue of a user unit up to its own declarations, as the prototype test (§9.1)
+// compiles against it: the native gates, the runtime header, each header a foreign type
+// names and the spelling of each mirror.
+pub fn cg_decl_probe_prologue(test_build: Bool) -> Str ! Diag.Report {
+    let held = print_swap_lines([])
+    print_prologue(true, false, test_build, "", "", program_native_gates(), true)
+    emit_foreign_prologue()
+    let text = print_take()
+    let _ = print_swap_lines(held)
+    text
+}
+
+fn emit_foreign_prologue() ! Diag.Report {
     let includes = program_foreign_includes()
     print_foreign_includes(includes.headers, includes.gates)
     let mut names: List[Str] = []

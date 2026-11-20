@@ -1,0 +1,353 @@
+// After the header test, `blink build` and `blink test` compile the C call of each `@ffi`
+// declaration against the prototype in its header. A declaration the C compiler refuses is
+// ForeignPrototypeMismatch (E0861) at the `@ffi` line, exit 1, and the unit compile does not
+// start. `blink check` does not run the test (section 9.1, the prototype test).
+
+import std.process.{ChildEnd, ChildLimits, ProcessResult}
+import std.time.{Duration}
+
+let SOCK_IN = "@ffi.struct(header: \"netinet/in.h\", name: \"sockaddr_in\")\ntype SockIn \{ sin_family: U16, sin_port: U16, sin_addr: U32, sin_zero: I64 \}\n\n"
+
+// No mirror of sockaddr_in6 passes the layout check: its address is a union. pollfd is a
+// second named struct with the same layout on every target.
+let POLLFD = "@ffi.struct(header: \"poll.h\", name: \"pollfd\")\ntype Pollfd \{ fd: I32, events: I16, revents: I16 \}\n\n"
+
+// Line 4 of each source below is the `@ffi` line of the declaration the header refuses.
+// poll names one struct. connect does not serve here: past _GNU_SOURCE, glibc gives its
+// address a transparent union that takes a pointer to each sockaddr struct.
+let POLL = "{SOCK_IN}@ffi(\"poll\", header: \"poll.h\")\n@trusted(audit: \"test\")\nfn c_poll(fds: Ptr[SockIn], n: U64, timeout: I32) -> I32 ! () \{\}\n\nfn main() \{\n    with ffi.scope() as scope \{\n        let a: Ptr[SockIn] = scope.alloc[SockIn]()\n        io.println(\"\{c_poll(a, 0, 0)\}\")\n    \}\n\}\n"
+
+let PIPE = "{SOCK_IN}@ffi(\"pipe\", header: \"unistd.h\")\n@trusted(audit: \"test\")\nfn c_pipe(fds: Ptr[SockIn]) -> I32 ! () \{\}\n\nfn main() \{\n    with ffi.scope() as scope \{\n        let a: Ptr[SockIn] = scope.alloc[SockIn]()\n        io.println(\"\{c_pipe(a)\}\")\n    \}\n\}\n"
+
+// abs takes one argument in stdlib.h, and this declaration gives it none. Its `@ffi` line is
+// line 1.
+let NO_ARGS_ABS = "@ffi(\"abs\", header: \"stdlib.h\")\n@trusted(audit: \"test\")\nfn no_args_abs() -> Int ! ()\n\nfn main() \{\n    io.println(\"\{no_args_abs()\}\")\n\}\n"
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// A fresh project whose src/main.bl is `source`.
+fn project(source: Str) -> Str ! FS.Write, Process.Spawn {
+    let dir = sh("mktemp -d /tmp/blink_prototype_test.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/tests")
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n").unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/src/main.bl", source).unwrap()
+    dir
+}
+
+// Runs `$B <cmd>` in dir. The corpus exports module filters that make each build one unit,
+// so the run drops them: --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd}")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+// What is wrong with how a build stopped on a refused prototype at `line`, or "".
+fn prototype_stop_error(r: ProcessResult, what: Str, line: Int) -> Str {
+    if r.end != ChildEnd.Exited(1) { return "{what}: ended with {r.end}, not 1\n{diag(r)}" }
+    if !r.err_out.contains("error[ForeignPrototypeMismatch]") { return "{what}: no E0861\n{diag(r)}" }
+    if !r.err_out.contains("src/main.bl:{line}:") { return "{what}: the span is not the @ffi line {line}\n{diag(r)}" }
+    if r.err_out.contains("GeneratedCDidNotCompile") { return "{what}: the unit compile ran\n{diag(r)}" }
+    ""
+}
+
+fn assert_stops_every_build_path(source: Str, label: Str, line: Int) ! FS.Write, Process.Spawn {
+    let dir = project(source)
+    let pm = blink_in(dir, "build --per-module src/main.bl")
+    let one = blink_in(dir, "build --no-per-module src/main.bl")
+    let run = blink_in(dir, "run src/main.bl")
+    let built = sh("test -e {dir}/build/main && echo yes").out.trim()
+    let _ = sh("rm -rf {dir}")
+    assert_eq(prototype_stop_error(pm, "{label} build --per-module", line), "")
+    assert_eq(prototype_stop_error(one, "{label} build --no-per-module", line), "")
+    assert_eq(prototype_stop_error(run, "{label} run", line), "")
+    assert_eq(built, "")
+}
+
+test "a Ptr to a mirror of a different struct than the header names stops the build with E0861" {
+    assert_stops_every_build_path(POLL, "poll", 4)
+}
+
+test "a Ptr to a mirror where the header takes a scalar pointer stops the build with E0861" {
+    assert_stops_every_build_path(PIPE, "pipe", 4)
+}
+
+test "a call with the wrong number of arguments for the header's prototype stops the build with E0861" {
+    assert_stops_every_build_path(NO_ARGS_ABS, "abs", 1)
+}
+
+// glibc's feature macros give the GNU strerror_r, which returns `char *`, so a declaration
+// with the XSI `int` return is refused there.
+test "an int return for the GNU strerror_r stops the build with E0861 on glibc" {
+    if !sh("cc -dumpmachine").out.trim().ends_with("-gnu") { return }
+    let src = "@ffi(\"strerror_r\", header: \"string.h\")\n@trusted(audit: \"test\")\nfn c_strerror_r(code: I32, buf: Ptr[U8], len: Int) -> I32 ! ()\n\nfn main() \{\n    with ffi.scope() as scope \{\n        let buf = scope.alloc_n[U8](256)\n        io.println(\"\{c_strerror_r(2, buf, 256)\}\")\n    \}\n\}\n"
+    assert_stops_every_build_path(src, "strerror_r", 1)
+}
+
+test "blink check does not run the prototype test" {
+    for (label, source) in [("poll", POLL), ("pipe", PIPE)] {
+        let dir = project(source)
+        let r = blink_in(dir, "check src/main.bl")
+        let _ = sh("rm -rf {dir}")
+        assert_eq(r.end, ChildEnd.Exited(0), "{label}: {diag(r)}")
+    }
+}
+
+test "a Ptr[Void] parameter takes a Ptr to any struct mirror and the build passes" {
+    let source = "{SOCK_IN}{POLLFD}@ffi(\"connect\", header: \"sys/socket.h\")\n@trusted(audit: \"test\")\nfn c_connect(fd: I32, addr: Ptr[Void], len: U32) -> I32 ! () \{\}\n\nfn main() \{\n    with ffi.scope() as scope \{\n        let a4: Ptr[SockIn] = scope.alloc[SockIn]()\n        let p: Ptr[Pollfd] = scope.alloc[Pollfd]()\n        io.println(\"\{c_connect(-1, a4, 16)\} \{c_connect(-1, p, 8)\}\")\n    \}\n\}\n"
+    let dir = project(source)
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    for (label, r) in [("--per-module", pm), ("--no-per-module", one)] {
+        assert_eq(r.end, ChildEnd.Exited(0), "{label}: {diag(r)}")
+        assert_eq(r.out.trim(), "-1 -1", "{label}: {diag(r)}")
+    }
+}
+
+// A scalar pointee erases to `void *`, so the test cannot see its width: these build.
+test "a scalar pointee and a pointer to a pointer pass the prototype test" {
+    let source = "@ffi(\"time\", header: \"time.h\")\n@trusted(audit: \"test\")\nfn c_time(t: Ptr[Int]) -> Int ! () \{\}\n\n@ffi(\"strtol\", header: \"stdlib.h\")\n@trusted(audit: \"test\")\nfn c_strtol(s: Ptr[U8], end: Ptr[Ptr[U8]], base: I32) -> Int ! () \{\}\n\nfn main() \{\n    with ffi.scope() as scope \{\n        let t: Ptr[Int] = scope.alloc[Int]()\n        let e: Ptr[Ptr[U8]] = scope.alloc[Ptr[U8]]()\n        io.println(\"\{c_time(t) > 0\} \{c_strtol(scope.alloc[U8](), e, 10)\}\")\n    \}\n\}\n"
+    let dir = project(source)
+    let r = blink_in(dir, "run src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(0), diag(r))
+    assert_eq(r.out.trim(), "true 0", diag(r))
+}
+
+// The batched probe fails, so the test splits it and reports only the declaration it refuses.
+test "of two declarations only the one the header refuses gets E0861" {
+    let good = "\n@ffi(\"abs\", header: \"stdlib.h\")\n@trusted(audit: \"test\")\nfn c_abs(x: I32) -> I32 ! () \{\}\n"
+    let dir = project("{POLL}{good}")
+    let r = blink_in(dir, "build src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(prototype_stop_error(r, "two declarations", 4), "")
+    assert_eq(r.err_out.split("error[ForeignPrototypeMismatch]").len(), 2, diag(r))
+}
+
+// The second build can take its units from the first one's emit; it must still run the test.
+test "a second build of a refused declaration stops with E0861 again" {
+    let dir = project(POLL)
+    let first = blink_in(dir, "build src/main.bl")
+    let second = blink_in(dir, "build src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(prototype_stop_error(first, "first build", 4), "")
+    assert_eq(prototype_stop_error(second, "second build", 4), "")
+}
+
+// A second build tests the fixed declaration, not the one the first build refused.
+test "a build after the declaration is fixed passes" {
+    let dir = project(POLL)
+    let bad = blink_in(dir, "build src/main.bl")
+    fs.write("{dir}/src/main.bl", POLL.replace("fds: Ptr[SockIn], n", "fds: Ptr[Void], n")).unwrap()
+    let fixed = blink_in(dir, "run src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(prototype_stop_error(bad, "before the fix", 4), "")
+    assert_eq(fixed.end, ChildEnd.Exited(0), diag(fixed))
+    assert_eq(fixed.out.trim(), "0", diag(fixed))
+}
+
+test "under json the stop is one E0861 row" {
+    let dir = project(POLL)
+    let r = blink_in(dir, "build --json src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    assert(r.err_out.contains("\"code\":\"E0861\""), diag(r))
+    assert(r.err_out.contains("\"name\":\"ForeignPrototypeMismatch\""), diag(r))
+    assert(!r.err_out.contains("I0017"), diag(r))
+}
+
+test "blink test gives the file the one E0861 diagnostic" {
+    let dir = project("fn main() \{\}\n")
+    let src = POLL.replace("fn main() \{\n    with ffi.scope() as scope \{\n        let a: Ptr[SockIn] = scope.alloc[SockIn]()\n        io.println(\"\{c_poll(a, 0, 0)\}\")\n    \}\n\}\n", "test \"calls it\" \{\n    with ffi.scope() as scope \{\n        assert(c_poll(scope.alloc[SockIn](), 0, 0) == 0)\n    \}\n\}\n")
+    fs.write("{dir}/tests/test_main.bl", src).unwrap()
+    let r = blink_in(dir, "test --json tests")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(r.end, ChildEnd.Exited(1), diag(r))
+    let mut line = ""
+    for l in r.out.split("\n") {
+        if l.contains("\"record\":\"file\"") { line = l }
+    }
+    assert(line.contains("\"outcome\":\"build_failed\""), diag(r))
+    assert(line.contains("\"code\":\"E0861\""), diag(r))
+    assert(!line.contains("I0017"), diag(r))
+}
+
+// A vendored native dependency `ops` in `{dir}/vendor`, with the C source `c` and the headers
+// `headers`, each a (name, text) pair.
+fn vendor(dir: Str, c: Str, headers: List[(Str, Str)]) ! FS.Write, Process.Spawn {
+    let _ = sh("mkdir -p {dir}/vendor")
+    let mut names: List[Str] = []
+    for (name, text) in headers {
+        fs.write("{dir}/vendor/{name}", text).unwrap()
+        names.push("\"{name}\"")
+    }
+    fs.write("{dir}/vendor/ops.c", c).unwrap()
+    fs.write("{dir}/blink.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nops = \{ type = \"vendored\", path = \"vendor/ops.c\", headers = [{names.join(", ")}] \}\n").unwrap()
+}
+
+fn assert_runs_on_both_paths(dir: Str, want: Str) ! Process.Spawn {
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    for (label, r) in [("--per-module", pm), ("--no-per-module", one)] {
+        assert_eq(r.end, ChildEnd.Exited(0), "{label}: {diag(r)}")
+        assert_eq(r.out.trim(), want, "{label}: {diag(r)}")
+    }
+}
+
+// A foreign constant is not a call, so the test has nothing of it to compile.
+test "a foreign constant beside an @ffi function passes the prototype test" {
+    let dir = project(#"
+@ffi("EINVAL", header: "errno.h")
+let EINVAL_C: Int
+
+@ffi("abs", header: "stdlib.h")
+@trusted(audit: "test")
+fn c_abs(x: I32) -> I32 ! ()
+
+fn main() {
+    io.println("{EINVAL_C > 0} {c_abs(-3)}")
+}
+"#)
+    assert_runs_on_both_paths(dir, "true 3")
+}
+
+// The probe's own names must not hide the symbol it calls or the type of an argument.
+test "a C function named like a local of the probe passes the prototype test" {
+    let dir = project(#"
+@ffi("ops", "r", header: "ops.h")
+@trusted(audit: "test")
+fn c_r(x: I32) -> I32 ! ()
+
+@ffi("ops", "a0", header: "ops.h")
+@trusted(audit: "test")
+fn c_a0(x: I32) -> I32 ! ()
+
+fn main() {
+    io.println("{c_r(1)} {c_a0(2)}")
+}
+"#)
+    vendor(dir, "int r(int x) \{ return x + 10; }\nint a0(int x) \{ return x + 20; }\n", [("ops.h", "int r(int x);\nint a0(int x);\n")])
+    assert_runs_on_both_paths(dir, "11 22")
+}
+
+// The unit reads the header of each foreign type, so the probe must read it too, or the call
+// that names the type does not compile and the test gives no verdict.
+test "a declaration beside an opaque type from another header gets E0861" {
+    let source = "@ffi(\"abs\", header: \"stdlib.h\")\n@trusted(audit: \"test\")\nfn no_args_abs() -> Int ! ()\n\n@ffi.opaque(name: \"regex_t\", header: \"regex.h\")\ntype Re\n\n@ffi(\"free\", header: \"stdlib.h\")\n@trusted(audit: \"test\")\nfn c_free(p: Re) ! ()\n\nfn main() \{\n    io.println(\"\{no_args_abs()\}\")\n\}\n"
+    assert_stops_every_build_path(source, "abs beside regex_t", 1)
+}
+
+// Two headers that cannot be read in one C file: each declaration is tested with its own.
+// The unit does not yet include a binding's `header:`, so it reads these two apart. Once it
+// includes them, they stop the unit compile, and this row expects I0017 in place of E0861.
+test "a declaration whose header clashes with another declaration's header gets E0861" {
+    let dir = project(#"
+@ffi("ops", "ops_a", header: "a.h")
+@trusted(audit: "test")
+fn c_a(x: I32) -> I32 ! ()
+
+@ffi("ops", "ops_b", header: "b.h")
+@trusted(audit: "test")
+fn c_b() -> I32 ! ()
+
+fn main() {
+    io.println("{c_a(1)} {c_b()}")
+}
+"#)
+    vendor(dir, "int ops_a(int x) \{ return x; }\nint ops_b(int x) \{ return x; }\n", [("a.h", "struct ops_s \{ int x; };\nint ops_a(int x);\n"), ("b.h", "struct ops_s \{ long y; };\nint ops_b(int x);\n")])
+    let pm = blink_in(dir, "build --per-module src/main.bl")
+    let one = blink_in(dir, "build --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    for (label, r) in [("--per-module", pm), ("--no-per-module", one)] {
+        assert_eq(prototype_stop_error(r, "clashing headers {label}", 6), "")
+        assert_eq(r.err_out.split("error[ForeignPrototypeMismatch]").len(), 2, diag(r))
+    }
+}
+
+// The test runs for every target before the first link, as the header test does: a call the
+// second target refuses leaves no binary for the first.
+test "a declaration that only the second target refuses stops the build before any link" {
+    let dir = project(#"
+@ffi("ops", "ops_f", header: "ops.h")
+@trusted(audit: "test")
+fn c_f(x: I32) -> I32 ! ()
+
+fn main() {
+    io.println("{c_f(1)}")
+}
+"#)
+    vendor(dir, "int ops_f(int x) \{ return x; }\n", [("ops.h", "#ifdef __GLIBC__\nint ops_f(int x);\n#else\nint ops_f(int x, int y);\n#endif\n")])
+    let mut fails: List[Str] = []
+    for path in ["--per-module", "--no-per-module"] {
+        let _ = sh("rm -rf {dir}/build")
+        let r = blink_in(dir, "build {path} --target x86_64-linux-gnu --target x86_64-linux-musl src/main.bl")
+        let built = sh("ls {dir}/build").out.trim()
+        let why = prototype_stop_error(r, path, 2)
+        if why != "" { fails.push(why) }
+        if built.contains("main-") { fails.push("{path}: a target linked before the test of the next: {built}") }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(fails.join("\n"), "")
+}
+
+// Runs `$B <cmd>` in dir with `{dir}/cc/cc`, made from `cases` (sh case arms on one argument
+// of the cc run), first on PATH.
+fn blink_with_cc(dir: Str, cases: Str, cmd: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    let real_cc = sh("command -v cc").out.trim()
+    let _ = sh("mkdir -p {dir}/cc")
+    fs.write("{dir}/cc/cc", "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in {cases} esac; done\nexec {real_cc} \"$@\"\n").unwrap()
+    let _ = sh("chmod +x {dir}/cc/cc")
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE CCACHE_DISABLE=1 PATH={dir}/cc:$PATH BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd}")
+}
+
+// A cc that answers the struct probe with no error gives the mirror no -D, so the call spells
+// `struct div_t`, which stdlib.h does not have. The test compiles the call as the unit does.
+test "a by-value mirror that the unit spells wrong stops the build with E0861" {
+    let dir = project(#"@ffi.struct(header: "stdlib.h", name: "div_t")
+type DivT { quot: I32, rem: I32 }
+
+@ffi("div", header: "stdlib.h")
+@trusted(audit: "test")
+fn c_div(a: I32, b: I32) -> DivT ! ()
+
+fn main() {
+    let d = c_div(7, 2)
+    io.println("{d.quot} {d.rem}")
+}
+"#)
+    let mut fails: List[Str] = []
+    for path in ["--per-module", "--no-per-module"] {
+        let r = blink_with_cc(dir, "*ffi_struct_probe.c) exit 0;;", "build {path} src/main.bl")
+        let why = prototype_stop_error(r, path, 4)
+        if why != "" { fails.push(why) }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(fails.join("\n"), "")
+}
+
+// A signal that ends the C compiler is no verdict on the call: the build goes on to the unit
+// compile and passes.
+test "a prototype test cc that a signal ends gives no E0861" {
+    let dir = project(#"@ffi("abs", header: "stdlib.h")
+@trusted(audit: "test")
+fn c_abs(x: I32) -> I32 ! ()
+
+fn main() {
+    io.println("{c_abs(-5)}")
+}
+"#)
+    let mut fails: List[Str] = []
+    for path in ["--per-module", "--no-per-module"] {
+        let r = blink_with_cc(dir, "*/.ptprobe.*) kill -9 $$;;", "run {path} src/main.bl")
+        if r.end != ChildEnd.Exited(0) || r.out.trim() != "5" { fails.push("{path}: {diag(r)}") }
+    }
+    let _ = sh("rm -rf {dir}")
+    assert_eq(fails.join("\n"), "")
+}

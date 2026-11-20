@@ -14,6 +14,8 @@
 import cg_emit.{DECLARED_GUARD_PREFIX}
 import cc_flags.{unit_cc_flags, cc_error_limit_flag, probe_unsafe_cflag}
 import cname.{c_ffi_struct_macro}
+import build_fs
+import std.process.{ProcessError, ProcessResult}
 import foreign_const_probe.{SpellingProbe, SPELLING_PROBE_FILE, is_cc_error_line, probe_failed_lines, spelling_ask, spelling_probe_of, typedef_names}
 
 // The file name the probe's own lines report under, after a `#line` directive.
@@ -94,8 +96,10 @@ pub fn guard_flags(declared: List[Str]) -> Str {
     out
 }
 
-// What one guard probe answered: the flags, and why it gave no verdict, or "" when it gave one.
+// What one guard probe answered: the symbols it found declared, their flags, and why it gave
+// no verdict, or "" when it gave one.
 pub type GuardRun {
+    declared: List[Str]
     flags: Str
     unanswered: Str
 }
@@ -133,8 +137,7 @@ pub fn guard_run(c_file: Str, c_text: Str, symbols: List[Str], cc: Str, tail: St
     if write_err == "" {
         // clang knows a library function such as cos with no header read, and that is not
         // a declaration the unit can call through. The probe reads English diagnostics.
-        let cmd = "LC_ALL=C {cc}{limit} -fno-builtin -x c {shell_word(probe)} -o {shell_word("{probe}.o")} {tail}"
-        match process.run("sh", ["-c", cmd]) {
+        match run_probe_cc("{cc}{limit}", "-fno-builtin -x c", probe, tail) {
             Ok(r) => {
                 code = match r.end {
                     ChildEnd.Exited(n) => n
@@ -152,7 +155,7 @@ pub fn guard_run(c_file: Str, c_text: Str, symbols: List[Str], cc: Str, tail: St
     trace.log("blink.build.units", "declared {c_file} for {label} (probe exit {code}):{flags}")
     // A failed compile of the probe declares at least one symbol unless an error outside the
     // symbols' lines stopped it.
-    GuardRun { flags: flags, unanswered: unanswered(probe, write_err, code, err_out, code == 0 || !declared.is_empty()) }
+    GuardRun { declared: declared, flags: flags, unanswered: unanswered(probe, write_err, code, err_out, code == 0 || !declared.is_empty()) }
 }
 
 // What one spelling probe answered: the flags; when the compile failed as a probe with a
@@ -249,7 +252,20 @@ pub fn hand_cc_flags(c_file: Str, c_text: Str, cc_words: List[Str]) -> Result[St
     Ok("{guards.flags}{defines}")
 }
 
+// Runs `{cc} {flags} {probe} -o {probe}.o {tail}` under LC_ALL=C. When sh would only split
+// that line into words, env runs cc and no shell starts, so a signal that ends cc ends the run
+// as a signal and not as the exit code a shell would give in its place.
+pub fn run_probe_cc(cc: Str, flags: Str, probe: Str, tail: Str) -> Result[ProcessResult, ProcessError] ! Process.Spawn {
+    let words = build_fs.plain_words("{cc} {flags} {probe} -o {probe}.o {tail}")
+    if !words.is_empty() {
+        let mut args = ["LC_ALL=C"]
+        for w in words { args.push(w) }
+        return process.run("env", args)
+    }
+    process.run("sh", ["-c", "LC_ALL=C {cc} {flags} {shell_word(probe)} -o {shell_word("{probe}.o")} {tail}"])
+}
+
 // `w` as one shell word.
-fn shell_word(w: Str) -> Str {
+pub fn shell_word(w: Str) -> Str {
     "'{w.replace("'", "'\\''")}'"
 }

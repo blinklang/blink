@@ -12,16 +12,21 @@ import std.json.{json_clear, json_parse, json_get, json_as_str, json_len, json_a
 
 let PACKAGE = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n"
 
-// The C a build makes for this file calls abs, which stdlib.h declares with one argument, with
-// none, so no C compiler accepts it.
-let WRONG_ARITY = #"@ffi("c", "abs", header: "stdlib.h")
+// A file with its own correct `@ffi` declaration. A build run with FAULT_KNOB naming it gets
+// generated C that no C compiler accepts, though the source passes every check.
+let FAULTED = #"@ffi("c", "abs", header: "stdlib.h")
 @trusted(audit: "test")
-fn no_args_abs() -> Int ! ()
+fn c_abs(x: Int) -> Int ! ()
 
 test "calls it" {
-    assert(no_args_abs() == 1)
+    assert(c_abs(-1) == 1)
 }
 "#
+
+// The dev knob that puts the fault in the entry unit of a build of the file it names, and the
+// undeclared name the C compiler's error then quotes.
+let FAULT_KNOB = "BLINK_DEV_UNIT_C_FAULT"
+let FAULT_NAME = "blink_dev_unit_c_fault_undeclared"
 
 // mylib.h declares the function and mylib.c does not define it, so only the link fails.
 let UNDEFINED = #"@ffi("mylib", "mylib_missing", header: "mylib.h")
@@ -87,6 +92,15 @@ fn blink_test(files: List[(Str, Str)], mylib_c: Str, args: Str) -> ProcessResult
     r
 }
 
+// Runs `blink test <args>` in a fresh project with FAULT_KNOB naming tests/<faulted>.bl, then
+// removes it.
+fn blink_test_faulted(files: List[(Str, Str)], faulted: Str, args: Str) -> ProcessResult ! FS.Write, Process.Spawn {
+    let dir = project(files, "")
+    let r = sh_in(dir, "BLINK_BIN=$B {FAULT_KNOB}=tests/{faulted}.bl", "$B test {args}")
+    let _ = sh("rm -rf {dir}")
+    r
+}
+
 // The file line of `file`, or "".
 fn file_line(out: Str, file: Str) -> Str {
     for line in out.split("\n") {
@@ -136,14 +150,14 @@ test "generated C that does not compile is one ice diagnostic, on both build pat
     for path in ["--per-module", "--no-per-module"] {
         // The file's name holds "error", which the C compiler's output repeats in lines that
         // are not errors: the message must still quote the error line.
-        let r = blink_test([("test_error_arity", WRONG_ARITY), ("test_good", GOOD)], "", "--json {path} tests")
+        let r = blink_test_faulted([("test_error_fault", FAULTED), ("test_good", GOOD)], "test_error_fault", "--json {path} tests")
         assert_eq(r.end, ChildEnd.Exited(1), diag(r))
-        assert_one_step_diagnostic(r, "test_error_arity", "ice", "GeneratedCDidNotCompile", "I0017", "compiling the generated C", "abs")
-        let line = file_line(r.out, "tests/test_error_arity.bl")
+        assert_one_step_diagnostic(r, "test_error_fault", "ice", "GeneratedCDidNotCompile", "I0017", "compiling the generated C", FAULT_NAME)
+        let line = file_line(r.out, "tests/test_error_fault.bl")
         json_clear()
         let message = json_as_str(json_get(json_at(json_get(json_parse(line), "diagnostics"), 0), "message"))
         assert(message.contains(": error: "), line)
-        assert(message.contains("abs"), line)
+        assert(message.contains(FAULT_NAME), line)
         assert(file_line(r.out, "tests/test_good.bl").contains("\"outcome\":\"ran\""), diag(r))
     }
 }
@@ -181,9 +195,9 @@ test "a long tool output is cut, and the last note says so" {
 }
 
 test "the human output prints the step diagnostic under BUILD FAILED" {
-    let r = blink_test([("test_arity", WRONG_ARITY)], "", "tests")
+    let r = blink_test_faulted([("test_fault", FAULTED)], "test_fault", "tests")
     assert_eq(r.end, ChildEnd.Exited(1), diag(r))
-    assert(r.out.contains("BUILD FAILED tests/test_arity.bl\n"), diag(r))
+    assert(r.out.contains("BUILD FAILED tests/test_fault.bl\n"), diag(r))
     assert(r.out.contains("internal compiler error[GeneratedCDidNotCompile]: compiling the generated C"), diag(r))
     assert(r.out.contains("  note: This is a compiler bug."), diag(r))
     assert(!r.out.contains("TestBuildEndedWithoutDiagnostic"), diag(r))
@@ -209,18 +223,18 @@ test "only a build that ends with no error diagnostic says it ended without one"
     assert(human.out.contains("internal compiler error[TestBuildEndedWithoutDiagnostic]: the test build ended with no diagnostic: something went wrong"), diag(human))
 }
 
-// A project whose src/main.bl calls the C of WRONG_ARITY.
-fn wrong_arity_project() -> Str ! FS.Write, Process.Spawn {
+// A project whose src/main.bl has its own correct `@ffi` declaration; build it with FAULT_KNOB.
+fn faulted_project() -> Str ! FS.Write, Process.Spawn {
     let dir = sh("mktemp -d /tmp/blink_build_step.XXXXXX").out.trim()
     let _ = sh("mkdir -p {dir}/src")
     fs.write("{dir}/blink.toml", PACKAGE).unwrap()
     fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
     fs.write("{dir}/src/main.bl", #"@ffi("c", "abs", header: "stdlib.h")
 @trusted(audit: "test")
-fn no_args_abs() -> Int ! ()
+fn c_abs(x: Int) -> Int ! ()
 
 fn main() {
-    io.println("{no_args_abs()}")
+    io.println("{c_abs(-1)}")
 }
 "#).unwrap()
     dir
@@ -228,27 +242,27 @@ fn main() {
 
 let PASSES_CHECK = "this source passes `blink check`; the cause is a bug of the compiler"
 // The stdlib has its own @ffi declarations; the note names only those of the program.
-let OWN_FFI = "this program has its own `@ffi` declarations (no_args_abs); a wrong `@ffi` prototype can also cause this error"
+let OWN_FFI = "this program has its own `@ffi` declarations (c_abs); a wrong `@ffi` prototype that the prototype test does not find can also cause this error"
 
 test "blink build reports a C compile failure as the same internal error, on both build paths" {
-    let dir = wrong_arity_project()
-    let pm = sh_in(dir, "", "$B build --per-module src/main.bl")
-    let one = sh_in(dir, "", "$B build --no-per-module src/main.bl")
+    let dir = faulted_project()
+    let pm = sh_in(dir, "{FAULT_KNOB}=src/main.bl", "$B build --per-module src/main.bl")
+    let one = sh_in(dir, "{FAULT_KNOB}=src/main.bl", "$B build --no-per-module src/main.bl")
     let _ = sh("rm -rf {dir}")
     for r in [pm, one] {
         assert_eq(r.end, ChildEnd.Exited(101), diag(r))
         assert(r.err_out.contains("internal compiler error[GeneratedCDidNotCompile]: compiling the generated C"), diag(r))
         assert(r.err_out.contains("  note: {PASSES_CHECK}\n"), diag(r))
         assert(r.err_out.contains("  note: {OWN_FFI}\n"), diag(r))
-        assert(r.err_out.contains("abs"), diag(r))
+        assert(r.err_out.contains(FAULT_NAME), diag(r))
         assert(!"{r.out}{r.err_out}".contains("C compilation failed"), diag(r))
     }
     assert(pm.err_out.contains("compiling the generated C of unit "), diag(pm))
 }
 
 test "under json, blink build gives the C compile failure one row with the notes first" {
-    let dir = wrong_arity_project()
-    let r = sh_in(dir, "", "$B build --json src/main.bl")
+    let dir = faulted_project()
+    let r = sh_in(dir, "{FAULT_KNOB}=src/main.bl", "$B build --json src/main.bl")
     let _ = sh("rm -rf {dir}")
     assert_eq(r.end, ChildEnd.Exited(101), diag(r))
     let mut row = ""
@@ -290,4 +304,13 @@ fn main() {
             assert(!r.err_out.contains("GeneratedCDidNotCompile"), diag(r))
         }
     }
+}
+
+test "the fault knob names a file only by whole path components" {
+    let dir = faulted_project()
+    let part = sh_in(dir, "{FAULT_KNOB}=ain.bl", "$B build --no-per-module src/main.bl")
+    let whole = sh_in(dir, "{FAULT_KNOB}=main.bl", "$B build --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(part.end, ChildEnd.Exited(0), diag(part))
+    assert_eq(whole.end, ChildEnd.Exited(101), diag(whole))
 }

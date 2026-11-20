@@ -1,0 +1,218 @@
+// The prototype test of `blink build` and `blink test` (§9.1).
+//
+// After the header test, the build compiles the C call that each `@ffi` declaration of the
+// program gives against the prototype in its header, with the C compiler, flags and include
+// paths of the unit compile. Each call is in a function of its own, with the call's argument
+// types as its parameters, so the test needs no type of the generated C. It reads only pass
+// or fail: a compile of all the calls that fails is run again for each call, to find the ones
+// the header refuses. A probe that cannot give a verdict refuses no declaration, and the unit
+// compile reports what is wrong.
+
+import parser.{get_annotation, get_str_named_arg, node_col, node_kind, node_line, node_name}
+import ast.{NodeKind}
+import cname.{c_ffi_symbol}
+import cg_reg.{cg_reg_build}
+import cg_decl.{ForeignCallShape, cg_decl_foreign_call_shape, cg_decl_probe_prologue}
+import foreign_const_probe.{is_header_name, own_ffi_decls}
+import foreign_decl_probe
+import diagnostics.{Diag, diag_error_span_at_notes, FOREIGN_PROTOTYPE_MISMATCH}
+
+// One `@ffi` declaration of the program, and the call that its wrapper makes.
+pub type ForeignPrototype {
+    decl: Int
+    annotation: Int
+    symbol: Str
+    // The header that the declaration names, or "" for none.
+    header: Str
+    shape: ForeignCallShape
+}
+
+// The declarations the test checks, and the C that a unit has before its own declarations.
+pub type ForeignPrototypes {
+    protos: List[ForeignPrototype]
+    prologue: Str
+}
+
+// The probe's own lines report under this file name, after a `#line` directive.
+let PROBE_FILE = "__blink_prototype_probe__"
+
+// The program's own `@ffi` fn declarations whose call the test can write. The stdlib's are
+// part of the compiler. A unit reads the same prologue as a test unit of `test_build` does.
+pub fn foreign_prototypes_in(program: Int, test_build: Bool) -> ForeignPrototypes ! Diag.Report {
+    let mut fns: List[Int] = []
+    for d in own_ffi_decls(program) {
+        if node_kind(d) == NodeKind.FnDef && get_annotation(d, "ffi") != -1 && c_ffi_symbol(d) != "" { fns.push(d) }
+    }
+    let mut out: List[ForeignPrototype] = []
+    if fns.is_empty() { return ForeignPrototypes { protos: out, prologue: "" } }
+    // A build that takes its units from an earlier emit has no registry of its own.
+    cg_reg_build(program)
+    for d in fns {
+        let ann = get_annotation(d, "ffi")
+        let named = get_str_named_arg(ann, "header")
+        let header = if is_header_name(named) { named } else { "" }
+        match cg_decl_foreign_call_shape(d) {
+            Some(shape) => out.push(ForeignPrototype { decl: d, annotation: ann, symbol: c_ffi_symbol(d), header: header, shape: shape })
+            None => {}
+        }
+    }
+    if out.is_empty() { return ForeignPrototypes { protos: out, prologue: "" } }
+    ForeignPrototypes { protos: out, prologue: cg_decl_probe_prologue(test_build) }
+}
+
+// The C before the calls: the unit's prologue, then each header that a declaration of
+// `protos` names.
+fn prelude(prologue: Str, protos: List[ForeignPrototype]) -> Str {
+    let mut lines: List[Str] = []
+    let mut headers: List[Str] = []
+    for p in protos {
+        if p.header != "" && !headers.contains(p.header) {
+            headers.push(p.header)
+            lines.push("#include <{p.header}>")
+        }
+    }
+    prologue.concat(lines.join("\n")).concat("\n")
+}
+
+// The function that holds the call of `p`, or, when `call` is false, the same function with no
+// call: a compile of that tests only the types and the headers. Each local has the reserved
+// `blink_` prefix, so it cannot hide a C symbol of the same name.
+fn call_fn(i: Int, p: ForeignPrototype, call: Bool) -> Str {
+    let mut params: List[Str] = []
+    let mut args: List[Str] = []
+    let mut j = 0
+    for t in p.shape.args {
+        params.push("{t} blink_probe_a{j}")
+        args.push("blink_probe_a{j}")
+        j = j + 1
+    }
+    let head = "void blink_prototype_probe_{i}({if params.is_empty() { "void" } else { params.join(", ") }})"
+    if !call { return "{head} \{\}" }
+    let c = "{p.symbol}({args.join(", ")})"
+    let body = if p.shape.ret == "" { "{c};" } else { "{p.shape.ret} blink_probe_r = {c}; (void)blink_probe_r;" }
+    "{head} \{ {body} \}"
+}
+
+fn probe_text(base: Str, fns: List[Str]) -> Str {
+    base.concat("#line 1 \"{PROBE_FILE}\"\n").concat(fns.join("\n")).concat("\n")
+}
+
+type ProbeEnd {
+    Passes
+    Fails
+    // No shell, no C compiler (127), a cc killed by a signal, or a probe that cannot be
+    // written.
+    NotRun
+}
+
+fn run_probe(path: Str, text: Str, cc: Str, tail: Str) -> ProbeEnd ! FS.Write, FS.Delete, Process.Spawn {
+    match fs.write(path, text) {
+        Ok(_) => {}
+        Err(_) => return ProbeEnd.NotRun
+    }
+    let mut why = "the C compiler did not start"
+    let end = match foreign_decl_probe.run_probe_cc(cc, "-fno-builtin -x c", path, tail) {
+        Ok(r) => {
+            why = r.err_out.trim().split("\n").get(0) ?? ""
+            match r.end {
+                ChildEnd.Exited(0) => ProbeEnd.Passes
+                ChildEnd.Exited(127) => ProbeEnd.NotRun
+                ChildEnd.Exited(_) => ProbeEnd.Fails
+                _ => ProbeEnd.NotRun
+            }
+        }
+        Err(_) => ProbeEnd.NotRun
+    }
+    let word = match end {
+        ProbeEnd.Passes => "passes"
+        ProbeEnd.Fails => "fails"
+        ProbeEnd.NotRun => "not run"
+    }
+    trace.log("blink.build.prototype", "{path} {word}: {why}\n{text}")
+    let _ = fs.delete(path)
+    let _ = fs.delete("{path}.o")
+    end
+}
+
+// The declarations of `probe` whose call the header refuses, for one target. `dir` holds the
+// probes. `cc` is the compile command up to the probe's own flags, and `tail` follows the
+// probe file, as the includes do on a unit's compile. `limit` lifts the error limit of `cc`.
+// A symbol that no header declares gets the prototype the unit writes, so it has no call to
+// test.
+//
+// One compile reads every header and holds every call. Two headers that cannot be read
+// together give no verdict there, so each declaration is then tested with only its own
+// header. The unit does not yet include a binding's `header:`, so it compiles with those
+// headers apart; this fallback holds until it does, and then such headers stop the unit.
+pub fn refused(probe: ForeignPrototypes, dir: Str, cc: Str, tail: Str, limit: Str, label: Str) -> List[ForeignPrototype] ! FS.Write, FS.Delete, Process.Spawn {
+    if probe.protos.is_empty() { return [] }
+    match refused_in(probe.prologue, probe.protos, "{dir}/all", cc, tail, limit, label) {
+        Some(out) => return out
+        None => {}
+    }
+    let mut out: List[ForeignPrototype] = []
+    let mut i = 0
+    for p in probe.protos {
+        match refused_in(probe.prologue, [p], "{dir}/one{i}", cc, tail, limit, label) {
+            Some(r) => { for q in r { out.push(q) } }
+            None => {}
+        }
+        i = i + 1
+    }
+    out
+}
+
+// The declarations of `protos` that the header refuses, with all their headers read in one
+// compile, or None when the headers or the types give no verdict.
+fn refused_in(prologue: Str, protos: List[ForeignPrototype], stem: Str, cc: Str, tail: Str, limit: Str, label: Str) -> Option[List[ForeignPrototype]] ! FS.Write, FS.Delete, Process.Spawn {
+    let base = prelude(prologue, protos)
+    let mut symbols: List[Str] = []
+    for p in protos {
+        if !symbols.contains(p.symbol) { symbols.push(p.symbol) }
+    }
+    let guards = foreign_decl_probe.guard_run(stem, base, symbols, cc, tail, limit, label)
+    if guards.unanswered != "" { return None }
+    let mut calls: List[Str] = []
+    let mut tested: List[ForeignPrototype] = []
+    for p in protos {
+        if !guards.declared.contains(p.symbol) { continue }
+        calls.push(call_fn(tested.len(), p, true))
+        tested.push(p)
+    }
+    if tested.is_empty() { return Some([]) }
+    match run_probe("{stem}.c", probe_text(base, calls), cc, tail) {
+        ProbeEnd.Passes => return Some([])
+        ProbeEnd.NotRun => return Some([])
+        ProbeEnd.Fails => {}
+    }
+    // A failed compile with no call shows a fault in the types or the headers, not in a
+    // prototype.
+    let mut bare: List[Str] = []
+    let mut i = 0
+    for p in tested {
+        bare.push(call_fn(i, p, false))
+        i = i + 1
+    }
+    match run_probe("{stem}.types.c", probe_text(base, bare), cc, tail) {
+        ProbeEnd.Passes => {}
+        ProbeEnd.NotRun => return Some([])
+        ProbeEnd.Fails => return None
+    }
+    if tested.len() == 1 { return Some(tested) }
+    let mut out: List[ForeignPrototype] = []
+    i = 0
+    for p in tested {
+        match run_probe("{stem}.p{i}.c", probe_text(base, [calls.get(i).unwrap()]), cc, tail) {
+            ProbeEnd.Fails => out.push(p)
+            _ => {}
+        }
+        i = i + 1
+    }
+    Some(out)
+}
+
+pub fn report_prototype_mismatch(p: ForeignPrototype) ! Diag.Report {
+    let ann = p.annotation
+    let col = node_col(ann)
+    diag_error_span_at_notes("ForeignPrototypeMismatch", FOREIGN_PROTOTYPE_MISMATCH, "the C compiler refused the call of `{p.symbol}` that `{node_name(p.decl)}` gives against the prototype in its header", p.decl, node_line(ann), col, col + 1 + node_name(ann).byte_len(), "", [])
+}
