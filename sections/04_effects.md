@@ -5854,9 +5854,9 @@ fn bad_nightly() ! IO.Log {
 
 Only a row with no `_` bounds the impls of a trait method. Effects beside an impl-chosen `_` add to the charge at a call through a type parameter and limit no impl. They are also the row of a type that keeps the default body of the method (see *Default bodies under an impl-chosen `_`* below). For example, `! IO.Log, _` is legal on such a method, and every impl may still choose a row without `IO.Log`.
 
-The empty row stays the default contract of a trait method. Write `! _` on a method without a callback only when its impls must do effects that the trait cannot name ahead, as cleanup does. `Closeable` (§3.6) and `Scoped` (§4.7.2) are the traits of this specification that do.
+The empty row stays the default contract of a trait method. Write `! _` on a method without a callback only when its impls must do effects that the trait cannot name ahead, as cleanup does. An impl for a type with a row slot takes `_` from the slot (§4.15.5). `Closeable` (§3.6) and `Scoped` (§4.7.2) are the traits of this specification that do.
 
-**Source of `_`.** A `_` in the row of a function or of an impl method needs a source: a `! _` callback or handler parameter, or a type parameter whose bound has a method with a `_` row. A `_` in the declaration of a trait method has no such need, because it is the impl-chosen contract above. A `final` trait method is the one exception (see *Default bodies under an impl-chosen `_`* below). An impl method that forwards the row of a type parameter has a source:
+**Source of `_`.** A `_` in the row of a function or of an impl method needs a source: a `! _` callback or handler parameter, a type parameter whose bound has a method with a `_` row, or the row slot of the self type of an impl (§4.15.5). A `_` in the return type of a fn is sourced by its `! _` parameters, and a parameter of the form `T[! _]` is one of them. A `_` in the declaration of a trait method has no such need, because it is the impl-chosen contract above. A `final` trait method is the one exception (see *Default bodies under an impl-chosen `_`* below). An impl method that forwards the row of a type parameter has a source:
 
 ```blink
 type Guard[T] {
@@ -6184,7 +6184,193 @@ In a fn that is not a root, the same call is E0500 at the call, and the `note:` 
 
 **async.spawn (§4.13):** `async.spawn` takes `fn() -> T ! _` — the spawned task inherits whatever effects the closure declares. The existing E0650 restriction on captures of a mutable root still applies, and so does the freeze of the shared cells its captures reach (§2.8 *Shared cells in a spawned task*). A handler in force at the spawn site whose captures reach a shared cell is homed (§2.8 *Handlers in a spawned task*). A function value whose row contains `State` cannot be spawned (E0651, §4.16.6).
 
-#### 4.15.5 What Is Deferred to v2
+#### 4.15.5 A Type That Stores a Callback
+
+A type can store a callback in a field. The row of the callback must stay on the type, or a call through the field would hide an effect. A type that stores a callback with an effect row carries one **row slot**: one anonymous row, written `[! _]` at the declaration and `[! R]` at a use site. The slot is the same kind of row as the clause row of `Handler[E ! R]` (§4.7.1) and has the same grammar. It comes after any type parameters.
+
+**Declaration.** A `! _` in a field type needs a slot on the type. A slot needs a field that uses it.
+
+```blink
+type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+
+type Job[T ! _] {                  // type parameter first, then the slot
+    input: T
+    run: fn(T) -> Void ! _
+}
+```
+
+A type has at most one slot, and the slot is exactly `! _`. These are errors:
+
+```blink
+type Late {
+    action: fn() -> Void ! _       // ERROR E0551: `_` has no slot (fix: `type Late[! _]`)
+}
+
+type Idle[! _] {
+    n: Int                         // ERROR E0551: the slot `! _` of `Idle` has no field that uses it
+}
+
+type Named[! e] {                  // ERROR E0571: named rows are v2 (§4.15.6)
+    action: fn() -> Void ! e
+}
+
+type Two[! _, ! _] {               // ERROR E0571: a type has one row slot
+    a: fn() -> Void ! _
+    b: fn() -> Void ! _
+}
+
+type Cleanup ! _ {                 // ERROR E0573: write the slot in brackets, `type Cleanup[! _] {`
+    action: fn() -> Void ! _
+}
+```
+
+```
+error[RowSlotAfterName]: the row slot of `Cleanup` must be in brackets
+  --> cleanup.bl:1:14
+   |
+ 1 | type Cleanup ! _ {
+   |              ^^^ the row slot goes after the name, inside `[ ]`
+   |
+   = help: write `type Cleanup[! _] {`
+```
+
+All `_` fields of one type share the one slot. The slot is the union of the rows of the closures that the value holds.
+
+**Use sites.** `Name[! R]` gives the slot a row. After type arguments, the row follows `!` inside the same brackets. A name with no row is the empty row.
+
+```blink
+fn a(c: Cleanup[! FS.Delete]) ! FS.Delete { (c.action)() }   // slot row: FS.Delete
+fn b(j: Job[Int ! IO]) ! IO { (j.run)(j.input) }
+fn c(c: Cleanup) { (c.action)() }                            // bare `Cleanup` is `Cleanup[! ]`, pure
+fn e(s: Cleanup[Int]) {}              // ERROR E0572: `Cleanup` takes a row slot `[! R]`, not a type argument
+fn f(p: Plain[! IO]) {}               // ERROR E0572: `Plain` has no row slot
+```
+
+A `_` in a parameter type of the form `T[! _]` is a source of `_` for the fn (§4.15.2, *Source of `_`*), as a `! _` callback parameter is.
+
+**Construction.** A struct literal infers the slot from the rows of the closures in the fields. A fn with a `! _` parameter may return the slotted type. The `_` in the return type is the union of the `! _` parameters (§4.15.2). The pass of a closure to such a fn charges nothing: the value holds the closure, and the charge happens where something calls it.
+
+```blink
+pub fn cleanup(action: fn() -> Void ! _) -> Cleanup[! _] {   // OK: the return slot has a source
+    Cleanup { action: action }
+}
+
+fn make(path: Str) -> Cleanup[! FS.Delete] {
+    Cleanup { action: fn() { fs.delete(path) } }              // OK: the slot is FS.Delete
+}
+```
+
+`make` takes no `FS.Delete`: it makes a closure and does not call it (§4.15.4). A value never changes its row after it exists. When the expected type names the slot, each closure in the literal must fit that row by the rules of fn types (§4.15.1).
+
+**Impl methods.** In an impl for a slotted type, the slot is the source of `_` for a method.
+
+```blink
+impl Scoped for Cleanup[! _] {
+    type Context = Void
+    fn enter(self) -> Void { let _ = self }
+    fn exit(self, ok: Bool) ! _ {   // OK: `_` is the slot of `Cleanup[! _]`
+        let _ = ok
+        (self.action)()
+    }
+}
+```
+
+At a call of `exit` on a `Cleanup[! R]`, `_` is `R`. A `with` on a `Cleanup[! R]` calls `exit`, so the `with` is charged `R`. A `Cleanup` with no row gives the empty row, and the `with` is charged nothing.
+
+**Charging.** The call of the stored closure charges its row. For `Cleanup`, the call is the `with`.
+
+```blink
+fn scratch(path: Str) ! IO {
+    with cleanup(fn() { fs.delete(path) }) {     // ERROR E0500: `FS.Delete` is not in `scratch`
+        io.println("work")
+    }
+}
+
+test "daemon stops at the end" {                 // charged `Process.Signal` (a test is a root, §2)
+    let child = start_daemon()
+    with cleanup(fn() { process.signal(child, 15) }) {
+        io.println("daemon runs")
+    }
+}
+```
+
+```
+error[UndeclaredEffect]: `scratch` may not perform `FS.Delete`
+  --> scratch.bl:2:10
+   |
+ 2 |     with cleanup(fn() { fs.delete(path) }) {
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this `with` calls `exit`; the row of the closure is `! FS.Delete`
+   |
+   = note: `FS.Delete` comes from `fs.delete` at scratch.bl:2:25, in the stored closure
+   = help: add `FS.Delete` to the row of `scratch`
+```
+
+The error names the row of the closure and the line of the effect call inside the closure, as in §4.15.4.
+
+**A builder returns a new value.** A mutable container never widens in place. `List[Route[! R1]]` does not become `List[Route[! R2]]`, because a holder of the old list would then see a closure with a row that its type does not name. A fn that adds a callback returns a new value with the union row. The old value keeps its old row and does not see the callback added later.
+
+```blink
+type Route[! _] {
+    path: Str
+    handler: fn(Request) -> Response ! _
+}
+
+type Server[! _] {
+    routes: List[Route[! _]]
+}
+
+fn server_get(s: Server[! _], path: Str, h: fn(Request) -> Response ! _) -> Server[! _] {
+    // `_` of the result = the slot of `s` + the row of `h`
+    Server { routes: s.routes.append(Route { path: path, handler: h }) }
+}
+
+fn serve(s: Server[! _]) ! Net.Listen, _ {       // `serve` calls the routes: it is charged the slot
+    for r in s.routes {
+        let _ = (r.handler)(request())
+    }
+}
+
+fn main() ! Net.Listen, DB, IO {
+    let s0 = server_new()                         // Server[! ]
+    let s1 = server_get(s0, "/ok", fn(r) { response_ok("ok") })        // Server[! ]
+    let s2 = server_get(s1, "/db", fn(r) { response_ok(db.query(t"...")) })  // Server[! DB]
+    serve(s1)                                     // OK: charged `Net.Listen`; `s1` has no `DB` route
+    serve(s2)                                     // charged `Net.Listen, DB`
+}
+
+fn bad() ! Net.Listen {
+    serve(server_get(server_new(), "/db", fn(r) { response_ok(db.query(t"...")) }))
+                                                  // ERROR E0500: `serve` is charged `DB`
+}
+```
+
+`s1` still has the empty row after `s2` exists. The builder copies the list: this costs O(n) per route, once at start-up.
+
+**A type outside the standard library.** The rules are the same for every type.
+
+```blink
+type Timer[! _] {
+    every: Int
+    tick: fn(Int) -> Void ! _
+}
+
+fn fire(t: Timer[! _], n: Int) ! _ {
+    (t.tick)(n)                                   // charged the slot
+}
+
+fn main() ! IO {
+    let t = Timer { every: 5, tick: fn(n) { io.println("tick {n}") } }   // Timer[! IO.Print]
+    fire(t, 1)                                    // OK: `IO.Print` is in `IO`
+}
+```
+
+**What stays the same.** A field with a concrete row (`fn() -> Void ! IO.Log`) is legal and needs no slot. Each call through it is charged `IO.Log`. A field with no row is pure. A lazy `iter.map` with an effectful callback is still an error in v1 (§3c.1, §4.15.6).
+
+#### 4.15.6 What Is Deferred to v2
+
+**One anonymous slot per type is v1.** A type has one row slot and a signature has one `_` (§4.15.5). Named slots (`type Cleanup[! e]`) and two slots on one type stay v2.
 
 **Named effect variables (row polymorphism):** v1 uses `_` which covers the common case of "forward all callback effects." v2 may introduce named effect variables for advanced use cases:
 
