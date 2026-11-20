@@ -1,43 +1,56 @@
 // From the deadline on, wait takes one last look at the pipes and returns, so a grandchild
 // that writes on and on cannot hold it. That look must still take all that the child wrote
 // before it ended: the pipe holds it, and a wait that comes late must not change the result
-// (sections/04_effects.md §4.4.8 A deadline holds whether or not anyone waits). Each child
-// writes 50000 bytes, more than one read takes, and the wait comes after timeout + grace.
+// (sections/04_effects.md §4.4.8 A deadline holds whether or not anyone waits). The wait
+// comes after timeout + grace.
 
 import compile_test_helpers
 import std.process.{ChildEnd, ChildLimits, LimitKind}
 import std.time.{Duration}
 
+// Each row needs this order: the child writes all its bytes (and the rows that expect Exited(0)
+// exit), then the deadline comes, then the wait. The deadline sits far above the time a child
+// takes to write SIZE bytes and exit, even under heavy load. The late wait needs no margin of
+// its own: it comes after LATE, and a sleep can run long but never short, so it always starts
+// after timeout + grace + the runtime's 200ms read delay.
 fn lim() -> ChildLimits {
-    ChildLimits { timeout: Some(Duration.ms(200)), grace: Duration.nanos(0) }
+    ChildLimits { timeout: Some(Duration.ms(1200)), grace: Duration.nanos(0) }
 }
 
+let LATE = "1.5"
+
+// Nothing reads the pipe before the late wait, so the child can write only what one pipe
+// holds. Linux gives a new pipe only 8192 bytes once the user's pipes pass
+// fs.pipe-user-pages-soft, which a full corpus run does; with more, the child blocks and
+// never exits. SIZE must stay below 8192 and above the 4096 bytes of the wait's first read.
+let SIZE = 6000
+
 fn big_write() -> Str {
-    "head -c 50000 /dev/zero | tr '\\0' x"
+    "head -c {SIZE} /dev/zero | tr '\\0' x"
 }
 
 test "a late wait on a child that exited before its deadline keeps all its output" {
     let child = process.spawn("sh", ["-c", big_write()], limits: lim()).unwrap()
-    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let _ = process.run("sleep", [LATE]).unwrap()
     let r = process.wait(child).unwrap()
     assert_eq(r.end, ChildEnd.Exited(0))
-    assert_eq(r.out.len(), 50000)
+    assert_eq(r.out.len(), SIZE)
 }
 
 test "a late wait on a child that its deadline ended keeps all it wrote before" {
     let child = process.spawn("sh", ["-c", "{big_write()}; sleep 30"], limits: lim()).unwrap()
-    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let _ = process.run("sleep", [LATE]).unwrap()
     let r = process.wait(child).unwrap()
     assert_eq(r.end, ChildEnd.Limit(LimitKind.Timeout))
-    assert_eq(r.out.len(), 50000)
+    assert_eq(r.out.len(), SIZE)
 }
 
 test "a late wait keeps all a child wrote to stderr" {
     let child = process.spawn("sh", ["-c", "{big_write()} >&2"], limits: lim()).unwrap()
-    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let _ = process.run("sleep", [LATE]).unwrap()
     let r = process.wait(child).unwrap()
     assert_eq(r.end, ChildEnd.Exited(0))
-    assert_eq(r.err_out.len(), 50000)
+    assert_eq(r.err_out.len(), SIZE)
 }
 
 // setsid puts the writer out of reach of the group signal, and it writes without end. The
@@ -52,7 +65,7 @@ test "a grandchild that writes without end does not hold a late wait" {
     let pid_file = "{dir}/pid"
     let script = "setsid sh -c 'echo $$ > \"$0\"; exec yes' \"$0\" & exit 0"
     let child = process.spawn("sh", ["-c", script, pid_file], limits: lim()).unwrap()
-    let _ = process.run("sleep", ["1.5"]).unwrap()
+    let _ = process.run("sleep", [LATE]).unwrap()
     let start = time.read()
     let r = process.wait(child).unwrap()
     let ms = start.elapsed().to_ms()
