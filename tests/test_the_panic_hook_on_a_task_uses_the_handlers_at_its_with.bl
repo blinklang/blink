@@ -1,0 +1,71 @@
+// A panic on a task runs the hook there, and each operation in the hook goes to the handlers in
+// scope at its `with` (sections/02_syntax.md §2.20 *The row of the hook*), not to the task's own
+// (§2.8 *Handlers in a spawned task*). The hook runs on a private copy of the vector at its
+// `with`. A run that hangs has a time limit.
+
+import compile_test_helpers.{compile_and_run_within}
+
+let PRELUDE = #"import std.panic.{PanicInfo}
+
+effect Tag {
+    effect Get {
+        fn tag() -> Str
+    }
+}
+
+fn boom(i: Int) -> Int {
+    let mut xs = [1, 2]
+    xs.set(i, 5)
+    xs.len()
+}
+"#
+
+test "the hook for a panic on a task uses the handlers at its with, not at the spawn" {
+    let body = #"
+fn main() ! IO, Env, Async, Tag {
+    with handler Tag { fn tag() -> Str { "with-site" } } {
+        let report = fn(_p: PanicInfo) -> Never {
+            io.println("hook sees tag: {tag.tag()}")
+            env.exit(70)
+        }
+        with on_panic(report) {
+            with handler Tag { fn tag() -> Str { "main-inner" } } {
+                async.scope {
+                    let a = async.spawn(fn() { io.println("{boom(10)}") })
+                    a.await
+                }
+            }
+        }
+    }
+}
+"#
+    let r = compile_and_run_within("{PRELUDE}{body}", "ph_on_task_spawn_{getpid()}", Duration.seconds(60))
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "hook sees tag: with-site\n")
+}
+
+test "the hook for a panic on a task uses the handlers at its with, not the task's own" {
+    let body = #"
+fn main() ! IO, Env, Async, Tag {
+    with handler Tag { fn tag() -> Str { "with-site" } } {
+        let report = fn(_p: PanicInfo) -> Never {
+            io.println("hook sees tag: {tag.tag()}")
+            env.exit(70)
+        }
+        with on_panic(report) {
+            async.scope {
+                let a = async.spawn(fn() {
+                    with handler Tag { fn tag() -> Str { "task-inner" } } {
+                        io.println("{tag.tag()} {boom(10)}")
+                    }
+                })
+                a.await
+            }
+        }
+    }
+}
+"#
+    let r = compile_and_run_within("{PRELUDE}{body}", "ph_on_task_own_{getpid()}", Duration.seconds(60))
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "hook sees tag: with-site\n")
+}

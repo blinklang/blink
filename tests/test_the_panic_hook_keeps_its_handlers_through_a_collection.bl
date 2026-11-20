@@ -1,0 +1,81 @@
+// The hook runs on a copy of the vector at its `with` (sections/02_syntax.md §2.20 *The row of
+// the hook*). A collection while the hook runs must not free that copy: an operation after it
+// still goes to the handlers at the `with`. The churn reuses blocks of the copy's size with
+// pointers in them, and only -O2 drops the locals that would keep a heap copy alive.
+
+import compile_test_helpers.{compile_and_run_within_opt}
+
+let PRELUDE = #"import std.panic.{PanicInfo}
+
+effect Tag {
+    effect Get {
+        fn tag() -> Str
+    }
+}
+
+fn boom(i: Int) -> Int {
+    let mut xs = [1, 2]
+    xs.set(i, 5)
+    xs.len()
+}
+
+fn churn() -> Int {
+    let word = "AAAA"
+    let mut total = 0
+    let mut i = 0
+    while i < 50000 {
+        let mut l: List[Str] = []
+        let mut k = 0
+        while k < i % 24 {
+            l.push(word)
+            k = k + 1
+        }
+        total = total + l.len()
+        i = i + 1
+    }
+    total
+}
+"#
+
+test "a hook that collects garbage on a task still uses the handlers at its with" {
+    let body = #"
+fn main() ! IO, Env, Async, Tag {
+    with handler Tag { fn tag() -> Str { "with-site" } } {
+        let report = fn(_p: PanicInfo) -> Never {
+            let n = churn()
+            io.println("hook sees tag: {tag.tag()} {n > 0}")
+            env.exit(70)
+        }
+        with on_panic(report) {
+            async.scope {
+                let a = async.spawn(fn() { io.println("{boom(10)}") })
+                a.await
+            }
+        }
+    }
+}
+"#
+    let r = compile_and_run_within_opt("{PRELUDE}{body}", "ph_gc_task_{getpid()}", Duration.seconds(60), "-O2")
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "hook sees tag: with-site true\n")
+}
+
+test "a hook that collects garbage on main still uses the handlers at its with" {
+    let body = #"
+fn main() ! IO, Env, Tag {
+    with handler Tag { fn tag() -> Str { "with-site" } } {
+        let report = fn(_p: PanicInfo) -> Never {
+            let n = churn()
+            io.println("hook sees tag: {tag.tag()} {n > 0}")
+            env.exit(70)
+        }
+        with on_panic(report) {
+            io.println("{boom(10)}")
+        }
+    }
+}
+"#
+    let r = compile_and_run_within_opt("{PRELUDE}{body}", "ph_gc_main_{getpid()}", Duration.seconds(60), "-O2")
+    assert(r.exit_code == 70, "exit {r.exit_code}: {r.err_out}")
+    assert_eq(r.out, "hook sees tag: with-site true\n")
+}

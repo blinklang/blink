@@ -3259,19 +3259,25 @@ BLINK_RT_FN const char* blink_str_format(const char* fmt, ...) {
 /* The panic hook of the program (spec §2.20). `with on_panic(f)` in main installs it for the
    body of the `with`, and a panic with a Blink site calls it there, at the panic point. The
    adapter is a C fn the compiler prints for main: it builds the PanicInfo and calls the hook
-   closure. `ev` is the program's effect vector and `ev_at_with` a copy of it at the `with`, so
-   the hook's operations go to the handlers in scope at the `with`, not at the panic point.
-   Only a panic on the thread that installed the hook copies it back: on any other thread the
-   vector holds the slots main is running with, and the copy would change them under main.
-   `owner` is that thread's address of __blink_in_panic_hook, which no other live thread shares.
+   closure. `ev_at_with` is a copy of the effect vector at the `with`, so the hook's operations
+   go to the handlers in scope at the `with`, not at the panic point. The run copies those
+   `ev_size` bytes onto its own stack, and `ev_run`, a fn the compiler prints because only the
+   program knows the name of the vector pointer, runs the adapter with that copy as the vector of
+   the thread that panics. So the hook writes no vector that is live: not main's, not a task's,
+   and not main's vector that a foreign thread falls back to.
+   A record with no `ev_run` comes from a compiler that came before these fns. Its hook copies
+   `ev_at_with` over `ev`, main's vector, and only on the thread that installed it, whose
+   address of __blink_in_panic_hook is `owner`.
    The record is one per process: main holds the only hook, and a panic on any thread is a
    panic of the program. `test_run` is set by the test runner, which takes every panic itself,
    so a test that calls main installs no hook. It is per process, not per thread: the runner's
    test hook is per thread, and a task that a test spawns to run main has none. */
 struct blink_closure_;
 typedef void (*__blink_panic_hook_adapter)(struct blink_closure_* hook, const char* message, const char* file, int64_t line);
+typedef void (*__blink_panic_hook_ev_run)(void* ev, struct blink_closure_* hook, const char* message, const char* file, int64_t line);
 typedef struct {
     __blink_panic_hook_adapter adapter;
+    __blink_panic_hook_ev_run ev_run;
     struct blink_closure_* hook;
     void* ev;
     const void* ev_at_with;
@@ -3314,7 +3320,8 @@ static __thread int __blink_in_panic_hook = 0;
 static char __blink_panic_hook_lock = 0;
 #endif
 
-/* A spin lock, not a mutex: it is held for a copy of the record and nothing else. */
+/* A spin lock, not a mutex: it is held for a copy of the record and of the vector at its
+   `with`, and nothing else. */
 static inline void __blink_panic_hook_lock_take(void) {
     while (__atomic_test_and_set(&__blink_panic_hook_lock, __ATOMIC_ACQUIRE)) {}
 }
@@ -3334,19 +3341,13 @@ static inline void __blink_panic_hook_publish(void) {
     __blink_panic_hook.test_run = test_run;
 }
 
-/* Install the hook for the body of a `with`. The cleanup of the `with` hands the frame to
+/* Install `record` for the body of a `with`. The cleanup of the `with` hands the frame to
    __blink_panic_hook_leave. */
-BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
-#ifndef BLINK_RUNTIME_DECLS_ONLY
-BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
+static inline void __blink_panic_hook_install(__blink_panic_hook_frame* frame, __blink_panic_hook_record record) {
     frame->installed = 0;
     frame->below = NULL;
     __blink_panic_hook_lock_take();
     if (!__blink_panic_hook.test_run && __blink_panic_test_hook == NULL) {
-        __blink_panic_hook_record record = {
-            .adapter = adapter, .hook = hook, .ev = ev, .ev_at_with = ev_at_with,
-            .ev_size = ev_size, .owner = &__blink_in_panic_hook,
-        };
         frame->record = record;
         frame->below = __blink_panic_hook_top;
         frame->installed = 1;
@@ -3354,6 +3355,26 @@ BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __bli
         __blink_panic_hook_publish();
     }
     __blink_panic_hook_lock_give();
+}
+
+BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_hook_enter(__blink_panic_hook_frame* frame, __blink_panic_hook_adapter adapter, struct blink_closure_* hook, void* ev, const void* ev_at_with, size_t ev_size) {
+    __blink_panic_hook_record record = {
+        .adapter = adapter, .hook = hook, .ev = ev, .ev_at_with = ev_at_with,
+        .ev_size = ev_size, .owner = &__blink_in_panic_hook,
+    };
+    __blink_panic_hook_install(frame, record);
+}
+#endif
+
+BLINK_RT_FN void __blink_panic_hook_enter_ev(__blink_panic_hook_frame* frame, __blink_panic_hook_ev_run ev_run, struct blink_closure_* hook, const void* ev_at_with, size_t ev_size);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN void __blink_panic_hook_enter_ev(__blink_panic_hook_frame* frame, __blink_panic_hook_ev_run ev_run, struct blink_closure_* hook, const void* ev_at_with, size_t ev_size) {
+    __blink_panic_hook_record record = {
+        .ev_run = ev_run, .hook = hook, .ev_at_with = ev_at_with, .ev_size = ev_size,
+    };
+    __blink_panic_hook_install(frame, record);
 }
 #endif
 
@@ -3398,8 +3419,8 @@ BLINK_RT_FN void __blink_panic_hook_mark_test_run(void) {
 
 /* Run the hook for a panic that nothing else takes: a draining cleanup, an armed
    assert_panics and the test runner each take theirs first, as __blink_panic_dispatch does.
-   A panic inside the hook does not call it again. A hook that returns, which its Never type
-   forbids, falls through to the default report. */
+   A panic inside the hook does not call it again. The hook is Never and its adapter ends in
+   __builtin_unreachable, so a call to the adapter does not come back here. */
 BLINK_RT_FN void __blink_panic_hook_run(const char* what, const char* file, int64_t line);
 #ifndef BLINK_RUNTIME_DECLS_ONLY
 BLINK_RT_FN void __blink_panic_hook_run(const char* what, const char* file, int64_t line) {
@@ -3407,12 +3428,22 @@ BLINK_RT_FN void __blink_panic_hook_run(const char* what, const char* file, int6
     if (__blink_in_panic_hook) return;
     __blink_panic_hook_lock_take();
     __blink_panic_hook_record r = __blink_panic_hook;
+    /* `ev_at_with` is on the stack of the `with`. Leave takes the lock before the body
+       ends, so under the lock the copy reads a live frame. The copy is on this stack, which
+       the collector scans for the whole hook; a pointer in TLS alone does not keep it. */
+    max_align_t ev[r.ev_run != NULL ? r.ev_size / sizeof(max_align_t) + 1 : 1];
+    if (r.ev_run != NULL) memcpy(ev, r.ev_at_with, r.ev_size);
     __blink_panic_hook_lock_give();
-    if (r.adapter == NULL) return;
+    if (r.hook == NULL) return;
     __blink_in_panic_hook = 1;
+    const char* message = blink_str_format("%s", what ? what : "");
+    const char* at = blink_str_format("%s", file ? file : "");
+    if (r.ev_run != NULL) {
+        r.ev_run(ev, r.hook, message, at, line);
+        return;
+    }
     if (r.owner == &__blink_in_panic_hook) memcpy(r.ev, r.ev_at_with, r.ev_size);
-    r.adapter(r.hook, blink_str_format("%s", what ? what : ""),
-            blink_str_format("%s", file ? file : ""), line);
+    r.adapter(r.hook, message, at, line);
 }
 #endif
 
