@@ -108,7 +108,7 @@ fn c_pipe(fds: Ptr[SockIn]) -> I32 ! () {}
 //   `pipe` takes `int *`; this declaration passes `struct sockaddr_in *`
 ```
 
-If the header is there and the prototype test passes, but the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype that the test did not find can also cause it (§8.10.5). An example is a build with `tcc`.
+`blink build` and `blink test` run three C tests, in this order, before they compile the unit: the header test (E0859), the layout test of each `@ffi.struct` mirror (E0862, §9.1.3 *Static layout assertions*), and the prototype test (E0861). If the header is there, the layout test and the prototype test pass, but the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype that the test did not find can also cause it (§8.10.5). An example is a build with `tcc`.
 
 #### `@ffi` Binds a Module-Level Function
 
@@ -3177,7 +3177,58 @@ libc.recv_bytes(fd, 16, flags: 0x40)                        // error: expected M
 
 #### Static layout assertions
 
-For every `@ffi.struct` declaration, the build checks that the size of the struct and the offset of each field match the named C struct in the header. If they differ, the build fails and reports the struct and the field.
+For every `@ffi.struct` declaration, `blink build` and `blink test` check that the size of the struct and the offset and size of each field match the named C struct in the header, on the target of the build. If they differ, the build stops with `ForeignStructMismatch` (E0862), exit `1`. No unit compiles. `blink check` reads no header and reports nothing.
+
+One code covers five kinds. The message names the kind, the struct, the field when the kind has one, and the target triple:
+
+| Kind | The C test finds | Message ends with |
+|------|------------------|-------------------|
+| NoName | the header declares no complete struct tag and no complete typedef name `name:` | the name that `name:` gives |
+| NoField | the C struct has no field of that name, or the field is a bit-field | the field name |
+| Offset | the field is at another offset in C | the C offset and the Blink offset |
+| FieldSize | the field has another size in C | the Blink size, for example "`I32` is 4 bytes" |
+| StructSize | the struct has another size in C | the C size and the Blink size |
+
+The report has these rules:
+
+- The primary span is the `@ffi.struct` line. For NoField, Offset and FieldSize, a secondary label marks the Blink field. The message names the field in words, so a tool that shows only the primary span still shows it. The JSON form (§8.6) holds the kind, and holds the Blink field as a `related` location.
+- Each mirror gets one report: the first check that fails, in this order: NoName, then each field in declaration order (NoField, Offset or FieldSize), then StructSize. A wrong field moves the fields after it, so a later report would only repeat the first. One run reports every bad mirror.
+- The target triple is in the message, because the same mirror can pass on one target and fail on another (for example under `--target aarch64-linux-gnu`).
+- The test reads only pass or fail. The kind and the field are the same under gcc 13 or later, clang and `zig cc`. A build with `tcc` is outside this promise, as it is for E0861.
+- The help for NoName says to check `name:`, and that a C type with no visible fields is an `@ffi.opaque` (*`@ffi.opaque`*). The help for a field that C does not have says that it shows as an Offset or StructSize kind when the missing field moves the fields after it.
+
+```blink
+@ffi.struct(header: "time.h", name: "timespec")
+type Ts { tv_sec: I64, tv_nsec: I64 }       // passes on x86_64-linux-gnu
+
+@ffi.struct(header: "time.h", name: "timespec")
+type TsSmall { tv_sec: I64, tv_nsec: I32 }
+// error[ForeignStructMismatch] (E0862) at the @ffi.struct line
+//   `@ffi.struct` `TsSmall` does not match C struct `timespec` on x86_64-linux-gnu:
+//   FieldSize: field `tv_nsec` has another size in C (`I32` is 4 bytes)
+
+@ffi.struct(header: "time.h", name: "timespec")
+type TsExtra { tv_sec: I64, tv_nsec: I64, extra: I64 }
+// error[ForeignStructMismatch] (E0862) at the @ffi.struct line
+//   `@ffi.struct` `TsExtra` does not match C struct `timespec` on x86_64-linux-gnu:
+//   NoField: C struct `timespec` has no field `extra`, or `extra` is a bit-field
+
+@ffi.struct(header: "time.h", name: "timespek")
+type TsTypo { tv_sec: I64, tv_nsec: I64 }
+// error[ForeignStructMismatch] (E0862) at the @ffi.struct line
+//   `TsTypo` names `timespek`, but `time.h` declares no complete struct tag and no
+//   complete typedef name `timespek` on x86_64-linux-gnu
+//   help: check the spelling of `name:`; a C type with no visible fields is an `@ffi.opaque`
+```
+
+The layout test proves size and offset only. It does not prove the sign of an integer, whether a field is a float or an integer, or the type that a pointer points to. A mirror whose fields have the right sizes and offsets but the wrong kind of type builds:
+
+```blink
+@ffi.struct(header: "time.h", name: "timespec")
+type TsFloat { tv_sec: I64, tv_nsec: Float }    // builds: both fields have the C size and offset
+```
+
+An author checks those parts with `blink audit`, not with this test.
 
 The C compiler is the authority for the C ABI. The headers used at user-build time can differ from the layout in the `@ffi.struct` declaration (libc version bump, cross-compile platform mismatch, BSD vs glibc). The layout check finds this before linking.
 

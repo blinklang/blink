@@ -743,6 +743,7 @@ A stop of `blink build` is outside the Blink source when the cause is in the hos
 | Cause | What `blink build` reports | Exit |
 |-------|----------------------------|------|
 | A header that an `@ffi` declaration names is not on the host | `ForeignHeaderNotFound` (E0859), at the `@ffi` line (§9.1) | `1` |
+| An `@ffi.struct` mirror does not match its C struct on the target (§9.1.3) | `ForeignStructMismatch` (E0862), at the `@ffi.struct` line | `1` |
 | The prototype of an `@ffi` declaration does not match the C call: a `Ptr` to a different named C type | `ForeignPrototypeMismatch` (E0861), at the `@ffi` line (§9.1) | `1` |
 | The C name of an `@ffi let` is not an integer constant on the target, or its value does not fit | `ForeignConstInvalid` (E0855), at the declaration | `1` |
 | The link step fails: a native library is missing or lacks a symbol | `LinkFailed` (E0857) | `1` |
@@ -758,6 +759,19 @@ fn missing() -> Int ! ()
 // blink build: error[ForeignHeaderNotFound] (E0859) at the @ffi line, exit 1
 //   `no_such_header.h` was not found by the C compiler on this host
 ```
+
+**A struct mirror that does not match its C struct.** `blink build` and `blink test` test each `@ffi.struct` mirror against the C struct that its `header:` and `name:` name, on the target of the build. A mirror that fails is `ForeignStructMismatch` (E0862) at the `@ffi.struct` line, and the command exits `1`. No unit compiles. `blink check` reads no header and reports nothing. The five kinds, the span, the message and the order of the C tests are in §9.1.3 *Static layout assertions*. The test runs after the header test (E0859) and before the prototype test (E0861).
+
+```blink
+@ffi.struct(header: "time.h", name: "timespec")
+type Ts { tv_sec: I64, tv_nsec: I32 }
+// blink check: exit 0
+// blink build: error[ForeignStructMismatch] (E0862) at the @ffi.struct line, exit 1
+//   `@ffi.struct` `Ts` does not match C struct `timespec` on x86_64-linux-gnu:
+//   field `tv_nsec` has a different size (`I32` is 4 bytes)
+```
+
+An `@ffi.struct` mirror is a claim about C too, and it has its own test. A mirror that does not match its C struct is `ForeignStructMismatch` (E0862), never I0017. I0017 keeps only a stop that no test explains.
 
 **The C compiler that gave no verdict.** `blink build` runs a C compiler: `cc` for a host build, and `zig cc` for a build with `--target`. If that tool gives no verdict on the generated C, the cause is the host, not the source. The tool gives no verdict in two cases:
 

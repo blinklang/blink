@@ -295,3 +295,5 @@ Did not run. Q3a closed 5-1 in Phase C, and no seat objected to any settled item
 
 - Rust checks a generic body once, at its definition, against the declared bounds. A method call on an unbounded `T` is an error whether or not the function is called. Blink takes the same rule.
 - `rustc` exits 101 on an internal compiler error and 1 on a program error. Blink uses the same split for check and build.
+
+- A later decision moved a struct mirror that does not match its C struct from I0017 to `ForeignStructMismatch` (E0862): see [A Struct Mirror That Does Not Match Its C Struct](ffi-struct-layout-mismatch.md).
