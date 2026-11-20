@@ -329,7 +329,8 @@ typedef struct {
 } blink_child_box;
 
 #if defined(__linux__)
-/* glibc declares pipe2 only past _GNU_SOURCE, which runtime_core.h does not set. */
+/* A Linux libc that runtime_core.h does not find to be glibc gets _POSIX_C_SOURCE alone,
+   which hides pipe2. */
 int pipe2(int pipefd[2], int flags);
 #endif
 
@@ -705,7 +706,8 @@ typedef struct {
 static blink_cg_state blink_cg = BLINK_CG_STATE_INIT;
 #endif
 
-/* glibc and musl declare syscall only past _GNU_SOURCE or _DEFAULT_SOURCE. */
+/* glibc and musl declare syscall only past _GNU_SOURCE or _DEFAULT_SOURCE, and
+   runtime_core.h sets neither on musl. */
 long syscall(long number, ...);
 
 #ifndef BLINK_RUNTIME_DECLS_ONLY

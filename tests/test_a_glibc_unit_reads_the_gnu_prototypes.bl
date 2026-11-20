@@ -1,0 +1,102 @@
+// On glibc, each unit and each build probe define _DEFAULT_SOURCE and _GNU_SOURCE before any
+// header, so a call meets the prototype that a C program with those macros gets (section 9.1,
+// feature macros). The rows run only where the build target is glibc.
+import compile_test_helpers.{scratch_root, sh}
+import std.fs
+import foreign_const_probe.{probe_of}
+
+type Run {
+    ok: Bool
+    text: Str
+}
+
+fn run_of(src: Str, tag: Str, extra: List[Str]) -> Run ! FS.Write, Process.Spawn, Env.Read {
+    let path = "{scratch_root()}/{tag}.bl"
+    fs.write(path, src).unwrap()
+    let mut args = ["run", path]
+    for a in extra { args.push(a) }
+    let r = process.run("build/blink", args).unwrap()
+    Run { ok: r.success(), text: "{r.out}{r.err_out}" }
+}
+
+fn build_of(src: Str, tag: Str, extra: List[Str]) -> Run ! FS.Write, Process.Spawn, Env.Read {
+    let path = "{scratch_root()}/{tag}.bl"
+    fs.write(path, src).unwrap()
+    let mut args = ["build", path, "-o", "{scratch_root()}/{tag}"]
+    for a in extra { args.push(a) }
+    let r = process.run("build/blink", args).unwrap()
+    Run { ok: r.success(), text: "{r.out}{r.err_out}" }
+}
+
+// The test of runtime_core.h: glibc is the libc that ships gnu/libc-version.h.
+fn host_is_glibc() -> Bool ! Process.Spawn, IO.Print {
+    let yes = sh("printf '#include <gnu/libc-version.h>\\n' | cc -E -x c - >/dev/null 2>&1 && echo yes") == "yes"
+    if !yes { io.println("skip: the host libc is not glibc") }
+    yes
+}
+
+// GNU strerror_r returns a char pointer to the message, which need not be the buffer.
+let GNU_STRERROR_R = "@ffi(\"strerror_r\", header: \"string.h\")\n@trusted(audit: \"test\")\nfn c_strerror_r(code: I32, buf: Ptr[U8], len: Int) -> Ptr[U8] ! ()\n\nfn main() \{\n    with ffi.scope() as scope \{\n        let buf = scope.alloc_n[U8](256)\n        io.println(c_strerror_r(2, buf, 256).to_str() ?? \"none\")\n    \}\n\}\n"
+
+// glibc defines O_DIRECT only past _GNU_SOURCE.
+let O_DIRECT = "@ffi(\"O_DIRECT\", header: \"fcntl.h\")\npub let O_DIRECT_C: Int\n\nfn main() \{\n    io.println(\"\{O_DIRECT_C > 0}\")\n\}\n"
+
+// glibc shows struct ucred only past _GNU_SOURCE.
+let UCRED = "@ffi.struct(header: \"sys/socket.h\", name: \"ucred\")\ntype Ucred \{\n    pid: I32\n    uid: U32\n    gid: U32\n\}\n\nfn main() \{\n    with ffi.scope() as scope \{\n        let c: Ptr[Ucred] = scope.alloc[Ucred]()\n        c.uid.write(7)\n        io.println(\"\{c.uid.read()\}\")\n    \}\n\}\n"
+
+// macOS hides F_FULLFSYNC from a unit that asks for _POSIX_C_SOURCE alone.
+let FULLFSYNC = "@ffi(\"F_FULLFSYNC\", header: \"fcntl.h\")\npub let F_FULLFSYNC_C: Int\n\nfn main() \{\n    io.println(\"\{F_FULLFSYNC_C\}\")\n\}\n"
+
+test "strerror_r with a pointer return gives the GNU message" {
+    if !host_is_glibc() { return }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = run_of(GNU_STRERROR_R, "gnu_strerror_r", [mode])
+        assert(r.ok, "{mode}: got: {r.text}")
+        assert(r.text.contains("No such file or directory"), "{mode}: got: {r.text}")
+    }
+}
+
+test "a constant that only _GNU_SOURCE defines is visible to the build" {
+    if !host_is_glibc() { return }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = run_of(O_DIRECT, "gnu_o_direct", [mode])
+        assert(r.ok, "{mode}: got: {r.text}")
+        assert(r.text.contains("true"), "{mode}: got: {r.text}")
+    }
+}
+
+test "a struct that only _GNU_SOURCE shows is a mirror the build accepts" {
+    if !host_is_glibc() { return }
+    for mode in ["--per-module", "--no-per-module"] {
+        let r = run_of(UCRED, "gnu_ucred", [mode])
+        assert(r.ok, "{mode}: got: {r.text}")
+        assert(r.text.contains("7"), "{mode}: got: {r.text}")
+    }
+}
+
+test "a cross build for macOS reads a constant that _DARWIN_C_SOURCE shows" {
+    if sh("command -v zig") == "" { return }
+    let r = build_of(FULLFSYNC, "darwin_fullfsync_cross", ["--target", "aarch64-macos"])
+    assert(r.ok, "got: {r.text}")
+}
+
+test "a cross build for glibc reads the GNU prototype" {
+    if sh("command -v zig") == "" { return }
+    let r = build_of(GNU_STRERROR_R, "gnu_strerror_r_cross", ["--target", "aarch64-linux-gnu"])
+    assert(r.ok, "got: {r.text}")
+}
+
+// The constant probe writes its own copy of the block, so a change to one copy must reach the
+// other, or the probe and the unit read different prototypes.
+test "the constant probe writes the feature macro block of runtime_core.h" {
+    let core = fs.read("bootstrap/runtime_core.h").unwrap()
+    let start = "#if defined(__APPLE__)\n"
+    let end = "#define _POSIX_C_SOURCE 200809L\n#endif\n"
+    let from = core.byte_index_of(start, 0) ?? -1
+    assert(from >= 0, "runtime_core.h has no feature macro block")
+    let tail = core.byte_slice(from, core.byte_len())
+    let to = tail.byte_index_of(end, 0) ?? -1
+    assert(to >= 0, "runtime_core.h has no _POSIX_C_SOURCE line")
+    let block = tail.byte_slice(0, to + end.byte_len())
+    assert(probe_of([]).text.starts_with(block), "probe text: {probe_of([]).text}")
+}

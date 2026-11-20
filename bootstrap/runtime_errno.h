@@ -10,9 +10,10 @@
 //
 // strerror_r (not strerror) because the runtime ships threads: strerror shares
 // one process-wide buffer, so a concurrent call could overwrite it mid-copy.
-// glibc with _GNU_SOURCE selects the GNU variant (returns a pointer that may or
-// may not be the buffer); _POSIX_C_SOURCE alone, and macOS, select the XSI
-// variant (int return, always fills the buffer) — both are handled.
+// glibc, where runtime_core.h sets _GNU_SOURCE, selects the GNU variant (returns
+// a pointer that may or may not be the buffer); _POSIX_C_SOURCE alone, macOS, and
+// musl even past _GNU_SOURCE select the XSI variant (int return, always fills the
+// buffer) — both are handled.
 //
 // Declaration is unconditional; the body is guarded by BLINK_RUNTIME_DECLS_ONLY
 // so the archive monolith holds the one definition and every other TU sees only
@@ -24,7 +25,7 @@ BLINK_RT_FN const char* blink_strerror(int64_t code);
 BLINK_RT_FN const char* blink_strerror(int64_t code) {
     char buf[256];
     buf[0] = '\0';
-#if defined(_GNU_SOURCE) && !defined(__APPLE__)
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
     const char* msg = strerror_r((int)code, buf, sizeof(buf));
     return blink_str_from_cstr_gc(msg ? msg : "unknown error");
 #else

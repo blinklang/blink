@@ -1,6 +1,24 @@
 #ifndef BLINK_RUNTIME_CORE_H
 #define BLINK_RUNTIME_CORE_H
 
+/* The feature macros of the target libc (section 9.1). They come before any header, so a
+   unit and each build probe read the same prototypes. glibc is the libc that ships
+   gnu/libc-version.h; the check reads no header, so it sets no macro of its own. Any other
+   libc gets _POSIX_C_SOURCE alone. src/foreign_const_probe.bl writes the same block. */
+#if defined(__APPLE__)
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+#elif defined(__has_include)
+#if __has_include(<gnu/libc-version.h>)
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#endif
+#endif
 #if !defined(_POSIX_C_SOURCE) && !defined(_GNU_SOURCE) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -28,8 +46,9 @@
 #define GC_THREADS
 #include <gc.h>
 #if !defined(__APPLE__)
-/* glibc declares realpath only past plain _POSIX_C_SOURCE. The compiler calls an
-   @ffi("realpath") binding through this prototype, so the unit needs one on every host. */
+/* A libc that gets _POSIX_C_SOURCE alone, such as musl, declares realpath only past it. The
+   compiler calls an @ffi("realpath") binding through this prototype, so the unit needs one
+   on every host. */
 extern char* realpath(const char* __restrict path, char* __restrict resolved);
 #endif
 /* The vendored headers sit flat beside gc.h; a system install keeps this one under gc/. */

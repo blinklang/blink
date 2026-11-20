@@ -122,11 +122,11 @@ BLINK_RT_FN void blink_unix_socket_close(int64_t fd) {
    platform has no such call; that is decided before fd is looked at, so a call on -1 tells
    whether the check is supported here. The platform macros of the target choose the call, so
    no arch table or file read is needed.
-   Linux: glibc gives SO_PEERCRED and struct ucred only past _POSIX_C_SOURCE, which
-   runtime_core.h may set alone, so SO_PEERCRED comes from the kernel header, which has the
-   value for each arch, and a struct of the same fixed layout (pid, uid, gid) stands in for
-   struct ucred. macOS and the BSDs hide getpeereid under _POSIX_C_SOURCE, so it is declared
-   here as their headers do. */
+   Linux: a libc that gets _POSIX_C_SOURCE alone from runtime_core.h hides SO_PEERCRED and
+   struct ucred, so SO_PEERCRED then comes from the kernel header, which has the value for
+   each arch, and a struct of the same fixed layout (pid, uid, gid) stands in for struct
+   ucred. The BSDs hide getpeereid under _POSIX_C_SOURCE, so it is declared here as their
+   headers do. */
 #if defined(__linux__) && !defined(SO_PEERCRED)
 #include <asm/socket.h>
 #endif
@@ -237,7 +237,8 @@ BLINK_RT_FN int64_t blink_socket_write(int64_t fd, const char* data) {
    failed. None prints, and none removes a file: a path that exists fails bind with
    EADDRINUSE. */
 #if defined(__linux__)
-/* glibc declares accept4 only past _GNU_SOURCE, which runtime_core.h does not set. */
+/* A Linux libc that runtime_core.h does not find to be glibc gets _POSIX_C_SOURCE alone,
+   which hides accept4. */
 int accept4(int sockfd, struct sockaddr* addr, socklen_t* addrlen, int flags);
 #endif
 
