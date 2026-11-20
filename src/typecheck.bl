@@ -3723,6 +3723,9 @@ type CallFacts {
     // type of the parameter, `let`, field, assignment target or return that the closure meets.
     // An error on that () points there (sections/03_types.md 3.3).
     closure_expected_at: Map[Int, Int]
+    // Each fn value that meets a fn type at a parameter, `let`, field, assignment or return,
+    // with that type: the flows the fn type row check reads (tc_fr_check_flows).
+    fn_row_flows: Map[Int, Int]
     // The written return type of the fn, method or closure whose body the walk is in, or -1.
     ret_ann: Int
     // Each `if` with no `else` that E0304 reported where a value is needed.
@@ -3819,7 +3822,7 @@ type UseJudge {
 }
 
 fn new_call_facts() -> CallFacts {
-    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), self_heads: Map(), self_refused: Set(), builtin_heads: Set(), builtin_static_reads: Map(), trait_heads: Map(), closure_expected_at: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], method_values: Map(), method_value_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
+    CallFacts { open_calls: [], open_group: Map(), open_tids: [], reported: Map(), self_views: Map(), view_sigs: Map(), hash_aliases_above: [], derive_facts_above: [], derive_facts_low: 0, derive_facts_open: [], derive_facts_open_low: Map(), debug_unbuilt_seen: Map(), hash_by_bounds: false, static_head_insts: Map(), static_head_binders: Map(), impl_bound_calls: [], impl_bound_binds: Map(), deferred_uses: [], deferred_use_at: Map(), late_keys: [], late_roots: Map(), late_roots_valid: false, late_refused: Map(), late_open: [], late_replay: -1, late_watch: Map(), late_fixed_at: Map(), infer_at: -1, static_owners: Map(), self_heads: Map(), self_refused: Set(), builtin_heads: Set(), builtin_static_reads: Map(), trait_heads: Map(), closure_expected_at: Map(), fn_row_flows: Map(), ret_ann: -1, missing_else: Map(), walk_returns: [], written_names: Map(), under_fn_type: Map(), method_reads: Map(), method_read_order: [], method_values: Map(), method_value_order: [], impl_binder_key_roles: Map(), key_body: -1, key_binders_reported: Map(), tpl_ctx: [], tpl_lit: [], errored: Map(), answers_after_report: 0, lost_to_error: Map(), row_unknown_at: -1 }
 }
 let mut tc_calls: CallFacts = new_call_facts()
 
@@ -10402,6 +10405,7 @@ fn tc_check_arg_types_with_binds(fn_name: Str, sig: Int, args_sl: Int, self_offs
                 i = i + 1
                 continue
             } else if tc_tid_is_no_info(ptid) == 0 {
+                tc_note_fn_row_flow(arg_node, ptid)
                 tc_note_closure_expected_at(arg_node, tc_decl_param_type_ann(fs.decl, pidx), ptid)
                 // A type parameter that an earlier argument fixed joins the two arguments, and
                 // projection is no join; only a parameter written as a handler type projects.
@@ -10569,6 +10573,7 @@ fn check_one_arg_shape_at(fn_name: Str, idx: Int, arg_node: Int, ptid: Int, proj
 @allow(UnrestoredMutation)
 fn check_arg_value(label: Str, arg_idx: Int, expected_t: Int, value_node: Int, projects: Bool) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_tid_is_no_info(expected_t) != 0 { return }
+    tc_note_fn_row_flow(value_node, expected_t)
     tc_seed_expected_into_value(value_node, expected_t)
     let saved_hint = tc_construct_hint
     tc_construct_hint = resolve_alias_tid(expected_t)
@@ -12183,6 +12188,21 @@ fn tc_note_closure_expected_at(val: Int, ann: Int, expected: Int) {
     for p in tc_expected_parts(v, expected) { tc_note_closure_expected_at(p.value, ann, p.expected) }
 }
 
+// `val` takes the type `expected`. Each value in `val` that `expected` gives a fn type
+// (tc_expected_parts) is a flow of a fn value into that type, whose row it must fit. The flows
+// feed only the trace channel, so with the channel off no compile pays for them.
+fn tc_note_fn_row_flow(val: Int, expected: Int) {
+    if val == -1 || expected < 0 || !trace_gate_on("blink.fn_row") { return }
+    let v = if node_kind(val) == NodeKind.NamedArg { node_value(val) } else { val }
+    if v == -1 { return }
+    let parts = tc_expected_parts(v, expected)
+    if parts.len() > 0 {
+        for p in parts { tc_note_fn_row_flow(p.value, p.expected) }
+        return
+    }
+    if tc_tid_kind(resolve_alias_tid(tc_resolve(expected))) == TyKind.Fn { tc_calls.fn_row_flows.insert(v, expected) }
+}
+
 // The one function type written in `ann` that takes `arity` params and returns (): `ann`
 // itself, or one inside its arguments, as in `List[fn(Int)]`. -1 when there is none, or more
 // than one and the closure could meet either.
@@ -13285,7 +13305,10 @@ fn tc_check_call_against_fn_tid(fn_tid: Int, args_sl: Int, label: Str, node: Int
     while li < got {
         // A call argument is expression context (§2.9): an else-less `if` passed as an
         // argument has no value on the false path. Infer in value context.
-        if li < expected { tc_seed_expected_into_value(sublist_get(args_sl, li), ty_param_list.get(pstart + li).unwrap()) }
+        if li < expected {
+            tc_note_fn_row_flow(sublist_get(args_sl, li), ty_param_list.get(pstart + li).unwrap())
+            tc_seed_expected_into_value(sublist_get(args_sl, li), ty_param_list.get(pstart + li).unwrap())
+        }
         let arg_tid = tc_infer_value(sublist_get(args_sl, li))
         if li < expected {
             let ptid = ty_param_list.get(pstart + li).unwrap()
@@ -15970,6 +15993,7 @@ fn tc_check_struct_lit_field_closures(stid: Int, node: Int) ! TypeCheck.Resolve,
             let vk = node_kind(v)
             let declared = resolve_alias_tid(get_struct_field_tid(stid, node_name(f)))
             if type_kind(declared) == TyKind.Fn {
+                tc_note_fn_row_flow(v, declared)
                 tc_note_closure_expected_at(v, tc_struct_field_type_ann(stid, node_name(f)), declared)
                 if !tc_closure_field_waits(v, declared) { tc_check_struct_lit_fn_field(v, declared) }
             }
@@ -16010,6 +16034,7 @@ fn tc_check_struct_lit_fn_field(v: Int, declared: Int) ! TypeCheck.Resolve, Type
 // parameter at `at_inst`.
 fn tc_seed_declared_field(declared: Int, at_inst: Int, value_node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     if tc_tid_has_bare_typevar(declared) != 0 { return }
+    tc_note_fn_row_flow(value_node, at_inst)
     tc_seed_expected_into_value(value_node, at_inst)
 }
 
@@ -29732,6 +29757,7 @@ fn tc_infer_enum_structlit_field_values(enum_tid: Int, vname: Str, flds_sl: Int)
             // A closure or handler value is typed too, so tc_check_lit_field_values can hold it
             // to the field.
             if node_kind(v) == NodeKind.Closure && type_kind(declared) == TyKind.Fn {
+                tc_note_fn_row_flow(v, declared)
                 tc_check_struct_lit_fn_field(v, declared)
                 let _ = infer_type(v)
             } else if node_kind(v) == NodeKind.HandlerExpr {
@@ -43698,6 +43724,7 @@ fn tc_check_param_default_types(fn_name: Str, fn_node: Int, sig: Int) ! TypeChec
         if dflt != -1 {
             let ptid = fnsig_param_list.get(fs.params_start + i) ?? -1
             if ptid >= 0 && tc_tid_is_no_info(ptid) == 0 {
+                tc_note_fn_row_flow(dflt, ptid)
                 // A signature records the abstract `Self`, which fixes nothing in the default.
                 let _ = check_one_arg_shape(fn_name, i - receiver, dflt, tc_self_as_receiver(ptid), tc_handler_effect_of(ptid) != "")
             } else {
@@ -44497,8 +44524,8 @@ fn tc_panic_hook_closure_mismatch(cls: Int) -> Str ! TypeCheck.Resolve, TypeChec
     tc_panic_hook_namesake_mismatch(params, ret)
 }
 
-// `on_panic(f)` takes one `f: fn(PanicInfo) -> Never`, with whatever row `f` declares: a fn
-// type carries no row, so the row is not part of the check. The item itself holds no value.
+// `on_panic(f)` takes one `f: fn(PanicInfo) -> Never`, with whatever row `f` declares, so `f`
+// is checked against that type with a `_` row. The item itself holds no value.
 // @allow: publishing the item's and f's types is this fn's effect.
 @allow(UnrestoredMutation)
 fn tc_check_panic_hook_item(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
@@ -44518,7 +44545,8 @@ fn tc_check_panic_hook_item(item: Int) ! TypeCheck.Resolve, TypeCheck.Report, Di
             if closure_msg != "" {
                 tc_error_at(closure_msg, f)
             } else {
-                check_arg_value("on_panic", 0, hook_t, f, false)
+                let want = make_fn_type_with_row(TYPE_NEVER, [tc_panic_info_type()], "_")
+                check_arg_value("on_panic", 0, want, f, false)
             }
         }
     }
@@ -47144,6 +47172,7 @@ fn tc_infer_returned_value(val: Int, returns_value: Bool) -> Int ! TypeCheck.Res
     // closure body reads its signature from it while it is walked. Inside a closure
     // body tc_current_fn_ret is that closure's own return (tc_check_closure_body_against_own_ret).
     if returns_value {
+        tc_note_fn_row_flow(val, tc_current_fn_ret)
         tc_note_closure_expected_at(val, tc_calls.ret_ann, tc_current_fn_ret)
         tc_seed_expected_into_value(val, tc_current_fn_ret)
     }
@@ -47187,6 +47216,7 @@ fn tc_check_assignment(node: Int, block: Int, at: Int) ! TypeCheck.Resolve, Type
         let first = diag_entry_count()
         tc_check_assign_root(node, block, at)
         let root_reported = diag_entry_count() > first
+        tc_note_fn_row_flow(val, target_t)
         tc_note_closure_expected_at(val, tc_assign_target_type_ann(target), target_t)
         let val_t = tc_infer_assigned_value(target_t, val)
         if kind == NodeKind.CompoundAssign {
@@ -47258,6 +47288,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
             let seed_tail = tc_block_tail_stmt(node)
             if seed_tail != -1 {
                 if tc_block_tail_value(seed_tail) != -1 { hint_tail = seed_tail }
+                tc_note_fn_row_flow(tc_block_tail_value(seed_tail), tc_current_fn_ret)
                 tc_note_closure_expected_at(tc_block_tail_value(seed_tail), tc_calls.ret_ann, tc_current_fn_ret)
                 tc_seed_expected_into_value(tc_block_tail_value(seed_tail), tc_current_fn_ret)
             }
@@ -47361,6 +47392,7 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
 
         let mut inferred_tid = TYPE_UNKNOWN
         if val != -1 {
+            tc_note_fn_row_flow(val, declared_tid)
             tc_note_closure_expected_at(val, type_ann, declared_tid)
             tc_seed_expected_into_value(val, declared_tid)
             // With no annotation the value has no expected type: the expectation of the block
@@ -49275,6 +49307,7 @@ fn tc_stamp_annotated_global_init(l: Int, l_val: Int) ! TypeCheck.Resolve, TypeC
     // A binding its module declares twice (E1016) is read as the recovery type, but its own
     // initializer still answers to its own annotation, so an empty `[]` there is not open.
     let declared = if tc_value_decl_poisoned(l) { tc_module_let_written_tid(l) } else { tc_lookup_node_tid(l) }
+    tc_note_fn_row_flow(l_val, declared)
     tc_seed_expected_into_value(l_val, declared)
     let hint = if tc_tid_is_no_info(declared) == 0 { resolve_alias_tid(declared) } else { tc_construct_hint }
     let v_tid = tc_infer_walked_let_value(l_val, tc_let_binder_name(l), hint)
@@ -52094,6 +52127,10 @@ type ErOwner {
     root: Bool
     // The on_panic item the program installs, or -1 (see tc_check_panic_hook_placement).
     hook: Int
+    // A walk that reads the row of a fn value's body and reports nothing: each effect the body
+    // needs that `held` lacks goes to `missed` (tc_fr_value_row).
+    collect: Bool
+    missed: List[Str]
 }
 
 // A root has no row to add an effect to, so the report asks for a handler (§4.6).
@@ -52113,6 +52150,10 @@ fn tc_er_default_body_help(owner: Str) -> Str {
 
 fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, callee: Str, req: Str) ! Diag.Report {
     if tc_er_satisfied(program, held, req) { return }
+    if owner.collect {
+        tc_fr_note_missed(owner, req)
+        return
+    }
     if req == "_" && owner.default_body {
         diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
             "call to `{callee}` needs effect `_`, which the default body of `{owner.name}` may not perform", site,
@@ -52174,6 +52215,10 @@ fn tc_er_require_op(program: Int, site: Int, held: List[Str], owner: ErOwner, op
         if !tc_er_satisfied(program, held, req) { unmet.push(req) }
     }
     if unmet.is_empty() { return }
+    if owner.collect {
+        for req in unmet { tc_fr_note_missed(owner, req) }
+        return
+    }
     let line = node_line(site)
     let col = node_col(site)
     let end_col = if tc_source_spells_at(site, op) { col + op.byte_len() } else { 0 }
@@ -52455,8 +52500,17 @@ fn tc_er_charge_call(program: Int, node: Int, held: List[Str], owner: ErOwner, f
         CallReach.Fn | CallReach.LetValue | CallReach.Variant => {
             if f.decl >= 0 { tc_er_require_sig_row(program, node, held, owner, f.decl, -1) }
         }
-        CallReach.Value | CallReach.Builtin | CallReach.BuiltinMethod | CallReach.Derived | CallReach.BuiltinRecvImpl | CallReach.Poison => {}
-        CallReach.Unknown => tc_note_call_row_unknown(node)
+        CallReach.Value => {
+            // A run of a fn value is not charged yet; the row of its fn type is still part of
+            // the row of a body that runs it.
+            if owner.collect {
+                for req in tc_fr_type_row(tc_fr_callee_tid(node)) { tc_er_require(program, node, held, owner, "", req) }
+            }
+        }
+        CallReach.Builtin | CallReach.BuiltinMethod | CallReach.Derived | CallReach.BuiltinRecvImpl | CallReach.Poison => {}
+        // A collect walk can reach a body no check walks, a test block's, whose unknown call
+        // must not stand as an internal error.
+        CallReach.Unknown => if !owner.collect { tc_note_call_row_unknown(node) }
     }
 }
 
@@ -52861,6 +52915,10 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
         // A Closeable bound also holds BlockHandler; its `_` is the row of close (§4.7.2).
         let mn = if tc_pipe_has(traits, "Closeable") != 0 { "close" } else if tc_pipe_has(traits, "BlockHandler") != 0 { "enter` and `{tname}.exit" } else { "" }
         if mn == "" { return }
+        if owner.collect {
+            tc_fr_note_missed(owner, "_")
+            return
+        }
         if owner.default_body {
             diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
                 "with item of type `{tname}` runs `{tname}.{mn}`, which the default body of `{owner.name}` may not perform", item,
@@ -52923,6 +52981,10 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
             }
         }
         i = i + 1
+    }
+    if owner.collect {
+        for req in missing { tc_fr_note_missed(owner, req) }
+        return
     }
     let mut k = 0
     while k < missing.len() {
@@ -53043,7 +53105,8 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
     if tc_is_default_fill(node) { return }
     let k = node_kind(node)
     if k == NodeKind.FnDef {
-        tc_er_walk_fn(program, node, owner.msg_ran, owner.assigns, owner.hook, kids)
+        // A nested fn runs only where it is called, so it adds nothing to the row collected.
+        if !owner.collect { tc_er_walk_fn(program, node, owner.msg_ran, owner.assigns, owner.hook, kids) }
         return
     }
     if k == NodeKind.WithBlock {
@@ -53086,7 +53149,7 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
         tc_er_check_call(program, node, held, owner)
         tc_er_check_fn_values_run(program, node, held, owner)
     }
-    if k == NodeKind.MethodCall { tc_er_check_helper_fix(program, node, held) }
+    if k == NodeKind.MethodCall && !owner.collect { tc_er_check_helper_fix(program, node, held) }
     // One child buffer serves the whole descent: each node appends its children, walks them,
     // and gives the slots back, so a body is walked without a list per node.
     let base = kids.len()
@@ -53108,7 +53171,7 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
 fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], hook: Int, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
     tc_er_check_wild_source(fn_node)
     if tc_is_entry_main(fn_node) {
-        tc_er_walk(program, node_body(fn_node), builtin_effect_tree_roots(), ErOwner { name: node_name(fn_node), decl: fn_node, default_body: false, msg_ran: msg_ran, assigns: assigns, root: true, hook: hook }, kids)
+        tc_er_walk(program, node_body(fn_node), builtin_effect_tree_roots(), ErOwner { name: node_name(fn_node), decl: fn_node, default_body: false, msg_ran: msg_ran, assigns: assigns, root: true, hook: hook, collect: false, missed: [] }, kids)
         return
     }
     let block = tc_method_block.get(fn_node) ?? -1
@@ -53120,7 +53183,7 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int
     for e in tc_er_fn_row(fn_node) {
         if !(default_body && e == "_") { held.push(e) }
     }
-    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook }, kids)
+    tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook, collect: false, missed: [] }, kids)
 }
 
 // An impl method's row may narrow its trait method's row but not widen it, so a bound
@@ -53289,8 +53352,80 @@ fn tc_check_effect_rows(program: Int, msg_ran: Set[Int], hook: Int) ! TypeCheck.
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {
         match tc_ue.op_root.get(op) {
-            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook }, kids)
+            Some(ed) => tc_er_walk(program, node_body(op), [tc_er_op_effect(ed, op)], ErOwner { name: "{tc_er_op_effect(ed, op)}.{node_name(op)}", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook, collect: false, missed: [] }, kids)
             None => {}
         }
     }
+    tc_fr_check_flows(program, msg_ran, assigns, hook)
+}
+
+// ── Rows of fn types (§4.15.1) ───────────────────────────────────────
+// A fn value may flow into a fn type only if the type's row admits the value's row. The check
+// reports nothing yet: each flow that the row does not admit is a line on the trace channel
+// `blink.fn_row`, until src, lib/std and tests write the rows their fn types need.
+fn tc_fr_check_flows(program: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], hook: Int) ! TypeCheck.Resolve, Diag.Report {
+    let mut kids: List[Int] = []
+    let mut vals: List[Int] = []
+    for (v, _) in tc_calls.fn_row_flows { vals.push(v) }
+    for v in vals.sort() {
+        let want = resolve_alias_tid(tc_resolve(tc_calls.fn_row_flows.get(v) ?? -1))
+        if want < 0 || tc_tid_kind(want) != TyKind.Fn { continue }
+        let admits = tc_fr_type_row(want)
+        // `_` takes the row of the value it is given (§4.15.2).
+        if admits.contains("_") { continue }
+        let got = tc_fr_value_row(program, v, msg_ran, assigns, hook, kids)
+        let mut over = false
+        for e in got {
+            if !tc_er_satisfied(program, admits, e) { over = true }
+        }
+        if over {
+            let at = "{diag_file_for_node(v)}:{node_line(v)}:{node_col(v)}"
+            let shown = type_to_str(want)
+            let row = got.sort().join(", ")
+            trace.log("blink.fn_row", "{at} {shown} <- ! {row}")
+        }
+    }
+}
+
+// The row a fn value runs: a named fn's declared row, read as a call through the value reads
+// it; a closure's body, which a `with` around the literal does not reach, since the body runs
+// where the closure is called; and for any other value, a parameter or a field, its fn type's.
+fn tc_fr_value_row(program: Int, v: Int, msg_ran: Set[Int], assigns: Map[Int, List[Int]], hook: Int, kids: List[Int]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let owner = ErOwner { name: "", decl: -1, default_body: false, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook, collect: true, missed: [] }
+    let cs = tc_tm_closures_of([v], assigns)
+    if cs.len() == 0 {
+        for e in tc_fr_type_row(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(v)))) { tc_fr_note_missed(owner, e) }
+        return owner.missed
+    }
+    for c in cs {
+        if node_kind(c) == NodeKind.FnDef {
+            tc_er_require_sig_row(program, v, [], owner, c, v)
+        } else {
+            tc_er_walk(program, node_body(c), [], owner, kids)
+        }
+    }
+    owner.missed
+}
+
+fn tc_fr_note_missed(owner: ErOwner, req: Str) {
+    if !owner.missed.contains(req) { owner.missed.push(req) }
+}
+
+// The effects in the row of fn type `t`; none for a type that is no fn type.
+fn tc_fr_type_row(t: Int) -> List[Str] {
+    if t < 0 || tc_tid_kind(t) != TyKind.Fn { return [] }
+    let key = ty_pool.get(t).unwrap().row
+    if key == "" { [] } else { key.split(", ") }
+}
+
+// The fn type a call through a value runs: the callee's, or for `s.f()` the field `f`'s.
+fn tc_fr_callee_tid(node: Int) -> Int ! TypeCheck.Resolve {
+    if node_kind(node) == NodeKind.Call { return resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_left(node)))) }
+    if node_kind(node) != NodeKind.MethodCall { return -1 }
+    let recv = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(node_obj(node))))
+    if recv < 0 || tc_tid_is_no_info(recv) != 0 { return -1 }
+    let k = tc_tid_kind(recv)
+    if k != TyKind.Struct && k != TyKind.Enum { return -1 }
+    let f = tc_field_tid_at_instance(recv, node_method(node))
+    if f < 0 { -1 } else { resolve_alias_tid(tc_resolve(f)) }
 }
