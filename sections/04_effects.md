@@ -2618,13 +2618,57 @@ let bad = process.run("./t", [], limits: ChildLimits { memory: Some(0) })
 
 If the host supports `memory` and the runtime fails to write the cgroup (for example, `EACCES` from the write), the call gives `Err` with `EACCES`, and no child starts. It does not give `ENOTSUP`.
 
-**A deadline holds whether or not anyone waits.** A deadline is a property of the child, not of the code that waits for it. A child that `process.spawn` started with a `timeout` ends at its deadline even if this program never calls `process.wait` on it, or calls it much later. The same is true of the leader's exit: the tree of a limited child ends at the first of the exit of its leader and its deadline, then SIGTERM, `grace`, SIGKILL. This holds on every path (`run`, `spawn` with no `wait`, with an early `wait`, with a late `wait`) and for a child that has only `memory` or only `processes`. The runtime starts one watcher the first time a limited child starts. A program that never starts a limited child starts no watcher and pays nothing. The watcher only sends signals. It never reaps a child, so `process.wait` still gets the result of the child, with `end` equal to `Limit(Timeout)` or to the real end of the leader.
+**A deadline holds whether or not anyone waits.** A deadline is a property of the child, not of the code that waits for it. A child that `process.spawn` started with a `timeout` ends at its deadline even if this program never calls `process.wait` on it, or calls it much later. The same is true of the leader's exit: the tree of a limited child ends at the first of the exit of its leader and its deadline, then SIGTERM, `grace`, SIGKILL. This holds on every path (`run`, `spawn` with no `wait`, with an early `wait`, with a late `wait`) and for a child that has only `memory` or only `processes`. The runtime starts one watcher the first time a limited child starts. A program that never starts a limited child starts no watcher and pays nothing. From the start of a limited child, the watcher also reads both pipes of that child (standard output and standard error) into a buffer that belongs to that child. Apart from this, it only sends signals. It never reaps a child, so `process.wait` still gets the result of the child, with `end` equal to `Limit(Timeout)` or to the real end of the leader.
 
 ```blink
 let c = process.spawn("sh", ["-c", "sleep 600 & exit 0"],
     limits: ChildLimits { memory: Some(256 * 1024 * 1024) })?
 // nobody waits: the sleep still ends right after sh exits (plus grace)
 // a wait at any time later gives Exited(0)
+```
+
+**A late wait on a limited child gives the same result as `run`.** The watcher reads the pipes of a limited child until the point where `run` stops reading: the exit of the leader and then the read to end of file (*The leader exits first*), or `timeout + grace + δ`, whichever comes first. `process.wait` takes the buffer and goes on from there. So a late `wait`, an early `wait` and `run` give the same `end` and the same `out` and `err_out` for the same child, on every host. The size of the pipe of the host never decides the `end`, and a limited child never blocks in `write` because nobody reads. The spec sets no limit on the size of the buffer: `out` stays everything that the child wrote before it ended.
+
+```blink
+let lim = ChildLimits { timeout: Some(Duration.ms(1200)), grace: Duration.nanos(0) }
+let c = process.spawn("sh", ["-c", "head -c 50000 /dev/zero | tr '\\0' x"], limits: lim)?
+let _ = process.run("sleep", ["1.5"])?
+let r = process.wait(c)?
+// r.end == Exited(0) and r.out.len() == 50000, on a pipe of 8 KiB and on a pipe of 64 KiB
+// the same child under process.run, or under process.wait at once, gives the same
+
+let big = process.spawn("sh", ["-c", "head -c 200000 /dev/zero | tr '\\0' x"], limits: lim)?
+let _ = process.run("sleep", ["1.5"])?
+let b = process.wait(big)?
+// b.end == Exited(0) and b.out.len() == 200000
+```
+
+The `timeout + grace + δ` bound holds while a child writes without end: a child that never stops writing does not delay the deadline of this child or of any other limited child.
+
+```blink
+let lim = ChildLimits { timeout: Some(Duration.seconds(1)), grace: Duration.nanos(0) }
+let c = process.spawn("sh", ["-c", "yes"], limits: lim)?
+let r = process.wait(c)?
+// returns at about 1 s: r.end == Limit(Timeout), and r.out holds what `yes` wrote in that time
+```
+
+The program holds this output in memory until `process.wait` takes it, until the runtime reaps an unreachable `Child` (*The runtime may reap an unreachable child*), or until the program ends. A limited child that the program never waits on holds what it wrote:
+
+```blink
+let lim = ChildLimits { timeout: Some(Duration.seconds(60)) }
+let _c = process.spawn("sh", ["-c", "head -c 1073741824 /dev/zero"], limits: lim)?
+// nobody waits: the child writes 1 GiB and ends Exited(0)
+// the runtime holds what it read until it reaps the unreachable Child or the program ends
+```
+
+**A child with no limit is not read before `wait`.** A child with no limit has no deadline, no watcher and no buffer. If it writes more than its pipe holds, it blocks in `write` until `process.wait` reads both pipes. That changes only the time. Its `end` and its `out` are the same as for `run`, and it loses no output.
+
+```blink
+let u = process.spawn("sh", ["-c", "head -c 200000 /dev/zero | tr '\\0' x"])?
+let _ = process.run("sleep", ["1.5"])?
+// u blocks in write when the pipe is full, and waits for process.wait
+let v = process.wait(u)?
+// v.end == Exited(0) and v.out.len() == 200000 on every host; only the time changes
 ```
 
 **The runtime cannot signal the child.** A child can leave the reach of a signal, for example when it runs a program that raises its user ID, such as `pkexec`. At the deadline the runtime signals the leader by its own pid, as well as the group. When the signal to the leader itself fails with `EPERM`, `run` and `wait` give `Err` with `code` equal to `EPERM`, and not `Ok` with `Limit(Timeout)`. `Limit(Timeout)` would say that the limit ended the child, and the child may still be alive. So `EPERM` from `run` or `wait` on a limited child means that the limit could not be enforced, and the child may still be alive. It does not mean that the child failed to start. The test is the signal to the leader, not the call to the group: a group call that reaches another member succeeds, and it proves nothing about the leader. `Err(EPERM)` if and only if the signal to the leader itself fails. There is no check at start: a call for a set-user-ID program starts it, because the mode of a file does not tell whether the runtime can signal the process that results (`sudo` is set-user-ID, and the runtime can signal it).
@@ -2753,7 +2797,7 @@ fn run_with_deadline(cmd: Str, args: List[Str], limit: Duration) -> Result[Proce
 }
 ```
 
-**Spawn can fail for a full table.** The runtime keeps its own cap on the children that were spawned and not yet waited. The spec gives no number for it, and the cap is not the first limit that a program meets: the limits of the operating system, such as the count of open files, come first on a usual host. When the cap is full, `process.spawn` gives `Err` with `EAGAIN`, and no child starts. There is no new error variant. When the operating system fails a step of the start, the `Err` holds the errno of that step: `EAGAIN` from the process limit of the user, `EMFILE` or `ENFILE` from the pipes of the child, or `ENOMEM`. The text of the `Err` may say that there are too many children not yet waited. A program that spawns many children waits on every `Child` it spawns, so the table empties. `process.run` does not count against the cap, and children that were spawned and not waited do not make `process.run` fail.
+**Spawn can fail for a full table.** The runtime keeps its own cap on the children that were spawned and not yet waited. The spec gives no number for it, and the cap is not the first limit that a program meets: the limits of the operating system, such as the count of open files, come first on a usual host. When the cap is full, `process.spawn` gives `Err` with `EAGAIN`, and no child starts. There is no new error variant. When the operating system fails a step of the start, the `Err` holds the errno of that step: `EAGAIN` from the process limit of the user, `EMFILE` or `ENFILE` from the pipes of the child, or `ENOMEM`. The text of the `Err` may say that there are too many children not yet waited. A program that spawns many children waits on every `Child` it spawns, so the table empties. A limited child that was not waited holds the output it wrote in memory until `wait`, until the runtime reaps it, or until the program ends, so waiting on every `Child` also frees that memory. `process.run` does not count against the cap, and children that were spawned and not waited do not make `process.run` fail.
 
 ```blink
 fn start_all(cmds: List[Str]) -> Result[List[Child], ProcessError] ! Process.Spawn {
