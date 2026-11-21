@@ -743,6 +743,7 @@ A stop of `blink build` is outside the Blink source when the cause is in the hos
 | Cause | What `blink build` reports | Exit |
 |-------|----------------------------|------|
 | A header that an `@ffi` declaration names is not on the host | `ForeignHeaderNotFound` (E0859), at the `@ffi` line (§9.1) | `1` |
+| A header that an `@ffi` declaration names does not compile alone with the C compiler, flags and pins of the unit (§9.1, *A header that does not compile alone*) | `ForeignHeaderDidNotCompile` (E0863), at the first `@ffi` line that names it | `1` |
 | An `@ffi.struct` mirror does not match its C struct on the target (§9.1.3) | `ForeignStructMismatch` (E0862), at the `@ffi.struct` line | `1` |
 | The prototype of an `@ffi` declaration does not match the C call: a `Ptr` to a different named C type, a binding with no `header:` against the prototype of another header of the unit, or a named header that does not declare the symbol for the target | `ForeignPrototypeMismatch` (E0861), at the `@ffi` line (§9.1) | `1` |
 | The C name of an `@ffi let` is not an integer constant on the target, or its value does not fit | `ForeignConstInvalid` (E0855), at the declaration | `1` |
@@ -750,7 +751,7 @@ A stop of `blink build` is outside the Blink source when the cause is in the hos
 | A vendored native dependency does not compile | `NativeDependencyBuildFailed` (E0858) | `1` |
 | The C compiler gave no verdict: it could not start, or a signal ended it | `CCompilerDidNotRun` (E0860), no span | `1` |
 
-An `@ffi` signature is the claim of the author about C (§9.1). `blink check` cannot test the claim. If the claim is wrong, `blink build` tests the prototype and can stop with E0861. A wrong claim that the test does not find can still make the C compiler reject the C that the compiler wrote. That stop is `GeneratedCDidNotCompile` (I0017), and its note names the `@ffi` declarations of the program (§8.10.5). A program with no `@ffi` declaration and no native dependency gets no such note: the cause is a bug of the compiler.
+An `@ffi` signature is the claim of the author about C (§9.1). `blink check` cannot test the claim. If the claim is wrong, `blink build` tests the prototype and can stop with E0861. A wrong claim that the test does not find can still make the C compiler reject the C that the compiler wrote. A header that does not compile alone is `ForeignHeaderDidNotCompile` (E0863), not I0017. That stop is `GeneratedCDidNotCompile` (I0017), and its note names the `@ffi` declarations of the program (§8.10.5). A program with no `@ffi` declaration and no native dependency gets no such note: the cause is a bug of the compiler.
 
 ```blink
 @ffi("no_such_header_fn", header: "no_such_header.h")
@@ -760,7 +761,7 @@ fn missing() -> Int ! ()
 //   `no_such_header.h` was not found by the C compiler on this host
 ```
 
-**A struct mirror that does not match its C struct.** `blink build` and `blink test` test each `@ffi.struct` mirror against the C struct that its `header:` and `name:` name, on the target of the build. A mirror that fails is `ForeignStructMismatch` (E0862) at the `@ffi.struct` line, and the command exits `1`. No unit compiles. `blink check` reads no header and reports nothing. The five kinds, the span, the message and the order of the C tests are in §9.1.3 *Static layout assertions*. The test runs after the header test (E0859) and before the prototype test (E0861).
+**A struct mirror that does not match its C struct.** `blink build` and `blink test` test each `@ffi.struct` mirror against the C struct that its `header:` and `name:` name, on the target of the build. A mirror that fails is `ForeignStructMismatch` (E0862) at the `@ffi.struct` line, and the command exits `1`. No unit compiles. `blink check` reads no header and reports nothing. The five kinds, the span, the message and the order of the C tests are in §9.1.3 *Static layout assertions*. The test runs after the header test (E0859) and the header-alone compile (E0863), and before the prototype test (E0861).
 
 ```blink
 @ffi.struct(header: "time.h", name: "timespec")

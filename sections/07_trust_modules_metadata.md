@@ -116,11 +116,78 @@ fn c_compress(src: Ptr[U8], n: Int) -> Int ! ()
 //   help: install the library that provides `zstd.h`
 ```
 
-**The prototype test.** After the header test passes, `blink build` and `blink test` test the prototype of each `@ffi` declaration. The test compiles the C call that the declaration gives against the prototype in the header. It uses the same C compiler, target, include paths and vendored native directories as the unit compile. It reads only pass or fail, and it does not read the text of the C compiler. A declaration that fails is `ForeignPrototypeMismatch` (E0861) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3). `blink check` does not run the test.
+**A header that does not compile alone.** After the header test passes, `blink build`, `blink test` and `blink run` compile each header that an `@ffi` declaration names, alone, in a unit that holds only `#include` of that header. The compile uses the C compiler, the target, the include paths, the vendored native directories, the flags and the pins of the unit compile (*The prototype test*, below). It reads only the exit status. A header that fails is `ForeignHeaderDidNotCompile` (E0863), and the command exits `1`. The unit compile does not start (§6.7.3). `blink check` runs no C compiler, so it shows nothing. No `ForeignStructMismatch` (E0862) and no `ForeignPrototypeMismatch` (E0861) shows for a declaration that names that header: the header is the cause, and the probes of E0862 and E0861 would all fail for it. The compiler may run this compile first, or only after another probe fails, or as part of the header test. Each choice gives the same output.
 
-The test and the unit compile both pass `-Werror=incompatible-pointer-types -Werror=int-conversion`, so one source gives one verdict on every host. The supported C compilers are gcc 13 and later, clang and `zig cc`. `tcc` ignores these two flags: under `tcc` the test and the unit compile accept a mismatch that the other compilers refuse, so E0861 does not fire. Every probe of the test compiles with `-c` to a temporary object file. No probe uses `-fsyntax-only`: `zig cc` can report a failure for correct C under that flag, and a false failure is a false E0861.
+The report holds one E0863 for each header, not for each declaration. The primary span is the first `@ffi` line, in source order, that names the header. A secondary label marks the `header:` argument of that line. A note lists the other `@ffi` lines that name the header. A second note copies the first 10 lines of the output of the C compiler, as the C compiler wrote them. The compiler copies the text and does not read it.
+
+The two help lines offer two fixes. The second fix says that the call is then unchecked, because the compiler never says "remove `header:`" alone.
+
+```blink
+@ffi("mylib", "mylib_get", header: "mylib.h")
+@trusted(audit: "MYLIB-GET")
+fn c_get() -> I32 ! ()
+```
+
+```c
+// mylib.h
+static inline int mylib_peek(int *p) { long *q = p; return (int)*q; }
+int mylib_get(void);
+```
+
+```
+$ blink build main.bl
+error[ForeignHeaderDidNotCompile] (E0863): header `mylib.h` does not compile with this C compiler (x86_64-linux-gnu)
+  --> main.bl:1:1
+  label on `header:`: this header
+  note: the C compiler said (first 10 lines):
+        mylib.h: In function 'mylib_peek':
+        mylib.h:1:51: error: initialization of 'long int *' from incompatible pointer type 'int *' [-Wincompatible-pointer-types]
+  help: point `header:` at a header of your own that declares only the symbols that you bind
+  help: or remove `header:`; the call then uses the prototype of this declaration, and the compiler does not check it
+$ echo $?
+1
+```
+
+The text after `note: the C compiler said` is the text of the C compiler, so it differs between compilers and versions. The pins apply to the whole compile, header code included. A header fault that is only a plain warning changes nothing, and the build prints nothing for it. This header makes the C compiler print a warning, and the build passes without a word about it:
+
+```c
+// warn.h
+#warning "warn.h is old"
+int warn_get(int x);
+```
+
+```
+$ blink build main.bl
+built: build/main
+$ echo $?
+0
+```
+
+**The prototype test.** After the header test and the header-alone compile pass, `blink build` and `blink test` test the prototype of each `@ffi` declaration. The test compiles the C call that the declaration gives against the prototype in the header. It uses the same C compiler, target, include paths and vendored native directories as the unit compile. It reads only pass or fail, and it does not read the text of the C compiler. A declaration that fails is `ForeignPrototypeMismatch` (E0861) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3). `blink check` does not run the test.
+
+The header-alone compile, the test and the unit compile all pass `-Werror=incompatible-pointer-types -Werror=int-conversion`, so one source gives one verdict on every host. The pins apply to the whole compile, header code included. The pins come last on the command line, after every flag that the user adds, so a user flag cannot turn a pin off by its place. The supported C compilers are gcc 13 and later, clang and `zig cc`. `tcc` ignores these two flags: under `tcc` the test and the unit compile accept a pointer type mismatch that the other compilers refuse, so E0861 does not fire for one. `tcc` still refuses a call with a wrong count of arguments, and E0861 fires for that. The build tells the user what the C compiler does not check (*A C compiler that accepts a pointer type mismatch*, below). Every probe of the test compiles with `-c` to a temporary object file. No probe uses `-fsyntax-only`: `zig cc` can report a failure for correct C under that flag, and a false failure is a false E0861.
 
 The test finds what the C compiler rejects when the generated call meets the prototype. The usual cause is a pointer to a different named C type. *A `Ptr` at an `@ffi` Call* (§9.1.1) gives the pointee rules. The test does not find a wrong scalar width or a wrong scalar pointee (`Ptr[I32]` for a `long *`): those are the claim of the author (*Signature Types*, below), and `blink audit` marks them (§9.1, *`blink audit` — FFI Inventory*).
+
+**A C compiler that accepts a pointer type mismatch.** Some C compilers accept a pointer type mismatch under the pins: `tcc` ignores both flags, and a flag of the user can have the same effect. The prototype test cannot find a wrong pointer type there, and a build that passes is not proof that the types are right. So the build runs one canary probe: a C call that passes a pointer of one type where the prototype takes a pointer of another type, compiled with the C compiler and the flags of the unit, pins last. A C compiler that follows the pins refuses it. The result is kept for the C compiler and its flags, so the canary does not run again for the same pair. The compiler does not look at the name of the C compiler.
+
+If the canary compiles, and the program has any `@ffi` fn, the build prints one note, once per build. The note is not a warning: `--strict` does not fail on it, and the exit is `0`. It says "pointer type mismatch" and not more, because a C compiler that accepts one can still refuse another error, such as a wrong count of arguments.
+
+```blink
+@ffi("getpid", header: "unistd.h")
+@trusted(audit: "UNISTD-GETPID")
+fn c_getpid() -> I32 ! ()
+```
+
+```
+$ blink build main.bl        # the C compiler is tcc
+note: this C compiler accepts a pointer type mismatch, so the prototype test cannot find a wrong pointer type in an `@ffi` declaration
+built: build/main
+$ echo $?
+0
+```
+
+"Any `@ffi` fn" means every `@ffi` fn that the build compiles, with or without `header:`, and the `@ffi` fns of the standard library too. The standard library binds C functions, so the note shows on nearly every build with `tcc`. The note is true there: the build does not check the pointer types of those bindings either. A program with no `@ffi` fn, its own or from a library, gets no note, and neither does a C compiler that refuses the canary. `blink check` runs no C compiler and prints no note.
 
 **What E0861 prints.** A declaration that passes costs one probe. A declaration that fails gets more probes (*The probes*, below), and each fact in the message is the result of one of them. The message states two kinds of fact only: what a pass or fail proved, and what the compiler knows from the declaration. It never prints a C type that no probe proved: no struct tag, no typedef name, and no `const` that the test did not see. For this reason it says "a pointer to `int`", not "takes `int *`". The report has these parts:
 
@@ -404,7 +471,16 @@ fn c_memfd_create(name: Ptr[U8], flags: U32) -> I32 ! ()
 
 On Linux the same declaration passes, because the header declares `memfd_create` there. This case has no slot line, no label and no probe of the slots: the call does not name a prototype, so the probes of *The probes* have nothing to test. It has the one help and the note above, and no other text.
 
-`blink build` and `blink test` run three C tests, in this order, before they compile the unit: the header test (E0859), the layout test of each `@ffi.struct` mirror (E0862, §9.1.3 *Static layout assertions*), and the prototype test (E0861). If the header is there, the layout test and the prototype test pass, but the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype that the test did not find can also cause it (§8.10.5). An example is a build with `tcc`.
+`blink build` and `blink test` run four C tests, in this order, before they compile the unit: the header test (E0859), the header-alone compile of each header (E0863), the layout test of each `@ffi.struct` mirror (E0862, §9.1.3 *Static layout assertions*), and the prototype test (E0861). `blink run` runs the same tests. The verdict comes from pass or fail only:
+
+| Header alone | Layout test and prototype test | Unit compile | Result |
+|--------------|--------------------------------|--------------|--------|
+| fails | not read | does not start | `ForeignHeaderDidNotCompile` (E0863), exit `1` |
+| passes | a test fails | does not start | `ForeignStructMismatch` (E0862) or `ForeignPrototypeMismatch` (E0861), exit `1` |
+| passes | both pass | fails | `GeneratedCDidNotCompile` (I0017), exit `101` |
+| passes | both pass | passes | the build goes on, exit `0` |
+
+If the header is there, the header compiles alone, the layout test and the prototype test pass, but the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype that the test did not find can also cause it (§8.10.5).
 
 #### `@ffi` Binds a Module-Level Function
 
@@ -3490,7 +3566,7 @@ The report has these rules:
 - The primary span is the `@ffi.struct` line. For NoField, Offset and FieldSize, a secondary label marks the Blink field. The message names the field in words, so a tool that shows only the primary span still shows it. The JSON form (§8.6) holds the kind, and holds the Blink field as a `related` location.
 - Each mirror gets one report: the first check that fails, in this order: NoName, then each field in declaration order (NoField, Offset or FieldSize), then StructSize. A wrong field moves the fields after it, so a later report would only repeat the first. One run reports every bad mirror.
 - The target triple is in the message, because the same mirror can pass on one target and fail on another (for example under `--target aarch64-linux-gnu`).
-- The test reads only pass or fail. The kind and the field are the same under gcc 13 or later, clang and `zig cc`. A build with `tcc` is outside this promise, as it is for E0861.
+- The test reads only pass or fail. The kind and the field are the same under gcc 13 or later, clang and `zig cc`. `tcc` is not a supported C compiler (§9.1, *The prototype test*).
 - The help for NoName says to check `name:`, and that a C type with no visible fields is an `@ffi.opaque` (*`@ffi.opaque`*). The help for a field that C does not have says that it shows as an Offset or StructSize kind when the missing field moves the fields after it.
 
 ```blink
