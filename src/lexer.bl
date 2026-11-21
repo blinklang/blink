@@ -127,11 +127,58 @@ fn codepoint_end(source: Str, source_len: Int, pos: Int) -> Int {
     pos + w
 }
 
+// The source text at start..end, where start and end are character starts as codepoint_end
+// counts them. byte_slice reads a continuation byte at either end as the middle of a codepoint,
+// but here it can be a stray byte that is a character of its own. Only then is the text copied
+// a character at a time.
+fn source_text(source: Str, source_len: Int, start: Int, end: Int) -> Str {
+    if start >= end { return "" }
+    if !is_continuation(peek(source, source_len, start)) && !is_continuation(peek(source, source_len, end)) {
+        return source.byte_slice(start, end)
+    }
+    source_text_lossy(source, source_len, start, end)
+}
+
+// The source text at start..end with each byte that is not UTF-8 written as U+FFFD, for a range
+// that can hold such bytes: a Str must hold UTF-8.
+fn source_text_lossy(source: Str, source_len: Int, start: Int, end: Int) -> Str {
+    let mut sb = StringBuilder.new()
+    let mut pos = start
+    while pos < end {
+        let ce = codepoint_end(source, source_len, pos)
+        let well_formed = ce - pos > 1 || peek(source, source_len, pos) < 128
+        sb.write(str_from_code_point(if well_formed { decode_codepoint(source, pos, ce) } else { 65533 }))
+        pos = ce
+    }
+    sb.to_str()
+}
+
+fn is_continuation(b: Int) -> Bool {
+    b >= 128 && b < 192
+}
+
+// Whether start..end is whole UTF-8 text: both ends are character starts and every character
+// between is well-formed, so byte_slice can cut it and the result is a valid Str.
+pub fn is_utf8_text(source: Str, source_len: Int, start: Int, end: Int) -> Bool {
+    if is_continuation(peek(source, source_len, start)) || is_continuation(peek(source, source_len, end)) { return false }
+    let mut pos = start
+    while pos < end {
+        if peek(source, source_len, pos) < 128 {
+            pos = pos + 1
+        } else {
+            let ce = codepoint_end(source, source_len, pos)
+            if ce == pos + 1 || ce > end { return false }
+            pos = ce
+        }
+    }
+    true
+}
+
 // The text of the character at pos..end, for a diagnostic. A byte that is not UTF-8 is
 // spelled `\xNN`: it is not text, and slicing it out would cut a codepoint.
-fn char_text(source: Str, pos: Int, end: Int) -> Str {
-    let b = source.byte_at(pos).to_int()
-    if end - pos > 1 || b < 128 { return source.byte_slice(pos, end) }
+fn char_text(source: Str, source_len: Int, pos: Int, end: Int) -> Str {
+    let b = peek(source, source_len, pos)
+    if end - pos > 1 || b < 128 { return source_text(source, source_len, pos, end) }
     let digits = "0123456789ABCDEF"
     "\\x".concat(digits.byte_slice(b / 16, b / 16 + 1)).concat(digits.byte_slice(b % 16, b % 16 + 1))
 }
@@ -244,7 +291,7 @@ fn scan_escape(source: Str, source_len: Int, pos: Int, limit: Int, in_char: Bool
         while end < limit && end - pos - 2 < max && is_hex(peek(source, source_len, end)) {
             end = end + 1
         }
-        let digits = source.byte_slice(pos + 2, end)
+        let digits = source_text(source, source_len, pos + 2, end)
         let fix = if digits == "" { "`\\u\{H\}` with 1 to 6 hex digits, such as `\\u\{41\}`" } else { "`\\u\{{hex_spelling(digits)}\}`" }
         if esc == CH_x {
             return escape_error(end, -1, "HexEscapeNotSupported", HEX_ESCAPE_NOT_SUPPORTED, "Blink has no `\\x` escape", "write {fix}")
@@ -256,7 +303,7 @@ fn scan_escape(source: Str, source_len: Int, pos: Int, limit: Int, in_char: Bool
     }
     // Recovery drops the whole malformed escape, the escaped character with its backslash.
     let esc_end = codepoint_end(source, source_len, pos + 1)
-    let text = char_text(source, pos + 1, esc_end)
+    let text = char_text(source, source_len, pos + 1, esc_end)
     let kind = if in_char { "char" } else { "string" }
     escape_error(esc_end, -1, "UnknownEscape", UNKNOWN_ESCAPE,
         "unknown escape sequence '\\{text}'{codepoint_label(source, pos + 1, esc_end)} in a {kind} literal",
@@ -283,10 +330,10 @@ fn scan_unicode_escape(source: Str, source_len: Int, pos: Int, limit: Int, in_ch
         q = q + 1
     }
     if q < end {
-        let bad = char_text(source, q, codepoint_end(source, source_len, q))
+        let bad = char_text(source, source_len, q, codepoint_end(source, source_len, q))
         return escape_error(span_end, -1, "InvalidUnicodeEscapeDigit", INVALID_UNICODE_ESCAPE_DIGIT, "`{bad}` is not a hex digit", "use only `0-9`, `a-f`, `A-F`")
     }
-    let digits = source.byte_slice(start, end)
+    let digits = source_text(source, source_len, start, end)
     if !closed {
         let fix = if digits == "" { "41" } else { digits }
         return escape_error(span_end, -1, "UnterminatedUnicodeEscape", UNTERMINATED_UNICODE_ESCAPE, "unterminated Unicode escape", "close the escape with `\}`: `\\u\{{fix}\}`")
@@ -348,21 +395,28 @@ fn is_regex_escape(c: Int) -> Bool {
     c == CH_PLUS || c == CH_STAR || c == CH_QUESTION || c == CH_PIPE || c == CH_CARET || c == CH_DOLLAR
 }
 
-// The text of a char literal written as a Str literal, for the MultiCharLiteral help: a quote
-// the Str would end at, or a brace it would read as interpolation, gets its backslash, and
-// `\'`, which a Str does not accept, loses its own.
-fn char_text_as_str(text: Str) -> Str {
+// The char literal text at start..end written as a Str literal, for the MultiCharLiteral help: a
+// quote the Str would end at, or a brace it would read as interpolation, gets its backslash, and
+// `\'`, which a Str does not accept, loses its own. It goes a character at a time, so a
+// multi-byte character stays whole and a byte that is not UTF-8 is spelled as char_text does.
+fn char_text_as_str(source: Str, source_len: Int, start: Int, end: Int) -> Str {
     let mut sb = StringBuilder.new()
     sb.write("\"")
-    let mut i = 0
-    while i < text.byte_len() {
-        let c = text.byte_at(i).to_int()
-        if c == CH_BACKSLASH && i + 1 < text.byte_len() {
-            let n = text.byte_at(i + 1).to_int()
-            if n == CH_SQUOTE { sb.write("'") } else { sb.write(text.byte_slice(i, i + 2)) }
-            i = i + 2
+    let mut i = start
+    while i < end {
+        let c = peek(source, source_len, i)
+        if c == CH_BACKSLASH && i + 1 < end {
+            let n_end = codepoint_end(source, source_len, i + 1)
+            if peek(source, source_len, i + 1) == CH_SQUOTE {
+                sb.write("'")
+            } else {
+                sb.write("\\")
+                sb.write(char_text(source, source_len, i + 1, n_end))
+            }
+            i = n_end
             continue
         }
+        let c_end = codepoint_end(source, source_len, i)
         if c == CH_DQUOTE {
             sb.write("\\\"")
         } else if c == CH_LBRACE {
@@ -370,9 +424,9 @@ fn char_text_as_str(text: Str) -> Str {
         } else if c == CH_RBRACE {
             sb.write("\\}")
         } else {
-            sb.write(text.byte_slice(i, i + 1))
+            sb.write(char_text(source, source_len, i, c_end))
         }
-        i = i + 1
+        i = c_end
     }
     sb.write("\"")
     sb.to_str()
@@ -486,11 +540,15 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
                     col = col + 2
                 }
                 let text_start = scan_pos
+                let mut non_ascii = false
                 while scan_pos < source_len && peek(source, source_len, scan_pos) != CH_NEWLINE {
+                    non_ascii = non_ascii || peek(source, source_len, scan_pos) >= 128
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
-                let text = source.byte_slice(text_start, scan_pos)
+                // No rule says comment text is UTF-8, so a comment can hold any byte.
+                let lossy = non_ascii && !is_utf8_text(source, source_len, text_start, scan_pos)
+                let text = if lossy { source_text_lossy(source, source_len, text_start, scan_pos) } else { source.byte_slice(text_start, scan_pos) }
                 if is_doc {
                     push_tok(TokenKind.DocComment, text, t_line, t_col, col)
                     _last_kind = TokenKind.DocComment
@@ -614,7 +672,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
                 } else if count >= 2 {
                     let message = if closed { "char literal holds {count} characters" } else { "char literal has no closing `'` on its line, so it holds {count} characters" }
                     diag_error_span_notes("MultiCharLiteral", MULTI_CHAR_LITERAL, message, t_line, t_col, end_col,
-                        "a char literal holds one character; use double quotes for a `Str`: `{char_text_as_str(source.byte_slice(open + 1, text_end))}`", [])
+                        "a char literal holds one character; use double quotes for a `Str`: `{char_text_as_str(source, source_len, open + 1, text_end)}`", [])
                 } else if !closed {
                     diag_error_span_notes("UnterminatedLiteral", UNTERMINATED_LITERAL, "unterminated char literal", t_line, t_col, end_col,
                         "close the literal with `'`", ["the literal reaches the end of the line at line {t_line}, col {end_col}"])
@@ -623,7 +681,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
                     diag_error_span_notes(first.name, first.code, first.message, t_line, e_col, e_col + first.end - first_pos, first.help, [])
                 } else if first.cp < 0 {
                     let e_col = t_col + first_pos - open
-                    diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{char_text(source, first_pos, first.end)}` in char literal: source text must be UTF-8", t_line, e_col, e_col + 1, "")
+                    diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{char_text(source, source_len, first_pos, first.end)}` in char literal: source text must be UTF-8", t_line, e_col, e_col + 1, "")
                 } else {
                     value = first.cp
                 }
@@ -1076,7 +1134,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
                     scan_pos = scan_pos + 1
                     col = col + 1
                 }
-                let word = source.byte_slice(start, scan_pos)
+                let word = source_text(source, source_len, start, scan_pos)
                 let kind = keyword_lookup(word)
                 push_tok(kind, word, t_line, t_col, col)
                 _last_kind = kind
@@ -1099,10 +1157,10 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
                         scan_pos = scan_pos + 1
                         col = col + 1
                     }
-                    push_tok(TokenKind.Float, source.byte_slice(start, scan_pos), t_line, t_col, col)
+                    push_tok(TokenKind.Float, source_text(source, source_len, start, scan_pos), t_line, t_col, col)
                     _last_kind = TokenKind.Float
                 } else {
-                    push_tok(TokenKind.Int, source.byte_slice(start, scan_pos), t_line, t_col, col)
+                    push_tok(TokenKind.Int, source_text(source, source_len, start, scan_pos), t_line, t_col, col)
                     _last_kind = TokenKind.Int
                 }
                 continue
@@ -1122,7 +1180,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
             // Recover by skipping the character so we can surface every bad
             // character in one pass rather than aborting on the first.
             let bad_end = codepoint_end(source, source_len, scan_pos)
-            let bad_ch = char_text(source, scan_pos, bad_end)
+            let bad_ch = char_text(source, source_len, scan_pos, bad_end)
             let bad_w = bad_end - scan_pos
             let hint = if bad_ch == ";" { "Blink uses newlines as statement terminators; delete the `;`" } else { "" }
             diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{bad_ch}`{codepoint_label(source, scan_pos, bad_end)}", line, col, col + bad_w, hint)
@@ -1136,7 +1194,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
             // Interpolation start: { (or #{...} for extended strings)
             if ch == CH_LBRACE {
                 if _run_start != -1 {
-                    string_buf.write(source.byte_slice(_run_start, scan_pos))
+                    string_buf.write(source_text(source, source_len, _run_start, scan_pos))
                     _run_start = -1
                 }
                 let t_line = line
@@ -1194,7 +1252,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
             // String end: " (or "# / "## / "### for extended strings)
             if ch == CH_DQUOTE {
                 if _run_start != -1 {
-                    string_buf.write(source.byte_slice(_run_start, scan_pos))
+                    string_buf.write(source_text(source, source_len, _run_start, scan_pos))
                     _run_start = -1
                 }
                 let t_line = line
@@ -1253,7 +1311,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
             // Escape sequences
             if ch == CH_BACKSLASH {
                 if _run_start != -1 {
-                    string_buf.write(source.byte_slice(_run_start, scan_pos))
+                    string_buf.write(source_text(source, source_len, _run_start, scan_pos))
                     _run_start = -1
                 }
                 let sdepth = string_depth_stack.get(string_depth_stack.len() - 1).unwrap()
@@ -1306,10 +1364,10 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
                 let cp_end = codepoint_end(source, source_len, scan_pos)
                 if cp_end == scan_pos + 1 {
                     if _run_start != -1 {
-                        string_buf.write(source.byte_slice(_run_start, scan_pos))
+                        string_buf.write(source_text(source, source_len, _run_start, scan_pos))
                         _run_start = -1
                     }
-                    let bad_ch = char_text(source, scan_pos, cp_end)
+                    let bad_ch = char_text(source, source_len, scan_pos, cp_end)
                     diag_error_range("UnexpectedCharacter", UNEXPECTED_CHARACTER, "unexpected character `{bad_ch}` in string literal: source text must be UTF-8", line, col, col + 1, "")
                 } else if _run_start == -1 {
                     _run_start = scan_pos
@@ -1338,7 +1396,7 @@ pub fn lex(source: Str) ! Lex.Tokenize, Diag.Report, IO.Eprint {
     // frame hands the parser a whole literal, so it has nothing to report at the end of the file.
     if string_depth_stack.len() > 0 {
         if _run_start != -1 {
-            string_buf.write(source.byte_slice(_run_start, scan_pos))
+            string_buf.write(source_text(source, source_len, _run_start, scan_pos))
             _run_start = -1
         }
         let o_line = string_open_lines.get(0).unwrap()

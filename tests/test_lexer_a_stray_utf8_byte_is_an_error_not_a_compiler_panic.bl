@@ -1,0 +1,114 @@
+// A byte that is not part of a well-formed UTF-8 sequence is an error, and the lexer goes on
+// after it. A text the lexer cuts from the source may start or end at such a byte, so no cut
+// may panic: the compile ends with the error and exit 1, never an internal compiler error.
+// `\342` is a lead byte with no continuation, and `\254` is a continuation byte with no lead.
+
+import compile_test_helpers
+
+fn capture(format: Str, tag: Str) -> Str ! FS.Delete, FS.Read, Process.Spawn, Env.Read {
+    compile_test_helpers.compile_printf_and_capture(format, tag)
+}
+
+fn expect_no_panic(out: Str, label: Str) ! IO.Print {
+    let ok = !out.contains("CompilerPanic") && !out.contains("exit=101")
+    if ok {
+        io.println("PASS: {label}")
+    } else {
+        io.println("FAIL: {label} — the compiler panicked:\n{out}")
+    }
+    assert(ok)
+}
+
+fn expect_lex_error(out: Str, code: Str, label: Str) ! IO.Print {
+    expect_no_panic(out, label)
+    compile_test_helpers.expect_error(out, code, label)
+    compile_test_helpers.expect_contains(out, "exit=1\n", "{label}: exit 1")
+}
+
+test "a string literal with a bad lead byte, a char and a stray continuation byte" {
+    let out = capture(#"fn main() {\n    let s = "a\342$\254b"\n}\n"#, "lex_utf8_string")
+    expect_lex_error(out, "E1113", "string literal")
+    compile_test_helpers.expect_contains(out, "\\xE2", "the error names the lead byte")
+    compile_test_helpers.expect_contains(out, "\\xAC", "the error names the continuation byte")
+}
+
+test "an extended string literal with a stray continuation byte" {
+    let out = capture(##"fn main() {\n    let s = #"a\342$\254"#\n}\n"##, "lex_utf8_ext_string")
+    expect_lex_error(out, "E1113", "extended string literal")
+}
+
+test "a string literal that reaches the end of the file at a stray byte" {
+    let out = capture(#"fn main() {\n    let s = "a\254"#, "lex_utf8_string_eof")
+    expect_no_panic(out, "string literal to the end of the file")
+    compile_test_helpers.expect_error(out, "E1113", "string literal to the end of the file")
+}
+
+test "an identifier that ends at a stray byte" {
+    let out = capture(#"fn main() {\n    let ab\254 = 1\n}\n"#, "lex_utf8_ident")
+    expect_lex_error(out, "E1113", "identifier")
+}
+
+test "an identifier in an interpolation hole that ends at a stray byte" {
+    let out = capture(#"fn main() {\n    let x = 1\n    let s = "{x\254}"\n}\n"#, "lex_utf8_hole")
+    expect_lex_error(out, "E1113", "interpolation hole")
+}
+
+test "a number that ends at a stray byte" {
+    let out = capture(#"fn main() {\n    let n = 12\254\n}\n"#, "lex_utf8_number")
+    expect_lex_error(out, "E1113", "number")
+}
+
+test "a hex escape whose digits end at a stray byte" {
+    let out = capture(#"fn main() {\n    let s = "\\x4\254"\n}\n"#, "lex_utf8_hex_escape")
+    expect_no_panic(out, "hex escape")
+    compile_test_helpers.expect_contains(out, "exit=1\n", "hex escape: exit 1")
+}
+
+test "a char literal that starts with a stray byte" {
+    let out = capture(#"fn main() {\n    let c = '\254ab'\n}\n"#, "lex_utf8_char")
+    expect_no_panic(out, "char literal")
+    compile_test_helpers.expect_contains(out, "exit=1\n", "char literal: exit 1")
+}
+
+test "a char literal with a stray byte between two characters" {
+    let out = capture(#"fn main() {\n    let c = 'a\254b'\n}\n"#, "lex_utf8_char_inner")
+    expect_lex_error(out, "E1125", "char literal with an inner stray byte holds three characters")
+    compile_test_helpers.expect_contains(out, "\\\"a\\\\xACb\\\"", "the help names the stray byte")
+}
+
+test "the help for a char literal of two characters keeps a multi-byte character whole" {
+    let out = capture(#"fn main() {\n    let c = '\303\251a'\n}\n"#, "lex_utf8_char_two")
+    expect_lex_error(out, "E1125", "char literal of two characters")
+    compile_test_helpers.expect_contains(out, "\\\"éa\\\"", "the help writes the literal as a Str")
+}
+
+test "an unexpected multi-byte character that ends at a stray byte" {
+    let out = capture(#"fn main() {\n    let x = \303\251\254\n}\n"#, "lex_utf8_char_text")
+    expect_lex_error(out, "E1113", "unexpected character before a stray byte")
+}
+
+// The spec has no rule on the encoding of comment text, so a stray byte in a comment is not
+// an error here. The comment must still lex without a panic.
+test "a comment that starts with a stray byte" {
+    let out = capture(#"//\254 x\nfn main() { }\n"#, "lex_utf8_comment")
+    expect_no_panic(out, "comment")
+    compile_test_helpers.expect_contains(out, "exit=0\n", "comment: exit 0")
+}
+
+test "a doc comment that starts with a stray byte" {
+    let out = capture(#"///\254 x\nfn main() { }\n"#, "lex_utf8_doc_comment")
+    expect_no_panic(out, "doc comment")
+    compile_test_helpers.expect_contains(out, "exit=0\n", "doc comment: exit 0")
+}
+
+// The lexer goes on after a stray byte, so the parser runs, and a parser help that quotes the
+// source must not cut it at that byte either.
+test "a parser help that quotes a range operand next to a stray byte" {
+    let out = capture(#"fn main() {\n    let n = 3\n    for i in 0..<n\200 {\n        print(i)\n    }\n}\n"#, "lex_utf8_parser_range")
+    expect_lex_error(out, "E1113", "range operand")
+}
+
+test "a parser help that quotes a mut pattern next to a stray byte" {
+    let out = capture(#"fn main() {\n    let mut (a, b)\200 = (1, 2)\n    print(a + b)\n}\n"#, "lex_utf8_parser_mut_pattern")
+    expect_lex_error(out, "E1113", "mut pattern")
+}
