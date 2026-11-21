@@ -51,7 +51,7 @@ import cg_derive.{
 }
 import ir.{ir_begin_body, ir_block, ir_node_count, ir_note_source, ir_pos_begin, ir_pos_take, ir_reset, ir_sources_pause, ir_sources_resume, ir_span, ir_verify_in_frame}
 import mono.{instances, named_instance_rows, program_calls_trace_log, program_spawns, set_named_instance_rows}
-import archive_keep.{BodyScan, is_kept, note_body}
+import archive_keep.{BodyScan, is_kept, note_body, note_held_body}
 import typecheck.{TYPE_INT, TYPE_VOID, TyKind, tc_enter_body_module, tc_program_has_panic_hook, tc_leave_body_module, tc_resolve, tc_tid_kind}
 import cg_stmt.{
     PANIC_HOOK_ADAPTER, PanicHookAdapter, cg_stmt_panic_hook_adapter, cg_stmt_reset, cg_stmt_set_debug_mode, lower_block, lower_block_returning, lower_fn,
@@ -419,7 +419,9 @@ fn emit_declarations(cfg: CgConfig, header_guard: Str, self_header: Str, define_
     // which every unit that reads this one has already included.
     let all_globals = globals_extern && cfg.archive_over_std == 0
     let globals = if all_globals { cg_reg_global_decls() } else { globals_in_scope(cfg, "", false) }
+    let inits_start = ir_node_count()
     let inits = if globals_extern { Map() } else { lower_global_inits(globals) }
+    if !globals_extern { note_held_body(cfg.body_scan, "the module initializers", inits_start) }
     let deferred = cg_decl_emit_globals(globals_extern, globals, inits)
     let declare_only = !(globals_extern && cfg.archive_over_std != 0)
     let fns = fns_in_scope(cfg, "", shared, declare_only)
@@ -632,11 +634,13 @@ fn emit_bodies(cfg: CgConfig, decls: List[Int]) ! Diag.Report {
 
 // The default of each derived operation this unit declared is its declared body, written
 // after every signature that body may call.
-fn emit_derived_op_bodies() ! Diag.Report {
+fn emit_derived_op_bodies(cfg: CgConfig) ! Diag.Report {
     set_current_inst(-1)
     for s in cg_decl_derived_slots() {
         cg_trace_arm_default(s.op, s.effect_decl)
+        let start = ir_node_count()
         print_vtable_slot_fn(s.ret, s.symbol, s.params, lower_body(s.op))
+        note_held_body(cfg.body_scan, "the default body {s.symbol}", start)
     }
 }
 
@@ -812,8 +816,9 @@ fn emit_definitions_of(cfg: CgConfig, module_key: Str, scope_fns: List[Int], sco
     print_queued_thunks()
     emit_bodies(cfg, fns)
     emit_bodies(cfg, methods)
-    emit_derived_op_bodies()
+    emit_derived_op_bodies(cfg)
     if !with_derived { return }
+    let derived_start = ir_node_count()
     cg_derive_emit_bodies(decls_in_scope(cfg, module_key, cg_reg_type_decls(), false))
     // A key table's text is spelled from its tuple type, which the entry key holds by the
     // table's name. The node it is written from only lends the lowering a span, so the table
@@ -821,6 +826,8 @@ fn emit_definitions_of(cfg: CgConfig, module_key: Str, scope_fns: List[Int], sco
     let track = ir_sources_pause()
     cg_derive_emit_key_tables(key_tables_in_scope(cfg, module_key, key_tables))
     ir_sources_resume(track)
+    // The eq and hash of a tuple key call the eq and hash of its parts, as @derive bodies do.
+    note_held_body(cfg.body_scan, "the @derive bodies", derived_start)
 }
 
 // A tuple key has no declaration, so no module owns its table. The node that spells it is

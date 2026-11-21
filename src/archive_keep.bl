@@ -20,7 +20,9 @@ import std.path.{path_join}
 pub let KEPT_MARKER = "/* blink:kept_for_user"
 
 // One printed body: the declaration, the C symbol it was printed under, the symbols its
-// calls and fn values name, and whether it names the evidence vector.
+// calls and fn values name, and whether it names the evidence vector. `decl` is -1 for a body
+// the archive must hold, which has no declaration a user unit could write in its place;
+// `symbol` then names that body for a reader.
 pub type BodyFacts {
     decl: Int
     symbol: Str
@@ -46,6 +48,12 @@ pub fn note_body(scan: Option[BodyScan], decl: Int, symbol: Str, start: Int) {
     }
 }
 
+// Records a body the archive must hold, from IR ids `start` up to the next free id: the
+// default body of an effect operation, the @derive bodies or the module initializers.
+pub fn note_held_body(scan: Option[BodyScan], label: Str, start: Int) {
+    note_body(scan, -1, label, start)
+}
+
 fn facts_of(decl: Int, symbol: Str, start: Int) -> BodyFacts {
     let mut refs: List[Str] = []
     let mut names_ev = false
@@ -67,15 +75,44 @@ fn facts_of(decl: Int, symbol: Str, start: Int) -> BodyFacts {
     BodyFacts { decl: decl, symbol: symbol, refs: refs, names_ev: names_ev }
 }
 
-// The C symbol of each declaration the archive must leave for the user unit, read from the
-// facts of one emit of the archive's program. A generic is named by its own symbol, not by
-// an instance's, so the whole generic stays out when one instance must.
+// Reads the facts of one emit of the archive's program. The C symbol of each declaration
+// the archive must leave for the user unit goes in `kept`. A generic is named by its own
+// symbol, not by an instance's, so the whole generic stays out when one instance must.
 //
 // A symbol counts as held when the emit printed a body under it, or when the declaration
 // needs no Blink body (a foreign binding). Every other symbol of a std declaration is one
 // the archive does not hold. A symbol of no std declaration (a runtime call, a foreign
 // function, a thunk) is outside the question.
-pub fn kept_symbols(scan: BodyScan) -> Map[Str, Int] {
+pub fn scan_verdict(scan: BodyScan) -> ScanVerdict {
+    let c = closure_of(scan)
+    let mut kept: Map[Str, Int] = Map()
+    for d in c.kept.keys() {
+        kept.insert(cg_decl_c_name(d), 1)
+    }
+    let mut held: List[Str] = []
+    for b in scan.bodies {
+        if b.decl >= 0 { continue }
+        if b.names_ev || names_unheld(b.refs, c.decl_of, c.held, c.kept) { held.push(b.symbol) }
+    }
+    ScanVerdict { kept: kept, held_needing_kept: held.sort() }
+}
+
+// `kept` is the C symbol of each body the archive leaves for the user unit.
+// `held_needing_kept` is the label of each body the archive must hold that names the vector
+// or reaches a body the archive does not hold. Such a body cannot move to the user unit, so
+// the archive build stops.
+pub type ScanVerdict {
+    kept: Map[Str, Int]
+    held_needing_kept: List[Str]
+}
+
+type KeepClosure {
+    decl_of: Map[Str, Int]
+    held: Map[Str, Int]
+    kept: Map[Int, Int]
+}
+
+fn closure_of(scan: BodyScan) -> KeepClosure {
     let mut decl_of: Map[Str, Int] = Map()
     let mut held: Map[Str, Int] = Map()
     let entry = cg_reg_entry_point()
@@ -101,18 +138,14 @@ pub fn kept_symbols(scan: BodyScan) -> Map[Str, Int] {
     while grew {
         grew = false
         for b in scan.bodies {
-            if kept.contains_key(b.decl) { continue }
+            if b.decl < 0 || kept.contains_key(b.decl) { continue }
             if b.names_ev || names_unheld(b.refs, decl_of, held, kept) {
                 kept.insert(b.decl, 1)
                 grew = true
             }
         }
     }
-    let mut out: Map[Str, Int] = Map()
-    for d in kept.keys() {
-        out.insert(cg_decl_c_name(d), 1)
-    }
-    out
+    KeepClosure { decl_of: decl_of, held: held, kept: kept }
 }
 
 fn all_decls() -> List[Int] {

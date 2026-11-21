@@ -1,0 +1,79 @@
+// Some bodies of the stdlib archive have no declaration that a user unit could write in
+// their place: the default body of an effect operation, a @derive body and the function
+// that runs the module initializers. The archive must hold them. When one of them names the
+// evidence vector, or calls a body that the archive leaves for the user unit, the archive
+// build stops with an internal error. Without the stop, the archive refers to a symbol it
+// does not define, or reads a vector whose layout is not the program's.
+import compile_test_helpers
+import std.process.{ProcessResult, ChildLimits, ChildEnd}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(900)) }).unwrap()
+}
+
+let FIXTURE = #"
+effect RowheldAsk {
+    effect Get {
+        fn ask() -> Int
+    }
+}
+
+fn rowheld_heard() -> Int {
+    with handler RowheldAsk {
+        fn ask() -> Int { 41 }
+    } {
+        rowheldask.ask()
+    }
+}
+
+effect RowheldLog {
+    effect Out {
+        fn write(s: Str)
+        fn emit(s: Str) { rowheldlog.write(s) }
+    }
+}
+
+// A unit prints a default body only for an effect whose handler it builds.
+pub fn rowheld_logged() {
+    with handler RowheldLog {
+        fn write(s: Str) { }
+    } {
+        rowheldlog.emit("a")
+    }
+}
+
+pub let ROWHELD_HEARD: Int = rowheld_heard()
+
+pub type RowheldKey { n: Int }
+
+impl Eq for RowheldKey {
+    fn eq(self, other: RowheldKey) -> Bool { rowheld_heard() == other.n }
+}
+
+@derive(Eq)
+pub type RowheldPair { k: RowheldKey }
+"#
+
+// A root whose lib/std/list.bl holds the fixture, with its own copy of the compiler: a
+// compiler reads std from lib/std beside itself before BLINK_ROOT. The archive build reads
+// the one-file runtime.h of build/; bootstrap/runtime.h includes files it does not copy.
+fn root() -> Str ! FS.Read, FS.Write, Process.Spawn, Env.Read {
+    let d = "{compile_test_helpers.scratch_root()}/_stdlib_archive_held_{getpid()}"
+    sh("rm -rf {d} && mkdir -p {d}/bin {d}/build {d}/cache && cp -rL lib {d}/lib && ln -s $(pwd)/bootstrap {d}/bootstrap && cp -L build/runtime.h {d}/build/runtime.h && cp build/blink {d}/bin/blink")
+    let list_src = fs.read("{d}/lib/std/list.bl").unwrap()
+    fs.write("{d}/lib/std/list.bl", list_src.concat(FIXTURE)).unwrap()
+    d
+}
+
+test "the archive build stops at each body it must hold that needs the vector or a kept body" {
+    let d = root()
+    let arc = sh("cd {d} && env -u BLINK_COMPILER_ARCHIVE BLINK_ROOT={d} BLINK_CACHE_DIR={d}/cache BLINK_BIN={d}/bin/blink {d}/bin/blink __build-stdlib-archive < /dev/null 2>&1")
+    sh("rm -rf {d}")
+    assert_eq(arc.end, ChildEnd.Exited(101), "expected the internal-error exit:\n{arc.out}")
+    assert(arc.out.contains("[StdArchiveNeedsKeptBody]"), "expected StdArchiveNeedsKeptBody (I0026):\n{arc.out}")
+    // Each kind of body is named on its own, so one kind cannot hide that another is not seen.
+    assert(arc.out.contains("module initializers"), "the error does not name the module initializers:\n{arc.out}")
+    assert(arc.out.contains("@derive bodies"), "the error does not name the @derive bodies:\n{arc.out}")
+    assert(arc.out.contains("RowheldLog"), "the error does not name the default body of RowheldLog.emit:\n{arc.out}")
+}
