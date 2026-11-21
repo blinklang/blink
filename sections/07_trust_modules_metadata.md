@@ -97,9 +97,12 @@ fn c_realpath(path: Ptr[U8], out: Ptr[U8]) -> Ptr[U8] ! ()   // on macOS: binds 
 @ffi("strerror_r", header: "string.h")
 @trusted(audit: "STRING-STRERROR-R")
 fn c_strerror_r(e: I32, buf: Ptr[U8], n: Int) -> I32 ! ()
+// string.h (glibc, with the feature macros above): char *strerror_r(int errnum, char *buf, size_t n);
 // blink build on glibc: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
-//   `strerror_r` returns `char *` for this build; this declaration returns an integer
-// fix: declare the result `Ptr[U8]`
+//   `strerror_r` does not match its prototype in `string.h`
+//   result: the header returns a pointer to `char`; this declaration returns an integer
+//   label on the result type: the header returns a pointer to `char`
+//   help: declare the result `Ptr[U8]`
 ```
 
 **The header test.** `blink check` does not look at the C headers. `blink build` and `blink test` do. Before the unit compile, each of them tests every header that an `@ffi` declaration names. The test uses the same C compiler, target, include paths and vendored native directories as the unit compile, so it gives no error for a program that builds. It reads only pass or fail, and it does not read the text of the C compiler. A header that the test cannot find is `ForeignHeaderNotFound` (E0859) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3).
@@ -115,22 +118,179 @@ fn c_compress(src: Ptr[U8], n: Int) -> Int ! ()
 
 **The prototype test.** After the header test passes, `blink build` and `blink test` test the prototype of each `@ffi` declaration. The test compiles the C call that the declaration gives against the prototype in the header. It uses the same C compiler, target, include paths and vendored native directories as the unit compile. It reads only pass or fail, and it does not read the text of the C compiler. A declaration that fails is `ForeignPrototypeMismatch` (E0861) at the `@ffi` line, and the command exits `1`. The unit compile does not start (§6.7.3). `blink check` does not run the test.
 
-The test and the unit compile both pass `-Werror=incompatible-pointer-types -Werror=int-conversion`, so one source gives one verdict on every host. The supported C compilers are gcc 13 and later, clang and `zig cc`. `tcc` ignores these two flags: under `tcc` the test and the unit compile accept a mismatch that the other compilers refuse, so E0861 does not fire.
+The test and the unit compile both pass `-Werror=incompatible-pointer-types -Werror=int-conversion`, so one source gives one verdict on every host. The supported C compilers are gcc 13 and later, clang and `zig cc`. `tcc` ignores these two flags: under `tcc` the test and the unit compile accept a mismatch that the other compilers refuse, so E0861 does not fire. Every probe of the test compiles with `-c` to a temporary object file. No probe uses `-fsyntax-only`: `zig cc` can report a failure for correct C under that flag, and a false failure is a false E0861.
 
 The test finds what the C compiler rejects when the generated call meets the prototype. The usual cause is a pointer to a different named C type. *A `Ptr` at an `@ffi` Call* (§9.1.1) gives the pointee rules. The test does not find a wrong scalar width or a wrong scalar pointee (`Ptr[I32]` for a `long *`): those are the claim of the author (*Signature Types*, below), and `blink audit` marks them (§9.1, *`blink audit` — FFI Inventory*).
 
-```blink
-@ffi.struct(header: "netinet/in.h", name: "sockaddr_in")
-type SockIn { sin_family: U16, sin_port: U16, sin_addr: U32, sin_zero: I64 }
+**What E0861 prints.** A declaration that passes costs one probe. A declaration that fails gets more probes (*The probes*, below), and each fact in the message is the result of one of them. The message states two kinds of fact only: what a pass or fail proved, and what the compiler knows from the declaration. It never prints a C type that no probe proved: no struct tag, no typedef name, and no `const` that the test did not see. For this reason it says "a pointer to `int`", not "takes `int *`". The report has these parts:
 
-@ffi("connect", header: "sys/socket.h")
-@trusted(audit: "NET-CONNECT")
-fn c_connect(fd: I32, addr: Ptr[SockIn], len: U32) -> I32 ! () {}
-// blink check: no error
+- A first line that names the function and the header: `` `pipe` does not match its prototype in `unistd.h` ``.
+- One line for each failing slot. A slot is a parameter, named by its position and its name, or the result. The lines are in a fixed order: the parameters from left to right, then the result. One E0861 holds every failing slot of one declaration. A line says what the header takes or returns, only when a probe proved it, and what the declaration passes or returns.
+- A secondary label on each failing parameter and on a failing result type. It holds the header-side fact of its line. The JSON form (§8.6) holds each failing slot as a `related` location, as E0862 does for a field (§9.1.3).
+- The help of a slot, only when a probe proves the fix. A failing slot with no help gets a note: `` note: compare `fds` with the prototype of `pipe` in `unistd.h` ``.
+- The primary span is the `@ffi` line.
+
+The declaration side needs no probe. It is the C type that the call uses (§9.1.1, *What C sees*): `struct sockaddr_in *` for a `Ptr[SockIn]`, `FILE *` for a `Ptr[CFile]`, `void *` for a `Ptr` to a scalar, and "a number" for a scalar. The result line says "returns" where a parameter line says "passes".
+
+**The probes.** They run only after the first probe of the declaration fails. Each is one C compile that reads only pass or fail, with the compiler, target, includes, feature macros and pins of the unit compile. They can run in parallel. The output order does not depend on the order in which they finish. The steps, in order:
+
+1. *The count.* Call the function with `k` arguments, for each `k` from `0` to one more than the declared count `n`. Each argument is `0`. A by-value `@ffi.struct` parameter keeps its declared type, because `0` cannot replace it. If exactly one `k` passes, the header takes `k` parameters. If every `k` from `m` up passes, the function is variadic and takes at least `m`. When the header count is not `n`, the report is one count line, and no slot probe runs. If no `k` passes, the report is the fallback text (below).
+2. *Each slot.* For a parameter, the call with the declared C type in that slot and `0` in the others. For the result, the call with the arguments `0` and the result bound to the declared result type. A slot that fails is a failing slot. A result of `()` never fails.
+3. *The shape of a failing slot.* The slot takes a `(void *)0`, or it does not. If it does, the header has a pointer there. If it does not, the header has a number there. For a result, the same test binds the call to a `const void *`. Every result probe binds through `const` (`const void *r`, `const T *r`), because gcc, clang and `zig cc` agree on a `const` binding and do not agree on a bare one.
+4. *The scalar pointee.* For a failing slot that has a pointer in the header. Step one tries these nine families with `T *` in the slot: `char`, `short`, `int`, `long`, `long long`, `float`, `double`, `long double` and `_Bool`. Under the pins of the unit, a family passes for each of its signs. Step two runs only when exactly one family passed. It adds `-Werror=pointer-sign` and tries each type of the family: `char`, `signed char` and `unsigned char`; `short` and `unsigned short`; `int` and `unsigned int`; `long` and `unsigned long`; `long long` and `unsigned long long`; and the one type of each other family. If exactly one type passes, the line names it. If none passes or two pass, the line names the family with its signs. The flag `-Werror=pointer-sign` is in step two only. No verdict probe, count probe, slot probe or unit compile passes it, so the flag cannot make an error or move one.
+5. *The mirrors of the program.* For a parameter only, and only when the declared type is a `Ptr` to an `@ffi.struct` or `@ffi.opaque` type, the slot has a pointer in the header, and no family passed in step four. For each `@ffi.struct` and `@ffi.opaque` type of the unit, the call with a pointer to its C type in the slot. The set is closed: it is the types that the program declares. E0862 runs before this step, so every mirror here has passed its layout test. The step probes at most a fixed number of mirrors, and the number does not depend on the host. A program with more mirrors than the cap gets no mirror result.
+6. *Drop one.* For a count that is one too high. For each parameter `j`, the call with the declared types of all parameters except `j`. Each argument has its declared C type.
+
+Nothing outside these sets is printed. A probe that the list does not name gives no line.
+
+**What a slot line says.** The lines for a parameter:
+
+| What the probes proved | The header side of the line | The help |
+|------------------------|-----------------------------|----------|
+| A pointer; exactly one scalar type passed | `the header takes a pointer to` that type | `declare the parameter` with `Ptr` of the Blink type (below) |
+| A pointer; the family is known, the sign is not | `the header takes a pointer to` the family with its signs, for example `` `int` or `unsigned int` `` | `declare the parameter` with the one Blink type, or the other |
+| A pointer; two or more families passed | `the header takes a pointer` | none |
+| A pointer; no family passed; the declared type is `Ptr` to a mirror; exactly one mirror passed | `the header takes a pointer to` the C type of that mirror | `declare the parameter` with `Ptr` of that mirror |
+| The same, but no mirror passed, two or more passed, or the program has more mirrors than the cap | `the header takes a pointer to a C type that is not a scalar` | the help with two fixes (below) |
+| A pointer; no family passed; the declared type is not a `Ptr` to a mirror | `the header takes a pointer to a C type that is not a scalar` | none |
+| A number | `the header takes a number` | none |
+
+A result line is the same with "returns" for "takes" and `declare the result` for `declare the parameter`. A result gets the first three rows, the last row and the row for a pointer to a type that is not a scalar, with no help. The mirror probe and the `Ptr[Void]` help are for a parameter: the coercion of `Ptr[Void]` is at an argument (§9.1.1).
+
+The Blink type in a help is the type with the size and sign of the C type on the target: `char` and `unsigned char` give `U8`, `signed char` gives `I8`, `short` gives `I16`, `unsigned short` gives `U16`, `int` gives `I32`, `unsigned int` gives `U32`, `float` gives `F32`, `double` gives `Float` and `_Bool` gives `Bool`. For `long`, `long long` and their unsigned forms, it is the Blink integer type of the same size and sign on the target. `long double` has no Blink type, and its line has no help. A scalar width is the claim of the author (*Signature Types*, below), so the help names a type and does not claim a width.
+
+```blink
+@ffi("pipe", header: "unistd.h")
+@trusted(audit: "UNISTD-PIPE")
+fn c_pipe(fds: Ptr[SockIn]) -> I32 ! () {}
 // blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
-//   `connect` takes `const struct sockaddr *`; this declaration passes `struct sockaddr_in *`
-//   help: declare the parameter `addr: Ptr[Void]`. It takes a `Ptr` to any struct
+//   `pipe` does not match its prototype in `unistd.h`
+//   parameter 1 `fds`: the header takes a pointer to `int`; this declaration passes `struct sockaddr_in *`
+//   label on `fds`: the header takes a pointer to `int`
+//   help: declare the parameter `fds: Ptr[I32]`
 ```
+
+Step four proved `int` with `-Werror=pointer-sign`: `unsigned int *` fails there, so the help names one type. A pointer to a scalar is the case that the help of `Ptr[Void]` does not cover. When the step gives no single type, the line names the family with both signs. This header takes `enum level *`, and the compilers do not agree on its sign:
+
+```blink
+@ffi("set_level", header: "h.h")
+@trusted(audit: "H-SET-LEVEL")
+fn c_set_level(p: Ptr[SockIn]) -> I32 ! () {}
+// h.h: int set_level(enum level *p);       // no type or two types pass the sign step
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `set_level` does not match its prototype in `h.h`
+//   parameter 1 `p`: the header takes a pointer to `int` or `unsigned int`; this declaration passes `struct sockaddr_in *`
+//   label on `p`: the header takes a pointer to `int` or `unsigned int`
+//   help: declare the parameter `p: Ptr[I32]` or `p: Ptr[U32]`
+```
+
+A binding with three parameters reports the slot that fails and no other. Only the second parameter of `readlink` is wrong here:
+
+```blink
+@ffi("readlink", header: "unistd.h")
+@trusted(audit: "UNISTD-READLINK")
+fn c_readlink(path: Ptr[U8], buf: Ptr[SockIn], n: Int) -> Int ! () {}
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `readlink` does not match its prototype in `unistd.h`
+//   parameter 2 `buf`: the header takes a pointer to `char`; this declaration passes `struct sockaddr_in *`
+//   label on `buf`: the header takes a pointer to `char`
+//   help: declare the parameter `buf: Ptr[U8]`
+```
+
+When two parameters fail, one E0861 holds both lines. Each line has its own label and its own help or note. The slot probes put `0` in every other slot, so one wrong slot does not make another fail:
+
+```blink
+@ffi("readlink", header: "unistd.h")
+@trusted(audit: "UNISTD-READLINK")
+fn c_readlink(path: Ptr[SockIn], buf: Ptr[SockIn], n: Int) -> Int ! () {}
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `readlink` does not match its prototype in `unistd.h`
+//   parameter 1 `path`: the header takes a pointer to `char`; this declaration passes `struct sockaddr_in *`
+//   label on `path`: the header takes a pointer to `char`
+//   help: declare the parameter `path: Ptr[U8]`
+//   parameter 2 `buf`: the header takes a pointer to `char`; this declaration passes `struct sockaddr_in *`
+//   label on `buf`: the header takes a pointer to `char`
+//   help: declare the parameter `buf: Ptr[U8]`
+```
+
+**A scalar slot that got a pointer.** When the header takes a number and the declaration passes a pointer, the line says so and gives no help. No probe can tell the width of a number (an `int` argument converts to any other number type without an error under the pins), and "the header takes a number" is the whole proved fact. The note tells the reader where to look:
+
+```blink
+@ffi.opaque(header: "stdio.h", name: "FILE")
+type CFile
+
+@ffi("fgets", header: "stdio.h")
+@trusted(audit: "STDIO-FGETS")
+fn c_fgets(buf: Ptr[U8], n: Ptr[CFile], f: Ptr[CFile]) -> Ptr[U8] ! () {}
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `fgets` does not match its prototype in `stdio.h`
+//   parameter 2 `n`: the header takes a number; this declaration passes `FILE *`
+//   label on `n`: the header takes a number
+//   note: compare `n` with the prototype of `fgets` in `stdio.h`
+```
+
+**The help of `Ptr[Void]`.** The help names `Ptr[Void]` only when three facts hold: the declared type of the parameter is a `Ptr` to an `@ffi.struct` or `@ffi.opaque` type (the declaration shows it), a probe proved that the header has a pointer in that slot (step three), and no scalar family passed (step four). Even then the probes cannot tell a function that takes any struct pointer (`connect` takes any socket address) from one that takes exactly one struct (`nanosleep` takes a `struct timespec`). For the second, `Ptr[Void]` compiles and drops the check that the header gives. So the help never offers `Ptr[Void]` alone. It offers the mirror first, and `Ptr[Void]` with its condition second. When the three facts hold, the mirror probe (step five) runs over the mirrors of the program, and the result decides the help.
+
+*Exactly one mirror passes.* The help names that mirror only. The program mirrors `timespec` for `rem`, so the probe finds it:
+
+```blink
+@ffi.struct(header: "time.h", name: "timespec")
+type TimeSpec { tv_sec: I64, tv_nsec: I64 }
+
+@ffi.struct(header: "sys/time.h", name: "timeval")
+type TimeVal { tv_sec: I64, tv_usec: I64 }
+
+@ffi("nanosleep", header: "time.h")
+@trusted(audit: "TIME-NANOSLEEP")
+fn c_nanosleep(req: Ptr[TimeVal], rem: Ptr[TimeSpec]) -> I32 ! () {}
+// blink build on x86_64-linux-gnu: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `nanosleep` does not match its prototype in `time.h`
+//   parameter 1 `req`: the header takes a pointer to `struct timespec`; this declaration passes `struct timeval *`
+//   label on `req`: the header takes a pointer to `struct timespec`
+//   help: declare the parameter `req: Ptr[TimeSpec]`
+```
+
+*No mirror passes.* The program has no mirror of `timespec`. The help has two fixes, with the mirror first:
+
+```blink
+@ffi.struct(header: "sys/time.h", name: "timeval")
+type TimeVal { tv_sec: I64, tv_usec: I64 }
+
+@ffi("nanosleep", header: "time.h")
+@trusted(audit: "TIME-NANOSLEEP")
+fn c_nanosleep(req: Ptr[TimeVal], rem: Ptr[Void]) -> I32 ! () {}
+// blink build on x86_64-linux-gnu: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `nanosleep` does not match its prototype in `time.h`
+//   parameter 1 `req`: the header takes a pointer to a C type that is not a scalar; this declaration passes `struct timeval *`
+//   label on `req`: the header takes a pointer to a C type that is not a scalar
+//   help: declare `req: Ptr[T]` with an `@ffi.struct` that mirrors the header's type; if `nanosleep` takes more than one struct type here, declare `req: Ptr[Void]`
+```
+
+*Two mirrors pass.* Two mirrors of one C type (the same tag, or a typedef and its tag) both pass. The test never picks one by the order of the declarations. The help has two fixes, as above:
+
+```blink
+@ffi.struct(header: "time.h", name: "timespec")
+type TimeSpec { tv_sec: I64, tv_nsec: I64 }
+
+@ffi.struct(header: "time.h", name: "timespec")
+type Deadline { tv_sec: I64, tv_nsec: I64 }
+
+@ffi.struct(header: "sys/time.h", name: "timeval")
+type TimeVal { tv_sec: I64, tv_usec: I64 }
+
+@ffi("nanosleep", header: "time.h")
+@trusted(audit: "TIME-NANOSLEEP")
+fn c_nanosleep(req: Ptr[TimeVal], rem: Ptr[Void]) -> I32 ! () {}
+// blink build on x86_64-linux-gnu: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `nanosleep` does not match its prototype in `time.h`
+//   parameter 1 `req`: the header takes a pointer to a C type that is not a scalar; this declaration passes `struct timeval *`
+//   label on `req`: the header takes a pointer to a C type that is not a scalar
+//   help: declare `req: Ptr[T]` with an `@ffi.struct` that mirrors the header's type; if `nanosleep` takes more than one struct type here, declare `req: Ptr[Void]`
+```
+
+A program with more mirrors than the cap gets the same help as the two cases above that name no mirror.
+
+On glibc, `connect` takes a union of every socket address pointer type, so `Ptr[SockIn]` passes the test there. On musl and on macOS it fails, with the second help above. The verdict is the verdict of the target of the build (*Feature macros*). A function that takes any struct pointer accepts `Ptr[Void]` on every target:
 
 ```blink
 @ffi.struct(header: "netinet/in.h", name: "sockaddr_in")
@@ -153,15 +313,62 @@ fn main() {
 }
 ```
 
-The help of E0861 offers `Ptr[Void]` only when the declaration passes a pointer to a different named C type, as above. It is the fix for that cause and for no other. A pointer to the wrong struct for a function that takes a plain `int *` is a wrong claim, not a case for `Ptr[Void]`:
+The help of E0861 is the fix for a pointer to a different named C type, and for no other cause. A pointer to the wrong struct for a function that takes a plain `int *` is a wrong claim, not a case for `Ptr[Void]`. The `pipe` example above shows it: a scalar family passed, so the help names `Ptr[I32]`.
+
+**The count.** The message gives the exact count that the probes found. The help names a parameter to remove only when exactly one drop-one probe passes (step six). Each drop-one probe keeps the declared types, so `pipe(fds, flags)` with `fds` removed puts an `I32` in a pointer slot, and only the drop of `flags` passes:
 
 ```blink
 @ffi("pipe", header: "unistd.h")
 @trusted(audit: "UNISTD-PIPE")
-fn c_pipe(fds: Ptr[SockIn]) -> I32 ! () {}
+fn c_pipe(fds: Ptr[I32], flags: I32) -> I32 ! () {}
 // blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
-//   `pipe` takes `int *`; this declaration passes `struct sockaddr_in *`
+//   `pipe` takes 1 parameter; this declaration has 2
+//   help: remove the parameter `flags`
 ```
+
+When the extra parameter has the same C type as a neighbor, several drops pass. The help then names no parameter, and the note tells the reader to compare. The count stays in the message. Here three drops pass, so no drop is proved:
+
+```blink
+@ffi("dup2", header: "unistd.h")
+@trusted(audit: "UNISTD-DUP2")
+fn c_dup2(old: I32, new: I32, extra: I32) -> I32 ! () {}
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `dup2` takes 2 parameters; this declaration has 3
+//   note: compare the parameters with the prototype of `dup2` in `unistd.h`
+```
+
+A variadic function says "at least". The count line has no label, because it is not one parameter:
+
+```blink
+@ffi("printf", header: "stdio.h")
+@trusted(audit: "STDIO-PRINTF")
+fn c_printf() -> I32 ! () {}
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `printf` takes at least 1 parameter; this declaration has 0
+//   note: compare the parameters with the prototype of `printf` in `stdio.h`
+```
+
+**The fallback text.** In three cases the probes prove no slot, and the report has no slot line, because a slot line would name a slot that no probe proved:
+
+- No count passes in step one. A by-value `@ffi.struct` parameter that the header does not take fails every probe, because `0` cannot replace it.
+- Every slot fails: every parameter and the result, for a declaration with a result that is not `()`.
+- The first probe failed, but the count is right and every slot probe passes.
+
+The text is the same in the three cases:
+
+```blink
+@ffi.struct(header: "netinet/in.h", name: "sockaddr_in")
+type SockIn { sin_family: U16, sin_port: U16, sin_addr: U32, sin_zero: I64 }
+
+@ffi("inet_ntoa", header: "arpa/inet.h")
+@trusted(audit: "ARPA-INET-NTOA")
+fn c_inet_ntoa(addr: SockIn) -> Ptr[U8] ! () {}
+// blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+//   `inet_ntoa` does not match its prototype in `arpa/inet.h`
+//   help: compare each `Ptr`, by-value struct, the count and the result with the header
+```
+
+`inet_ntoa` takes a `struct in_addr` by value. The declaration passes a `struct sockaddr_in`, so every call that keeps it fails, and no `k` passes in step one.
 
 **What the prototype test covers.** The test compiles every `@ffi` wrapper that the unit compiles, with the includes of the unit. A binding with no `header:` is in the test. If another header that the unit reads declares its symbol, the call goes through that prototype (*What `header:` does*), and a wrong claim is `ForeignPrototypeMismatch` (E0861) at the `@ffi` line, exit `1`. It is never I0017. The note names the header that declares the symbol:
 
@@ -174,7 +381,10 @@ fn c_getpid() -> I32 ! ()
 @trusted(audit: "UNISTD-PIPE")
 fn c_pipe(fds: Ptr[SockIn]) -> I32 ! ()
 // blink build: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
-//   `pipe` takes `int *`; this declaration passes `struct sockaddr_in *`
+//   `pipe` does not match its prototype in `unistd.h`
+//   parameter 1 `fds`: the header takes a pointer to `int`; this declaration passes `struct sockaddr_in *`
+//   label on `fds`: the header takes a pointer to `int`
+//   help: declare the parameter `fds: Ptr[I32]`
 //   note: `unistd.h` declares `pipe`; this unit reads it because another declaration names it
 ```
 
@@ -185,13 +395,14 @@ A binding names a header, the header is found, but it does not declare the symbo
 @trusted(audit: "MMAN-MEMFD-CREATE")
 fn c_memfd_create(name: Ptr[U8], flags: U32) -> I32 ! ()
 // blink build on macOS: error[ForeignPrototypeMismatch] (E0861) at the @ffi line, exit 1
+// sys/mman.h (macOS): no declaration of `memfd_create`
 //   `sys/mman.h` does not declare `memfd_create` for this target (aarch64-macos)
 //   help: remove `header:`; the call then uses this declaration's prototype, unchecked
 //   note: if the target does not have `memfd_create`, it is not available for this target,
 //         and the link step stops instead (E0857)
 ```
 
-On Linux the same declaration passes, because the header declares `memfd_create` there.
+On Linux the same declaration passes, because the header declares `memfd_create` there. This case has no slot line, no label and no probe of the slots: the call does not name a prototype, so the probes of *The probes* have nothing to test. It has the one help and the note above, and no other text.
 
 `blink build` and `blink test` run three C tests, in this order, before they compile the unit: the header test (E0859), the layout test of each `@ffi.struct` mirror (E0862, §9.1.3 *Static layout assertions*), and the prototype test (E0861). If the header is there, the layout test and the prototype test pass, but the C compiler still rejects the generated C, the stop is `GeneratedCDidNotCompile` (I0017). Its note names the `@ffi` declarations of the program and says that a wrong prototype that the test did not find can also cause it (§8.10.5). An example is a build with `tcc`.
 
