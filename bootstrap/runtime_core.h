@@ -44,6 +44,9 @@
 #include <mach-o/dyld.h>
 #endif
 #define GC_THREADS
+/* Boehm prints "GC Warning" lines to stderr at random; the program did not ask for them and they
+   break stderr compares. GC_PRINT_STATS still shows them. */
+#define GC_IGNORE_WARN
 #include <gc.h>
 #if !defined(__APPLE__)
 /* A libc that gets _POSIX_C_SOURCE alone, such as musl, declares realpath only past it. The

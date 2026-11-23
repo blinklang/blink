@@ -1,0 +1,52 @@
+// Boehm GC can print a "GC Warning: ..." line to stderr at any time, for example after repeated
+// large allocations. The program did not ask for it, and it breaks each tool that compares
+// stderr. So each Blink program must start with Boehm's quiet warn proc in place. The warning
+// itself comes at random, so the test checks the warn proc, not stderr. Blink cannot take the
+// address of a C fn, so a vendored C source makes the compare.
+import std.process.{ChildEnd, ProcessResult, ChildLimits}
+import std.time.{Duration}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd], limits: ChildLimits { timeout: Some(Duration.seconds(300)) }).unwrap()
+}
+
+// The corpus exports module filters that make each build one unit, so the run drops them:
+// --per-module must reach the per-module path.
+fn blink_in(dir: Str, cmd: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE -u BLINK_ROOT -u BLINK_COMPILER_ARCHIVE -u BLINK_SKIP_MODULES -u BLINK_ONLY_MODULE BLINK_CACHE_DIR={dir}/cache BLINK_BIN=$B $B {cmd} < /dev/null")
+}
+
+fn diag(r: ProcessResult) -> Str {
+    "exit {r.end}\nstdout:\n{r.out}\nstderr:\n{r.err_out}"
+}
+
+let MANIFEST = "[package]\nname = \"gcwarn\"\nversion = \"0.1.0\"\n\n[native-dependencies]\ngcprobe = \{ type = \"vendored\", path = \"vendor/gcprobe.c\", headers = [\"gcprobe.h\"] \}\n"
+
+let PROBE_HEADER = "#ifndef GCPROBE_H\n#define GCPROBE_H\n#include <stdint.h>\nint64_t gcprobe_warn_is_ignored(void);\n#endif\n"
+
+let PROBE_SOURCE = "#include <gc.h>\n#include \"gcprobe.h\"\nint64_t gcprobe_warn_is_ignored(void) \{ return GC_get_warn_proc() == GC_ignore_warn_proc; }\n"
+
+test "a program starts with the GC warn proc that drops each warning" {
+    let dir = sh("mktemp -d /tmp/blink_gc_warn.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/src {dir}/vendor")
+    fs.write("{dir}/blink.toml", MANIFEST).unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/vendor/gcprobe.h", PROBE_HEADER).unwrap()
+    fs.write("{dir}/vendor/gcprobe.c", PROBE_SOURCE).unwrap()
+    fs.write("{dir}/src/main.bl", #"
+@ffi("gcprobe", "gcprobe_warn_is_ignored")
+@trusted(audit: "T1")
+fn warn_is_ignored() -> I64 ! () {}
+
+fn main() {
+    io.println("{warn_is_ignored()}")
+}
+"#).unwrap()
+    let pm = blink_in(dir, "run --per-module src/main.bl")
+    let one = blink_in(dir, "run --no-per-module src/main.bl")
+    let _ = sh("rm -rf {dir}")
+    assert_eq(pm.end, ChildEnd.Exited(0), "--per-module: {diag(pm)}")
+    assert_eq(pm.out.trim(), "1", "--per-module: {diag(pm)}")
+    assert_eq(one.end, ChildEnd.Exited(0), "--no-per-module: {diag(one)}")
+    assert_eq(one.out.trim(), "1", "--no-per-module: {diag(one)}")
+}
