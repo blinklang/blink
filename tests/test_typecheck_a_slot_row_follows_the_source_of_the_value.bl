@@ -1,0 +1,610 @@
+// The slot row of a value is the row of the callbacks that its sources hold: the literal that
+// made it, the fn that returned it, the parameter or field it came from. A `_` in a declared
+// type is not a row that the value holds (sections/04_effects.md §4.15.5).
+
+import compile_test_helpers
+
+// Each source parses and the compiler ends with exit 0 or 1: a row that passes on a parse
+// error or on a crash, whose output has no error record, proves nothing about the slot.
+fn capture(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_printf_and_capture(src.replace("\\", "\\\\").replace("%", "%%"), tag)
+    if out.contains("UnexpectedToken") {
+        io.println("FAIL: {tag} does not parse")
+        assert(false)
+    }
+    if !out.ends_with("exit=0\n") && !out.ends_with("exit=1\n") {
+        io.println("FAIL: {tag} does not end with exit 0 or 1")
+        assert(false)
+    }
+    out
+}
+
+let CLEANUP = #"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+impl BlockHandler for Cleanup[! _] {
+    type Context = Void
+    fn enter(self) -> Void { let _ = self }
+    fn exit(self, ok: Bool) ! _ {
+        let _ = ok
+        (self.action)()
+    }
+}
+pub fn cleanup(action: fn() -> Void ! _) -> Cleanup[! _] {
+    Cleanup { action: action }
+}
+"#
+
+test "a value a ctor fn returns holds the row of the closure the call gives it" {
+    let out = capture(CLEANUP.concat(#"fn loud() ! IO.Print {
+    with cleanup(fn() { io.println("bye") }) {
+        let _ = 1
+    }
+}
+fn loud2() ! IO.Print {
+    let c = cleanup(fn() { io.println("bye") })
+    (c.action)()
+}
+fn passed(g: fn() -> Void ! IO.Print) ! IO.Print {
+    with cleanup(g) { let _ = 1 }
+}
+fn main() ! IO.Print {
+    loud()
+    loud2()
+}
+"#), "slot_src_ctor_fn_ok")
+    compile_test_helpers.expect_compiles_clean(out, "a fn that declares the row of the closure compiles")
+}
+
+test "a value a ctor fn returns charges the row of its closure" {
+    let out = capture(CLEANUP.concat(#"fn bye() ! IO.Print { io.println("bye") }
+fn quiet() {
+    with cleanup(bye) {
+        let _ = 1
+    }
+}
+fn main() { }
+"#), "slot_src_ctor_fn_bad")
+    compile_test_helpers.expect_error(out, "E0500", "the with charges the row the closure gives the slot")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the row of the closure")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a pure ctor fn call charges nothing" {
+    let out = capture(CLEANUP.concat(#"fn nop() { }
+fn quiet() {
+    with cleanup(nop) {
+        let _ = 1
+    }
+}
+fn main() { }
+"#), "slot_src_ctor_fn_pure")
+    compile_test_helpers.expect_compiles_clean(out, "a pure closure gives the slot no row")
+}
+
+test "a field copied into a new literal holds the row of the old value" {
+    let src = #"type Timer[! _] {
+    every: Int
+    tick: fn(Int) -> Void ! _
+}
+fn fire(t: Timer[! _], n: Int) ! _ {
+    (t.tick)(n)
+}
+fn nop(n: Int) { let _ = n }
+fn say(n: Int) ! IO.Print { io.println("{n}") }
+fn pure() {
+    let mut t = Timer { every: 1, tick: nop }
+    t = Timer { every: t.every + 1, tick: t.tick }
+    fire(t, 1)
+}
+fn loud() {
+    let mut t = Timer { every: 1, tick: say }
+    t = Timer { every: t.every + 1, tick: t.tick }
+    fire(t, 1)
+}
+fn main() { }
+"#
+    let out = capture(src, "slot_src_field_copy")
+    compile_test_helpers.expect_error(out, "E0500", "the copied field keeps the row of `say`")
+    compile_test_helpers.expect_contains(out, "\"line\":18", "the error is in loud")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a value read from a slotted field through let and for holds the row of the field" {
+    let out = capture(#"type Route[! _] {
+    path: Str
+    on: fn(Int) -> Int ! _
+}
+type Server[! _] {
+    routes: List[Route[! _]]
+    main: Route[! _]
+}
+fn each(s: Server[! IO.Print]) ! IO.Print {
+    for r in s.routes {
+        let _ = (r.on)(1)
+    }
+}
+fn direct(s: Server[! IO.Print]) ! IO.Print {
+    let _ = (s.main.on)(1)
+}
+fn local(s: Server[! IO.Print]) ! IO.Print {
+    let r = s.main
+    let _ = (r.on)(1)
+}
+fn quiet(s: Server[! IO.Print]) {
+    let r = s.main
+    let _ = (r.on)(1)
+}
+fn main() { }
+"#, "slot_src_field_read")
+    compile_test_helpers.expect_error(out, "E0500", "a fn with no row that runs the field is charged")
+    compile_test_helpers.expect_contains(out, "\"line\":23", "the error is in quiet")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a value a match binds from a slotted field gives no false `_`" {
+    let out = capture(#"type Node[! _] {
+    f: fn() -> Void ! _
+    next: Option[Node[! _]]
+}
+fn walk(n: Node[! IO.Print]) ! IO.Print {
+    match n.next {
+        Some(m) => (m.f)()
+        None => { }
+    }
+}
+fn main() { }
+"#, "slot_src_match_binder")
+    compile_test_helpers.expect_compiles_clean(out, "a fn that declares the slot row compiles")
+}
+
+// Each step reads the field of the value before it, so a walk with no memo grows with the
+// power of the step count.
+test "a chain of reassigns and spreads checks fast" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+type Outer[! _] {
+    inner: Cleanup[! _]
+}
+type Timer[! _] {
+    every: Int
+    name: Str
+    tick: fn(Int) -> Void ! _
+}
+fn fwd(c: Cleanup[! _]) ! _ {
+    (c.action)()
+}
+fn pure() { }
+fn quiet() {
+    let mut o = Outer { inner: Cleanup { action: pure } }
+    o = Outer { inner: o.inner }
+    o = Outer { inner: o.inner }
+    o = Outer { inner: o.inner }
+    o = Outer { inner: o.inner }
+    o = Outer { inner: o.inner }
+    o = Outer { inner: o.inner }
+    o = Outer { inner: o.inner }
+    o = Outer { inner: o.inner }
+    fwd(o.inner)
+}
+fn ticks() ! IO.Print {
+    let mut t = Timer { every: 5, name: "a", tick: fn(n) { io.println("tick {n}") } }
+    t = Timer { every: 10, ..t }
+    t = Timer { name: "b", ..t }
+    t = Timer { every: 20, ..t }
+    t = Timer { name: "c", ..t }
+    t = Timer { every: 30, ..t }
+    t = Timer { name: "d", ..t }
+    (t.tick)(1)
+}
+fn main() { }
+"#, "slot_src_chain")
+    compile_test_helpers.expect_compiles_clean(out, "the chain keeps the rows and ends")
+}
+
+test "a spread gives only the fields the literal does not set" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+type Outer[! _] {
+    inner: Cleanup[! _]
+}
+fn fwd(c: Cleanup[! _]) ! _ {
+    (c.action)()
+}
+fn say() ! IO.Print { io.println("x") }
+fn pure() { }
+fn quiet() {
+    let c = Cleanup { action: pure }
+    let o = Outer { inner: Cleanup { action: say } }
+    let o2 = Outer { inner: c, ..o }
+    fwd(o2.inner)
+}
+fn main() { }
+"#, "slot_src_spread_override")
+    compile_test_helpers.expect_compiles_clean(out, "the field the literal sets hides the field of the spread")
+}
+
+test "a param with a row in its slot keeps the row" {
+    let out = capture(#"type Job[T ! _] {
+    input: T
+    run: fn(T) -> Void ! _
+}
+fn bad(j: Job[Int ! IO.Print]) { (j.run)(j.input) }
+fn main() { }
+"#, "slot_src_param_row")
+    compile_test_helpers.expect_error(out, "E0500", "a call through the param's field is charged the row of its type")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the row")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a literal given to a BlockHandler type parameter charges its slot row" {
+    let out = capture(CLEANUP.concat(#"fn say() ! IO.Print { io.println("x") }
+fn g[T: BlockHandler](t: T) ! _ {
+    with t {
+        let _ = 0
+    }
+}
+fn quiet() { g(Cleanup { action: say }) }
+fn main() { }
+"#), "slot_src_generic_bound")
+    compile_test_helpers.expect_error(out, "E0500", "the call of g is charged the slot row of the literal")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the row of `say`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a field of a ctor call result and an item of a list literal hold the row of their closure" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn mk(g: fn() -> Void ! _) -> Cleanup[! _] { Cleanup { action: g } }
+fn say() ! IO.Print { io.println("x") }
+fn direct() {
+    (mk(say).action)()
+}
+fn each() {
+    let cs = [Cleanup { action: say }]
+    for c in cs {
+        (c.action)()
+    }
+}
+fn main() { }
+"#, "slot_src_call_and_list")
+    compile_test_helpers.expect_contains(out, "\"line\":7", "the call through the ctor result is charged")
+    compile_test_helpers.expect_contains(out, "\"line\":12", "the call through the list item is charged")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 2)
+}
+
+test "a value passed back through a fn in a loop is walked once" {
+    let out = capture(CLEANUP.concat(#"fn nop() { }
+fn wrap(c: Cleanup[! _]) -> Cleanup[! _] { c }
+fn add(c: Cleanup[! _], f: fn() -> Void ! _) -> Cleanup[! _] {
+    let _ = f
+    c
+}
+trait Again {
+    fn again(self) -> Self
+}
+impl Again for Cleanup[! _] {
+    fn again(self) -> Cleanup[! _] { self }
+}
+fn by_fn() {
+    let mut c = cleanup(nop)
+    c = wrap(c)
+    (c.action)()
+}
+fn by_loop() {
+    let mut c = cleanup(nop)
+    for _ in 0..3 { c = add(c, nop) }
+    with c { let _ = 1 }
+}
+fn by_method() {
+    let mut c = cleanup(nop)
+    c = c.again()
+    with c { let _ = 1 }
+}
+fn main() { }
+"#), "slot_src_loop_back")
+    compile_test_helpers.expect_compiles_clean(out, "a pure value passed back through a fn charges nothing")
+}
+
+test "a long chain of branches through a fn checks fast" {
+    let out = capture(CLEANUP.concat(#"fn say() ! IO.Print { io.println("x") }
+fn wrap(c: Cleanup[! _]) -> Cleanup[! _] { c }
+fn quiet(b: Bool) {
+    let c0 = cleanup(say)
+    let c1 = if b { wrap(c0) } else { c0 }
+    let c2 = if b { wrap(c1) } else { c1 }
+    let c3 = if b { wrap(c2) } else { c2 }
+    let c4 = if b { wrap(c3) } else { c3 }
+    let c5 = if b { wrap(c4) } else { c4 }
+    let c6 = if b { wrap(c5) } else { c5 }
+    let c7 = if b { wrap(c6) } else { c6 }
+    let c8 = if b { wrap(c7) } else { c7 }
+    let c9 = if b { wrap(c8) } else { c8 }
+    let c10 = if b { wrap(c9) } else { c9 }
+    let c11 = if b { wrap(c10) } else { c10 }
+    let c12 = if b { wrap(c11) } else { c11 }
+    let c13 = if b { wrap(c12) } else { c12 }
+    let c14 = if b { wrap(c13) } else { c13 }
+    let c15 = if b { wrap(c14) } else { c14 }
+    let c16 = if b { wrap(c15) } else { c15 }
+    let c17 = if b { wrap(c16) } else { c16 }
+    let c18 = if b { wrap(c17) } else { c17 }
+    let c19 = if b { wrap(c18) } else { c18 }
+    let c20 = if b { wrap(c19) } else { c19 }
+    let c21 = if b { wrap(c20) } else { c20 }
+    let c22 = if b { wrap(c21) } else { c21 }
+    let c23 = if b { wrap(c22) } else { c22 }
+    let c24 = if b { wrap(c23) } else { c23 }
+    let c25 = if b { wrap(c24) } else { c24 }
+    let c26 = if b { wrap(c25) } else { c25 }
+    let c27 = if b { wrap(c26) } else { c26 }
+    let c28 = if b { wrap(c27) } else { c27 }
+    let c29 = if b { wrap(c28) } else { c28 }
+    let c30 = if b { wrap(c29) } else { c29 }
+    (c30.action)()
+}
+fn main() { }
+"#), "slot_src_branch_chain")
+    compile_test_helpers.expect_error(out, "E0500", "the end of the chain holds the row of `say`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a trait call through the trait name reads the receiver from the first argument" {
+    let out = capture(CLEANUP.concat(#"fn nop() { }
+fn say() ! IO.Print { io.println("x") }
+trait Chain {
+    fn then2(self, f: fn() -> Void ! _) -> Self
+}
+impl Chain for Cleanup[! _] {
+    fn then2(self, f: fn() -> Void ! _) -> Cleanup[! _] {
+        let _ = self
+        Cleanup { action: f }
+    }
+}
+fn q1() {
+    let c = Chain.then2(cleanup(nop), say)
+    (c.action)()
+}
+fn q2() {
+    with Chain.then2(cleanup(nop), say) { let _ = 1 }
+}
+fn main() { }
+"#), "slot_src_trait_qualified")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 2)
+    compile_test_helpers.expect_contains(out, "IO.Print", "the errors name the row of `say`")
+}
+
+test "a generic fn passes on the row of the value it is given" {
+    let out = capture(CLEANUP.concat(#"fn say() ! IO.Print { io.println("x") }
+fn id[T](x: T) -> T { x }
+fn first[T](xs: List[T]) -> T { xs.get(0).unwrap() }
+fn useall[T: BlockHandler](ts: List[T]) ! _ {
+    for t in ts { with t { let _ = 1 } }
+}
+fn q1() {
+    let c = id(cleanup(say))
+    (c.action)()
+}
+fn q2() {
+    with id(cleanup(say)) { let _ = 1 }
+}
+fn q3() {
+    (first([cleanup(say)]).action)()
+}
+fn q4() {
+    useall([cleanup(say)])
+}
+fn main() { }
+"#), "slot_src_generic")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 4)
+    compile_test_helpers.expect_contains(out, "IO.Print", "the errors name the row of `say`")
+}
+
+test "a call of one `_` field charges the whole slot" {
+    let out = capture(#"type Two[! _] {
+    a: fn() -> Void ! _
+    b: fn() -> Void ! _
+}
+fn nop() { }
+fn say() ! IO.Print { io.println("x") }
+fn quiet() {
+    let t = Two { a: nop, b: say }
+    (t.a)()
+}
+fn main() { }
+"#, "slot_src_whole_slot")
+    compile_test_helpers.expect_error(out, "E0500", "the slot holds the row of `say`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a value made by a builtin form holds the row of its parts" {
+    let out = capture(#"type Timer[! _] {
+    tick: fn(Int) -> Void ! _
+}
+type Box[! _] {
+    t: Timer[! _]
+    opt: Option[Timer[! _]]
+    all: List[Timer[! _]]
+    pair: (Timer[! _], Int)
+}
+fn sayi(n: Int) ! IO.Print { io.println("{n}") }
+fn fire(b: Box[! _]) ! _ {
+    match b.opt {
+        Some(t) => (t.tick)(1)
+        None => { }
+    }
+}
+fn m1(b: Box[! IO.Print]) {
+    let t = b.opt ?? b.t
+    (t.tick)(1)
+}
+fn m2(b: Box[! IO.Print]) {
+    let t = b.opt.unwrap()
+    (t.tick)(1)
+}
+fn m3(b: Box[! IO.Print]) {
+    let t = b.all.get(0).unwrap()
+    (t.tick)(1)
+}
+fn m4(b: Box[! IO.Print]) {
+    let t = b.pair.0
+    (t.tick)(1)
+}
+fn m5(b: Box[! IO.Print]) {
+    (b.all.get(0).unwrap().tick)(1)
+}
+fn nopi(n: Int) { let _ = n }
+fn m6() {
+    let q = Timer { tick: nopi }
+    fire(Box { t: q, opt: Some(Timer { tick: sayi }), all: [], pair: (q, 1) })
+}
+fn main() { }
+"#, "slot_src_builtin_form")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 6)
+    compile_test_helpers.expect_contains(out, "IO.Print", "the errors name the row of `sayi`")
+}
+
+test "a slotted value the walk does not follow is charged its `_`, not passed" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn say() ! IO.Print { io.println("x") }
+fn quiet() {
+    let mk = fn() -> Cleanup[! _] { Cleanup { action: say } }
+    let c = mk()
+    (c.action)()
+}
+fn main() { }
+"#, "slot_src_unknown_leaf")
+    compile_test_helpers.expect_error(out, "E0500", "a value from a call of a closure is charged")
+    compile_test_helpers.expect_contains(out, "\"line\":8", "the error is at the call of the field")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a `None` or an empty list in a slotted field gives no `_`" {
+    let out = capture(#"type Timer[! _] {
+    tick: fn(Int) -> Void ! _
+}
+type Box[! _] {
+    t: Timer[! _]
+    opt: Option[Timer[! _]]
+    all: List[Timer[! _]]
+}
+fn fire(b: Box[! _]) ! _ {
+    (b.t.tick)(1)
+}
+fn nopi(n: Int) { let _ = n }
+fn pure(c: Bool) {
+    let t = Timer { tick: nopi }
+    fire(Box { t: t, opt: None, all: [] })
+    fire(Box { t: t, opt: if c { None } else { Some(t) }, all: [] })
+}
+fn main() { }
+"#, "slot_src_none_and_empty")
+    compile_test_helpers.expect_compiles_clean(out, "a `None` holds no callback")
+}
+
+test "a callback added to a list after its literal is charged" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn cleanup(action: fn() -> Void ! _) -> Cleanup[! _] {
+    Cleanup { action: action }
+}
+fn say() ! IO.Print { io.println("x") }
+fn nop() { }
+fn add(xs: List[Cleanup[! IO.Print]]) ! IO.Print { xs.push(cleanup(say)) }
+fn by_method() {
+    let mut xs = [cleanup(nop)]
+    xs.push(cleanup(say))
+    for c in xs { (c.action)() }
+}
+fn by_fn() ! IO.Print {
+    let xs = [cleanup(nop)]
+    add(xs)
+    for c in xs { (c.action)() }
+}
+fn main() { }
+"#, "slot_src_list_push")
+    compile_test_helpers.expect_error(out, "E0500", "a callback pushed after the literal is charged")
+    compile_test_helpers.expect_contains(out, "\"line\":13", "the error is in by_method")
+}
+
+test "a list a builtin `map` makes holds what its fn returns" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn cleanup(action: fn() -> Void ! _) -> Cleanup[! _] {
+    Cleanup { action: action }
+}
+fn say() ! IO.Print { io.println("x") }
+fn quiet() {
+    let ys = [1].map(fn(n) { cleanup(say) })
+    for c in ys { (c.action)() }
+}
+fn main() { }
+"#, "slot_src_builtin_map")
+    compile_test_helpers.expect_error(out, "E0500", "the items `map` makes are charged")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a list a tuple pattern binds is charged" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn cleanup(action: fn() -> Void ! _) -> Cleanup[! _] {
+    Cleanup { action: action }
+}
+fn say() ! IO.Print { io.println("x") }
+fn quiet() {
+    let (xs, n) = ([cleanup(say)], 1)
+    let _ = n
+    for c in xs { (c.action)() }
+}
+fn main() { }
+"#, "slot_src_tuple_pattern")
+    compile_test_helpers.expect_error(out, "E0500", "a list from a tuple pattern is charged")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a list that only a `for` and builtin methods read keeps the row of its literal" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn cleanup(action: fn() -> Void ! _) -> Cleanup[! _] {
+    Cleanup { action: action }
+}
+fn nop() { }
+fn pure() {
+    let xs = [cleanup(nop)]
+    for c in xs { (c.action)() }
+    (xs.get(0).unwrap().action)()
+    let _ = xs.len()
+}
+fn main() { }
+"#, "slot_src_list_read_only")
+    compile_test_helpers.expect_compiles_clean(out, "a list read only by a for and builtin methods is not charged `_`")
+}
+
+test "a value of a kind the walk does not list gets the rows its type names" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn cleanup(action: fn() -> Void ! _) -> Cleanup[! _] {
+    Cleanup { action: action }
+}
+fn say() ! IO.Print { io.println("x") }
+type Bag {
+    items: List[Cleanup[! IO.Print]]
+}
+fn quiet(b: Bag) {
+    for c in b.items { (c.action)() }
+}
+fn main() { }
+"#, "slot_src_plain_field_type")
+    compile_test_helpers.expect_error(out, "E0500", "a list read from a plain struct field is charged its item row")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}

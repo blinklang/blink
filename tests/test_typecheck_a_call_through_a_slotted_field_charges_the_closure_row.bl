@@ -1,0 +1,254 @@
+// A value of a slotted type keeps the row of the closures it holds. A call of a stored closure
+// charges that row where the call is, and a `with` on a slotted `BlockHandler` value charges it
+// at the `with` (sections/04_effects.md §4.15.5, §4.15.4).
+
+import compile_test_helpers
+
+// Each source parses: a row that passes on a parse error proves nothing about the slot.
+fn capture(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    if out.contains("UnexpectedToken") {
+        io.println("FAIL: {tag} does not parse")
+        assert(false)
+    }
+    out
+}
+
+test "a call through a slotted field in a fn that lacks the row is E0500" {
+    let src = #"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn run(c: Cleanup[! IO.Print]) {
+    (c.action)()
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_field_call_charged")
+    compile_test_helpers.expect_error(out, "E0500", "the call charges the slot row")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the missing effect")
+    compile_test_helpers.expect_contains(out, "\"line\":5", "the error is at the call")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "the caller of a forwarding fn is charged the slot row" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn fwd(c: Cleanup[! _]) ! _ {
+    (c.action)()
+}
+fn quiet(c: Cleanup[! IO.Print]) {
+    fwd(c)
+}
+fn main() { }
+"#, "row_slot_no_leak_fwd")
+    compile_test_helpers.expect_error(out, "E0500", "the caller of a forwarding fn is charged the slot row")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the slot row")
+    compile_test_helpers.expect_contains(out, "\"line\":8,\"col\":5", "the error is at the call of `fwd`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a timer outside std keeps the row of its tick" {
+    let src = #"type Timer[! _] {
+    every: Int
+    tick: fn(Int) -> Void ! _
+}
+fn fire(t: Timer[! _], n: Int) ! _ {
+    (t.tick)(n)
+}
+fn main() ! IO {
+    let t = Timer { every: 5, tick: fn(n: Int) { io.println("tick {n}") } }
+    fire(t, 1)
+}
+"#
+    let out = capture(src, "row_slot_timer")
+    compile_test_helpers.expect_compiles_clean(out, "the slot is IO.Print and main holds IO")
+}
+
+// A named fn in the field is not charged where it is written, so the one E0500 can only come
+// from the row that the literal gives its slot.
+test "a literal gives its slot the row of the fn it stores" {
+    let src = #"type Timer[! _] {
+    every: Int
+    tick: fn(Int) -> Void ! _
+}
+fn fire(t: Timer[! _], n: Int) ! _ {
+    (t.tick)(n)
+}
+fn say(n: Int) ! IO.Print { io.println("tick {n}") }
+fn quiet() {
+    let t = Timer { every: 5, tick: say }
+    fire(t, 1)
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_literal_row")
+    compile_test_helpers.expect_error(out, "E0500", "the slot of the literal is IO.Print")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the row of `say`")
+    compile_test_helpers.expect_contains(out, "\"line\":11,\"col\":5", "the error is at the call of `fire`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a with on a slotted value charges its slot row at the with" {
+    let src = #"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+impl BlockHandler for Cleanup[! _] {
+    type Context = Void
+    fn enter(self) -> Void {
+        let _ = self
+    }
+    fn exit(self, ok: Bool) ! _ {
+        let _ = ok
+        (self.action)()
+    }
+}
+fn scratch(c: Cleanup[! FS.Delete]) ! IO {
+    with c {
+        io.println("work")
+    }
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_with_charged")
+    compile_test_helpers.expect_error(out, "E0500", "the with runs exit, whose row is the slot row")
+    compile_test_helpers.expect_contains(out, "FS.Delete", "the error names the slot row")
+    compile_test_helpers.expect_contains(out, "\"line\":15,\"col\":10", "the error is at the with item")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "an impl for a slotted type takes its _ from the slot" {
+    let src = #"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+impl BlockHandler for Cleanup[! _] {
+    type Context = Void
+    fn enter(self) -> Void {
+        let _ = self
+    }
+    fn exit(self, ok: Bool) ! _ {
+        let _ = ok
+        (self.action)()
+    }
+}
+fn scratch(c: Cleanup[! FS.Delete]) ! FS.Delete, IO {
+    with c {
+        io.println("work")
+    }
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_impl_self_source")
+    compile_test_helpers.expect_compiles_clean(out, "the slot of the impl type is the source of `_` in exit")
+}
+
+// A test is a root, so it may stop a child in a cleanup.
+test "a test that stops a child in a cleanup compiles" {
+    let src = #"import std.testing.{cleanup}
+test "daemon stops at the end" {
+    let child = process.spawn("sleep", ["5"]).unwrap()
+    with cleanup(fn() { let _ = process.signal(child, 15) }) {
+        io.println("daemon runs")
+    }
+}
+"#
+    let out = capture(src, "row_slot_daemon_test_root")
+    compile_test_helpers.expect_compiles_clean(out, "a test root holds Process.Signal")
+}
+
+test "a field written with the slot holds the slot row of the value it is read from" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+type Outer[! _] {
+    inner: Cleanup[! _]
+}
+fn fwd(c: Cleanup[! _]) ! _ {
+    (c.action)()
+}
+fn named(o: Outer[! IO.Print]) {
+    fwd(o.inner)
+}
+fn main() { }
+"#, "row_slot_field_read_named")
+    compile_test_helpers.expect_error(out, "E0500", "the field holds the slot row of its value")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the slot row")
+    compile_test_helpers.expect_contains(out, "\"line\":11,\"col\":5", "the error is at the call of `fwd`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a field of a literal holds the row the literal gives the slot" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+type Outer[! _] {
+    inner: Cleanup[! _]
+}
+fn say() ! IO.Print {
+    io.println("x")
+}
+fn fwd(c: Cleanup[! _]) ! _ {
+    (c.action)()
+}
+fn quiet() {
+    let o = Outer { inner: Cleanup { action: say } }
+    fwd(o.inner)
+}
+fn main() { }
+"#, "row_slot_field_read_literal")
+    compile_test_helpers.expect_error(out, "E0500", "the field holds the row of the literal")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the slot row")
+    compile_test_helpers.expect_contains(out, "\"line\":15,\"col\":5", "the error is at the call of `fwd`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a generic fn bound by BlockHandler is charged the slot row of its argument" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+impl BlockHandler for Cleanup[! _] {
+    type Context = Void
+    fn enter(self) -> Void {
+        let _ = self
+    }
+    fn exit(self, ok: Bool) ! _ {
+        let _ = ok
+        (self.action)()
+    }
+}
+fn g[T: BlockHandler](t: T) ! _ {
+    let u = t
+    with u {
+        let _ = 0
+    }
+}
+fn quiet(c: Cleanup[! IO.Print]) {
+    g(c)
+}
+fn main() { }
+"#, "row_slot_generic_bound")
+    compile_test_helpers.expect_error(out, "E0500", "the bound path charges the slot row")
+    compile_test_helpers.expect_contains(out, "IO.Print", "the error names the slot row")
+    compile_test_helpers.expect_contains(out, "\"line\":21,\"col\":5", "the error is at the call of `g`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a closure that calls a slotted field runs the slot row where it is written" {
+    let out = capture(#"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn run(f: fn() -> Void ! _) ! _ {
+    f()
+}
+fn quiet(c: Cleanup[! IO.Print]) {
+    run(fn() { (c.action)() })
+}
+fn loud(c: Cleanup[! IO.Print]) ! IO.Print {
+    run(fn() { (c.action)() })
+}
+fn main() { }
+"#, "row_slot_closure_calls_field")
+    compile_test_helpers.expect_error(out, "E0500", "the fn that lacks the row gets the error")
+    compile_test_helpers.expect_contains(out, "\"line\":8,\"col\":17", "the error is at the call in the closure")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}

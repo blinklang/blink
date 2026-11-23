@@ -39,7 +39,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, CODEGEN_STAGE_NOT_BUILT_NAME, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, ROW_SLOT_MISMATCH, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, ROW_OWNER_AMBIGUOUS, ROW_LIST_NEEDS_PARENS, INVALID_RUNTIME_BINDING, FFI_INCOMPATIBLE_TYPE, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, ROW_SLOT_MISMATCH, diag_error_range, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, ROW_OWNER_AMBIGUOUS, ROW_LIST_NEEDS_PARENS, INVALID_RUNTIME_BINDING, FFI_INCOMPATIBLE_TYPE, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -14743,6 +14743,17 @@ fn tc_written_type_slot(n: Str, core: Str) -> Int {
     if node_effects(decl) != -1 { 1 } else { 0 }
 }
 
+// error[RowSlotMismatch] (E0572) at an impl target written with a row slot, `for T[! _]`,
+// when `T` declares no slot.
+fn tc_check_impl_target_slot(im: Int) ! Diag.Report {
+    if node_effects(im) == -1 { return }
+    let n = node_name(im)
+    let slot = tc_written_type_slot(n, tc_compiler_known_type_meant(n, -1))
+    if slot != 0 { return }
+    let (line, col) = written_unpack(node_impl_target_at(im))
+    diag_error_range("RowSlotMismatch", ROW_SLOT_MISMATCH, "`{n}` has no row slot, so it takes no row", line, col, col + n.len(), "remove the row; only a type declared with `[! _]` takes a row in its brackets")
+}
+
 // error[RowSlotMismatch] (E0572): a row on a type with no slot, or a type argument where a
 // slotted type takes its row (§4.15.5). True when the use was a type argument in the slot,
 // which is then this error alone and not also TypeArgArity.
@@ -15894,7 +15905,9 @@ fn tc_fnsig_param_instance_tid(ann_node: Int, bare_tid: Int) -> Int ! TypeCheck.
     if bk == TyKind.Enum {
         return make_enum_instance_type(base, arg_tids)
     }
-    make_struct_instance_type(base, arg_tids)
+    // The row in the slot (`Job[Int ! IO]`) is part of the param type, so a call through a field
+    // of the param runs it.
+    make_struct_type_with_row(-1, base, arg_tids, tc_struct_ann_row_key(bare_tid, ann_node))
 }
 
 // A generic-enum VARIANT-FIELD annotation (`Branch(left: Tree[T], …)`) must intern
@@ -22751,6 +22764,7 @@ pub fn check_types(program: Int) -> Int ! TypeCheck, Diag.Report, IO.Eprint {
             nr_current_module = im_module
             let impl_type = tc_impl_target_name(im)
             let trait_id = tc_impl_trait_id(im)
+            if !impl_provided_by_closeable(im) { tc_check_impl_target_slot(im) }
             // Register the canonical monomorphized poly impl
             // `impl[T] Trait[T] for List[T]` for binder recovery in the
             // MethodCall arm. Same shape gate as validate_trait_impls'
@@ -26601,12 +26615,18 @@ pub fn tc_derived_static_value_owner(access_node: Int) -> Int {
 //
 // The binder node, not the spelling, is a local's identity: two nested blocks may each bind
 // `s`, and a later pass that looks the name up again cannot tell which one a read meant.
-let mut tc_local_binder: Map[Int, Int] = Map()
+type LocalBinders {
+    of_ident: Map[Int, Int]
+    // The scrutinee of the match whose arm pattern binds each binder node, so a walk can find
+    // what a match binder holds.
+    match_scrutinee: Map[Int, Int]
+}
+let mut tc_local_binder: LocalBinders = LocalBinders { of_ident: Map(), match_scrutinee: Map() }
 
 // The node that bound the local, parameter or pattern name this ident reads, or -1 when the
 // ident reads a global, a function, a builtin, or a binder that recorded no node.
 pub fn tc_ident_binder_node(ident_node: Int) -> Int {
-    tc_local_binder.get(ident_node) ?? -1
+    tc_local_binder.of_ident.get(ident_node) ?? -1
 }
 
 fn nr_note_local_binder(ident_node: Int, name: Str) {
@@ -26619,7 +26639,7 @@ fn nr_note_local_binder_at(ident_node: Int, idx: Int) {
     if nr_index_is_global(idx) != 0 { return }
     let binder = nr_scope_nodes.get(idx).unwrap()
     if binder < 0 { return }
-    tc_local_binder.insert(ident_node, binder)
+    tc_local_binder.of_ident.insert(ident_node, binder)
 }
 
 // Two imports in one file that bind one name to different items (sections/07, "Imported
@@ -32588,7 +32608,7 @@ fn resolve_names(program: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Repor
     nr_forget_answers()
     tc_call_decl = Map()
     tc_global_read_decl = Map()
-    tc_local_binder = Map()
+    tc_local_binder = LocalBinders { of_ident: Map(), match_scrutinee: Map() }
     tc_ue.row_names = Map()
     nr_read_budget_effects(program)
     nr_push_scope()
@@ -34928,6 +34948,10 @@ fn nr_check_node(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                 let arm = sublist_get(arms_sl, i)
                 nr_push_scope()
                 nr_check_pattern(node_pattern(arm), true)
+                let mut bnames: List[Str] = []
+                let mut bnodes: List[Int] = []
+                tc_pattern_binders(node_pattern(arm), bnames, bnodes)
+                for b in bnodes { tc_local_binder.match_scrutinee.insert(b, node_scrutinee(node)) }
                 let guard = node_guard(arm)
                 if guard != -1 {
                     nr_check_node(guard)
@@ -45773,6 +45797,23 @@ fn tc_tm_let_values(decl: Int, assigns: Map[Int, List[Int]]) -> List[Int] {
 // initializer and every value assigned to it, since a call of it may run any of them.
 fn tc_tm_closures_of(exprs: List[Int], assigns: Map[Int, List[Int]]) -> List[Int] {
     let mut out: List[Int] = []
+    for n in tc_tm_value_sources(exprs, assigns) {
+        if node_kind(n) != NodeKind.StructLit { out.push(n) }
+    }
+    out
+}
+
+// The closures, named fns and struct literals these expressions are, or name through a local
+// `let` or a module global, or yield from each branch of an `if`, `match` or block. One walk
+// serves each reader, so a value form that one of them follows, all of them follow.
+fn tc_tm_value_sources(exprs: List[Int], assigns: Map[Int, List[Int]]) -> List[Int] {
+    tc_tm_value_walk(exprs, assigns, [])
+}
+
+// tc_tm_value_sources, which also puts in `leaves` each value the walk reaches but cannot
+// follow: a parameter, a field read, a call, and any other expression.
+fn tc_tm_value_walk(exprs: List[Int], assigns: Map[Int, List[Int]], leaves: List[Int]) -> List[Int] {
+    let mut out: List[Int] = []
     let mut seen: Set[Int] = Set()
     let mut todo: List[Int] = []
     for e in exprs { todo.push(e) }
@@ -45781,7 +45822,7 @@ fn tc_tm_closures_of(exprs: List[Int], assigns: Map[Int, List[Int]]) -> List[Int
         if node < 0 || seen.contains(node) { continue }
         seen.insert(node)
         let k = node_kind(node)
-        if k == NodeKind.Closure {
+        if k == NodeKind.Closure || k == NodeKind.StructLit {
             out.push(node)
         } else if k == NodeKind.NamedArg {
             todo.push(node_value(node))
@@ -45791,6 +45832,8 @@ fn tc_tm_closures_of(exprs: List[Int], assigns: Map[Int, List[Int]]) -> List[Int
             if named >= 0 { out.push(named) }
             if decl >= 0 {
                 for v in tc_tm_let_values(decl, assigns) { todo.push(v) }
+            } else if named < 0 {
+                leaves.push(node)
             }
         } else if k == NodeKind.Block {
             todo.push(tc_arm_tail_value_node(node))
@@ -45807,6 +45850,8 @@ fn tc_tm_closures_of(exprs: List[Int], assigns: Map[Int, List[Int]]) -> List[Int
                 todo.push(tc_arm_tail_value_node(node_body(sublist_get(arms, i))))
                 i = i + 1
             }
+        } else {
+            leaves.push(node)
         }
     }
     out.sort()
@@ -52296,7 +52341,7 @@ fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, calle
     if req == "_" {
         diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
             "call to `{callee}` needs effect `_`, which `{owner.name}` does not declare", site,
-            "add `! _` to `{owner.name}`: `{callee}` has an impl-chosen row, so the call runs the row of whichever impl the type parameter stands for")
+            "add `! _` to `{owner.name}`: the row of `{callee}` comes from the values that the caller of `{owner.name}` gives it")
         diag_set_last_fix("add effect", req)
         return
     }
@@ -52634,10 +52679,17 @@ fn tc_er_charge_call(program: Int, node: Int, held: List[Str], owner: ErOwner, f
             if f.decl >= 0 { tc_er_require_sig_row(program, node, held, owner, f.decl, -1) }
         }
         CallReach.Value => {
-            // A run of a fn value is not charged yet; the row of its fn type is still part of
-            // the row of a body that runs it.
-            if owner.collect {
-                for req in tc_fr_type_row(tc_fr_callee_tid(node)) { tc_er_require(program, node, held, owner, "", req) }
+            match tc_er_slot_field_call_row(program, node, owner) {
+                // A call through a `_` field of a slotted value runs the slot row (§4.15.5).
+                Some(row) => {
+                    let shown = tc_er_field_call_shown(node)
+                    for req in row { tc_er_require(program, node, held, owner, shown, req) }
+                }
+                // A run of any other fn value is not charged yet; the row of its fn type is still
+                // part of the row of a body that runs it.
+                None => if owner.collect {
+                    for req in tc_fr_type_row(tc_fr_callee_tid(node)) { tc_er_require(program, node, held, owner, "", req) }
+                }
             }
         }
         CallReach.Builtin | CallReach.BuiltinMethod | CallReach.Derived | CallReach.BuiltinRecvImpl | CallReach.Poison => {}
@@ -52660,7 +52712,9 @@ fn tc_er_require_sig_row(program: Int, node: Int, held: List[Str], owner: ErOwne
         // it now, or making the lib wrappers declare it, would settle that question here.
         if req == "_" {
             let binds = if value >= 0 { tc_er_fn_value_binds(value, fs) } else { tc_er_call_binds(node, decl) }
-            for w in tc_er_wild_row(decl, binds, 0) {
+            let wild = tc_er_wild_row(decl, binds, 0)
+            tc_er_push_all(wild, tc_er_slot_arg_rows(program, node, decl, owner, Map()))
+            for w in wild {
                 tc_er_require(program, node, held, owner, node_name(decl), w)
             }
         } else if req != "FFI" && !req.starts_with("FFI.") {
@@ -52795,7 +52849,7 @@ fn tc_er_call_binds(node: Int, decl: Int) -> Map[Str, Int] ! TypeCheck.Resolve, 
     let fs = fnsig_pool.get(idx).unwrap()
     let params_sl = node_params(decl)
     let mut lead: List[Int] = []
-    if node_kind(node) == NodeKind.MethodCall && params_sl != -1 && sublist_length(params_sl) > 0 && node_name(sublist_get(params_sl, 0)) == "self" {
+    if tc_er_self_lead(node, params_sl) == 1 {
         let t = tc_lookup_node_tid(node_obj(node))
         if t >= 0 && tc_tid_is_no_info(resolve_alias_tid(tc_resolve(t))) == 0 { lead.push(t) }
     }
@@ -52908,6 +52962,13 @@ fn tc_er_push_impl_row(out: List[Str], a: Int, decl: Int, depth: Int) ! TypeChec
                 let ib = if block != -1 && node_kind(block) == NodeKind.ImplBlock { tc_impl_binds_for_instance(block, a) } else { tc_no_binds }
                 for w in tc_er_wild_row(decl, ib, depth + 1) {
                     if !out.contains(w) { out.push(w) }
+                }
+                // The `_` of a slot type is the row of the value, which the caller reads off
+                // the argument; here only the effects the type names are known.
+                if tc_er_in_wild_slot_impl(decl) {
+                    for e2 in tc_slot_row_of_tid(a) {
+                        if e2 != "_" && !out.contains(e2) { out.push(e2) }
+                    }
                 }
             } else if !out.contains("_") {
                 out.push("_")
@@ -53090,6 +53151,8 @@ fn tc_er_check_with_item(program: Int, item: Int, tid0: Int, held: List[Str], ow
                 let e = fnsig_effect_names.get(fs.effects_start + j).unwrap()
                 if e == "_" {
                     for w in tc_er_wild_row(m, tc_impl_binds_for_instance(im, tid), 0) { row.push(w) }
+                    // An impl for `T[! _]` runs the row the item's slot holds (§4.15.5).
+                    if tc_er_in_wild_slot_impl(m) { tc_er_push_all(row, tc_er_value_slot_row(program, item, owner)) }
                 } else {
                     row.push(e)
                 }
@@ -53405,16 +53468,23 @@ fn tc_er_check_impl_row(program: Int, m: Int, tm: Int, trait_name: Str) ! Diag.R
 // A `_` in the row of `decl` has a source (§4.15.2): a type parameter whose bound has a `_`
 // method, or a `! _` callback parameter.
 fn tc_er_wild_sourced(decl: Int) -> Bool {
-    tc_er_has_wild_fn_param(decl) || tc_er_wild_params(decl).len() > 0
+    tc_er_has_wild_fn_param(decl) || tc_er_wild_params(decl).len() > 0 || tc_er_any_param(decl, tc_er_param_is_wild_slot) || tc_er_in_wild_slot_impl(decl)
 }
 
 fn tc_er_has_wild_fn_param(decl: Int) -> Bool {
+    tc_er_any_param(decl, tc_er_param_is_wild_fn)
+}
+
+fn tc_er_param_is_wild_fn(p: Int) -> Bool {
+    let ann = node_type_ann(p)
+    ann != -1 && is_fn_type_ann(ann) && tc_er_row_wild_site(node_effects(ann)) != -1
+}
+
+fn tc_er_any_param(decl: Int, pred: fn(Int) -> Bool) -> Bool {
     let ps = node_params(decl)
-    if ps == -1 { return false }
     let mut i = 0
-    while i < sublist_length(ps) {
-        let ann = node_type_ann(sublist_get(ps, i))
-        if ann != -1 && is_fn_type_ann(ann) && tc_er_row_wild_site(node_effects(ann)) != -1 { return true }
+    while ps != -1 && i < sublist_length(ps) {
+        if pred(sublist_get(ps, i)) { return true }
         i = i + 1
     }
     false
@@ -53547,6 +53617,11 @@ fn tc_fr_note_missed(owner: ErOwner, req: Str) {
 // The effects in the row of fn type `t`; none for a type that is no fn type.
 fn tc_fr_type_row(t: Int) -> List[Str] {
     if t < 0 || tc_tid_kind(t) != TyKind.Fn { return [] }
+    tc_row_key_effects(t)
+}
+
+// The effects of the row key of type `t`; [] for the empty row.
+fn tc_row_key_effects(t: Int) -> List[Str] {
     let key = ty_pool.get(t).unwrap().row
     if key == "" { [] } else { key.split(", ") }
 }
@@ -53561,4 +53636,549 @@ fn tc_fr_callee_tid(node: Int) -> Int ! TypeCheck.Resolve {
     if k != TyKind.Struct && k != TyKind.Enum { return -1 }
     let f = tc_field_tid_at_instance(recv, node_method(node))
     if f < 0 { -1 } else { resolve_alias_tid(tc_resolve(f)) }
+}
+
+// ── Row slots (§4.15.5) ──────────────────────────────────────────────
+// The row a value of a slotted type holds is the row its type names. A struct literal gives its
+// slot the rows of the callbacks in its `_` fields, which only this pass knows, so a value whose
+// type names no row is traced through `let` to the literals it may be.
+
+// The declaration of struct type `t` when it has a row slot, or -1.
+fn tc_slot_decl(t0: Int) -> Int {
+    let t = resolve_alias_tid(tc_resolve(t0))
+    if t < 0 || tc_tid_is_no_info(t) != 0 || tc_tid_kind(t) != TyKind.Struct { return -1 }
+    let decl = tc_tid_decl_node(t)
+    if decl < 0 || node_effects(decl) == -1 { -1 } else { decl }
+}
+
+// The effects of the row that slotted type `t` names; [] for the empty row.
+fn tc_slot_row_of_tid(t0: Int) -> List[Str] {
+    if tc_slot_decl(t0) < 0 { return [] }
+    tc_row_key_effects(resolve_alias_tid(tc_resolve(t0)))
+}
+
+// Whether the field `name` of the type declared at `decl` has `_` in its type, so it holds
+// values of the slot row.
+fn tc_slot_field_is_wild(decl: Int, name: Str) -> Bool {
+    let flds = node_fields(decl)
+    let mut i = 0
+    while flds != -1 && i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        if node_kind(f) == NodeKind.TypeField && node_name(f) == name { return tc_ann_row_wild_site(node_value(f)) != -1 }
+        i = i + 1
+    }
+    false
+}
+
+// The names of the fields of slotted type `decl` that have `_` in their type.
+fn tc_slot_wild_fields(decl: Int) -> List[Str] {
+    let mut out: List[Str] = []
+    let flds = node_fields(decl)
+    let mut i = 0
+    while flds != -1 && i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        if node_kind(f) == NodeKind.TypeField && tc_ann_row_wild_site(node_value(f)) != -1 { out.push(node_name(f)) }
+        i = i + 1
+    }
+    out
+}
+
+// The row a value of a slotted type holds: the row its type names, or, when that row is empty
+// or `_`, the rows its sources give the slot (§4.15.5). Each query starts a new memo.
+fn tc_er_value_slot_row(program: Int, expr: Int, owner: ErOwner) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    tc_er_slot_field_row(program, expr, "", owner, Map())
+}
+
+// The row that the `_` fields of value `expr` hold: all of them, or only field `field` when it
+// is not "". A `_` in the type of a value that is not a parameter is the declared row of a field
+// or a return, not the row the value holds, so the walk goes to the sources of the value. The
+// memo holds one answer for each value and field, so a value met again on the walk, or a cycle
+// of `let mut` writes, is walked once.
+fn tc_er_slot_field_row(program: Int, expr0: Int, field: Str, owner: ErOwner, memo: Map[Str, List[Str]]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let expr = if expr0 >= 0 && node_kind(expr0) == NodeKind.NamedArg { node_value(expr0) } else { expr0 }
+    if expr < 0 { return [] }
+    let named = tc_slot_row_of_tid(tc_lookup_node_tid(expr))
+    if named.len() > 0 && !named.contains("_") { return named }
+    let key = "{expr}.{field}"
+    match memo.get(key) {
+        Some(r) => return r
+        None => {}
+    }
+    // A value met again while its own walk is open adds no row that the open walk does not add.
+    memo.insert(key, [])
+    let mut out: List[Str] = []
+    let mut leaves: List[Int] = []
+    for src in tc_tm_value_walk([expr], owner.assigns, leaves) {
+        if node_kind(src) == NodeKind.StructLit { tc_er_push_all(out, tc_er_lit_slot_row(program, src, field, owner, memo)) }
+    }
+    for leaf in leaves { tc_er_push_all(out, tc_er_leaf_slot_row(program, leaf, owner, memo)) }
+    memo.insert(key, out)
+    out
+}
+
+// The row that struct literal `lit` gives the `_` fields of its slot: the callbacks it sets, and
+// from a spread only the fields that the literal does not set.
+fn tc_er_lit_slot_row(program: Int, lit: Int, field: Str, owner: ErOwner, memo: Map[Str, List[Str]]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Str] = []
+    let decl = tc_slot_decl(tc_lookup_node_tid(lit))
+    let flds = node_fields(lit)
+    if decl < 0 || flds == -1 { return out }
+    let wild = tc_slot_wild_fields(decl)
+    let mut set: List[Str] = []
+    let mut spreads: List[Int] = []
+    let mut i = 0
+    while i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        if node_kind(f) == NodeKind.SpreadExpr {
+            spreads.push(node_value(f))
+        } else {
+            set.push(node_name(f))
+            if wild.contains(node_name(f)) && (field == "" || field == node_name(f)) {
+                tc_er_push_all(out, tc_er_held_row(program, node_value(f), owner, memo))
+            }
+        }
+        i = i + 1
+    }
+    for s in spreads {
+        for w in wild {
+            if !set.contains(w) && (field == "" || field == w) { tc_er_push_all(out, tc_er_slot_field_row(program, s, w, owner, memo)) }
+        }
+    }
+    out
+}
+
+// The slot row of a value the walk cannot follow further, for all its `_` fields: a leaf gives
+// no row field by field. A parameter written `T[! _]` holds the `_` of its fn, as `self` does in
+// a method of an impl for `T[! _]`. A leaf gives a row only from what proves it; any other leaf
+// gives `_`, so a value the walk does not know is charged, never passed.
+fn tc_er_leaf_slot_row(program: Int, leaf: Int, owner: ErOwner, memo: Map[Str, List[Str]]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let k = node_kind(leaf)
+    if k == NodeKind.FieldAccess {
+        let read = tc_er_wild_field_read_row(program, leaf, owner, memo)
+        if read.is_some() { return read.unwrap() }
+    }
+    let named = tc_slot_row_of_tid(tc_lookup_node_tid(leaf))
+    if named.len() > 0 && !named.contains("_") { return named }
+    if k == NodeKind.Ident {
+        if node_name(leaf) == "self" && tc_er_in_wild_slot_impl(owner.decl) { return ["_"] }
+        let b = tc_ident_binder_node(leaf)
+        if b >= 0 && node_kind(b) == NodeKind.Param { return named }
+        // A `for` binder holds an item of what the loop walks, and a match binder a part of
+        // what the match reads.
+        if b >= 0 && node_kind(b) == NodeKind.ForIn { return tc_er_held_row(program, node_iterable(b), owner, memo) }
+        let scrut = if b >= 0 { tc_local_binder.match_scrutinee.get(b) ?? -1 } else { -1 }
+        if scrut >= 0 { return tc_er_held_row(program, scrut, owner, memo) }
+    }
+    if k == NodeKind.Call || k == NodeKind.MethodCall {
+        let decl = tc_call_decl_node(leaf)
+        if decl >= 0 && node_kind(decl) == NodeKind.FnDef {
+            match tc_er_fn_result_row(program, leaf, decl, named, owner, memo) {
+                Some(r) => return r
+                None => {}
+            }
+        }
+    }
+    match tc_er_derived_row(program, leaf, owner, memo) {
+        Some(r) => return r
+        None => {}
+    }
+    ["_"]
+}
+
+// The slot row of the result of call `node` of fn `decl`, from its signature: a return type
+// that names a row with `_` gives the row the call binds to `_`, one with no row is the empty
+// row, and a type parameter gives what the arguments of that type parameter hold. None when the
+// return type is none of these.
+fn tc_er_fn_result_row(program: Int, node: Int, decl: Int, named: List[Str], owner: ErOwner, memo: Map[Str, List[Str]]) -> Option[List[Str]] ! TypeCheck.Resolve, Diag.Report {
+    let ret = node_type_ann(decl)
+    if ret == -1 || node_kind(ret) != NodeKind.TypeAnn { return None }
+    let ps = node_params(decl)
+    let tps = node_type_params(decl)
+    let mut i = 0
+    while tps != -1 && i < sublist_length(tps) {
+        let tp = node_name(sublist_get(tps, i))
+        if node_name(ret) == tp {
+            let mut out: List[Str] = []
+            let args = node_args(node)
+            let lead = tc_er_self_lead(node, ps)
+            let mut j = 0
+            while ps != -1 && args != -1 && j < sublist_length(args) {
+                let arg = sublist_get(args, j)
+                let pidx = if node_kind(arg) == NodeKind.NamedArg { tc_er_param_index(ps, node_name(arg)) } else { j + lead }
+                if pidx >= 0 && pidx < sublist_length(ps) && !tc_is_default_fill(arg) && tc_er_ann_names(node_type_ann(sublist_get(ps, pidx)), tp) {
+                    let v = if node_kind(arg) == NodeKind.NamedArg { node_value(arg) } else { arg }
+                    tc_er_push_all(out, tc_er_held_row(program, v, owner, memo))
+                }
+                j = j + 1
+            }
+            return Some(out)
+        }
+        i = i + 1
+    }
+    if tc_slot_decl(resolve_type_ann(ret)) < 0 { return None }
+    let row = node_effects(ret)
+    if row == -1 { return Some([]) }
+    if !named.contains("_") { return None }
+    let mut out: List[Str] = []
+    for e in named {
+        if e != "_" { tc_er_push_all(out, [e]) }
+    }
+    tc_er_push_all(out, tc_er_call_wild_row(program, node, decl, owner, memo))
+    Some(out)
+}
+
+// The row of a value that a builtin form makes from other values with no user fn: `a ?? b`,
+// `x?`, `t.0`, `xs[i]`, a builtin method such as `unwrap` or `get`, and an enum variant such as
+// `Some(x)`. It holds what its parts hold. None for any other value.
+fn tc_er_derived_row(program: Int, v: Int, owner: ErOwner, memo: Map[Str, List[Str]]) -> Option[List[Str]] ! TypeCheck.Resolve, Diag.Report {
+    let k = node_kind(v)
+    let mut parts: List[Int] = []
+    let mut wild = false
+    if k == NodeKind.BinOp && node_op(v) == "??" {
+        parts.push(node_left(v))
+        parts.push(node_right(v))
+    } else if k == NodeKind.UnaryOp && node_op(v) == "?" {
+        parts.push(node_left(v))
+    } else if k == NodeKind.IndexExpr || (k == NodeKind.FieldAccess && tc_slot_decl(tc_lookup_node_tid(node_obj(v))) < 0 && tc_module_global_decl(v) == None) {
+        parts.push(node_obj(v))
+    } else if k == NodeKind.StructLit {
+        let flds = node_fields(v)
+        let mut i = 0
+        while flds != -1 && i < sublist_length(flds) {
+            parts.push(node_value(sublist_get(flds, i)))
+            i = i + 1
+        }
+    } else if k == NodeKind.Call || k == NodeKind.MethodCall {
+        let ck = tc_call_facts(v).kind
+        if ck != CallReach.Variant && ck != CallReach.Builtin && ck != CallReach.BuiltinMethod { return None }
+        if k == NodeKind.MethodCall && !tc_late_call_is_qualified(v) { parts.push(node_obj(v)) }
+        let args = node_args(v)
+        let mut i = 0
+        while args != -1 && i < sublist_length(args) {
+            let a = sublist_get(args, i)
+            let at = resolve_alias_tid(tc_resolve(tc_lookup_node_tid(a)))
+            if k == NodeKind.Call || type_kind(at) != TyKind.Fn {
+                parts.push(a)
+            } else if tc_er_type_holds_slot(ty_pool.get(at).unwrap().inner1) {
+                // A builtin method keeps what its fn argument returns, as `map` does; the walk
+                // does not follow the fn, so the slotted values it returns are charged `_`.
+                wild = true
+            }
+            i = i + 1
+        }
+    } else {
+        return None
+    }
+    let mut out: List[Str] = []
+    if wild { out.push("_") }
+    for x in parts { tc_er_push_all(out, tc_er_held_row(program, x, owner, memo)) }
+    Some(out)
+}
+
+// The row a read of field `f` of a slotted value holds when the type of `f` has `_`: the row its
+// object holds in that field. None for any other field read.
+fn tc_er_wild_field_read_row(program: Int, read: Int, owner: ErOwner, memo: Map[Str, List[Str]]) -> Option[List[Str]] ! TypeCheck.Resolve, Diag.Report {
+    let obj = node_obj(read)
+    let od = tc_slot_decl(tc_lookup_node_tid(obj))
+    if od < 0 || !tc_slot_field_is_wild(od, node_name(read)) { return None }
+    Some(tc_er_slot_field_row(program, obj, node_name(read), owner, memo))
+}
+
+// The row the callbacks in value `v` run: a fn value's, the slot row of a slotted value, the
+// row of a `_` field it is read from, and the union over the items of a list or tuple literal.
+fn tc_er_held_row(program: Int, v: Int, owner: ErOwner, memo: Map[Str, List[Str]]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    if v < 0 { return [] }
+    let k = node_kind(v)
+    if k == NodeKind.ListLit || k == NodeKind.TupleLit {
+        let mut out: List[Str] = []
+        let items = node_elements(v)
+        let mut i = 0
+        while items != -1 && i < sublist_length(items) {
+            tc_er_push_all(out, tc_er_held_row(program, sublist_get(items, i), owner, memo))
+            i = i + 1
+        }
+        return out
+    }
+    if tc_slot_decl(tc_lookup_node_tid(v)) >= 0 { return tc_er_slot_field_row(program, v, "", owner, memo) }
+    if k == NodeKind.FieldAccess {
+        let read = tc_er_wild_field_read_row(program, v, owner, memo)
+        if read.is_some() { return read.unwrap() }
+    }
+    // A local `let` that holds a field read holds the row of that field.
+    let held = if k == NodeKind.Ident { tc_tm_let_of(v) } else { -1 }
+    if held >= 0 {
+        let key = "held.{v}"
+        match memo.get(key) {
+            Some(r) => return r
+            None => {}
+        }
+        memo.insert(key, [])
+        let mut out: List[Str] = []
+        for x in tc_tm_let_values(held, owner.assigns) { tc_er_push_all(out, tc_er_held_row(program, x, owner, memo)) }
+        // A method or a fn the value goes to may add items to a list, map, set or channel
+        // after its literal, so the type of those items gives their row.
+        if tc_er_let_may_grow(held, owner, memo) { tc_er_nested_slot_row(tc_lookup_node_tid(v), out, true) }
+        memo.insert(key, out)
+        return out
+    }
+    match tc_er_derived_row(program, v, owner, memo) {
+        Some(r) => return r
+        None => {}
+    }
+    let mut out: List[Str] = []
+    tc_er_push_all(out, tc_fr_value_row(program, v, owner.msg_ran, owner.assigns, owner.hook, []))
+    if k == NodeKind.IfExpr || k == NodeKind.MatchExpr || k == NodeKind.Block {
+        let mut leaves: List[Int] = []
+        for x in tc_tm_value_walk([v], owner.assigns, leaves) {
+            if node_kind(x) == NodeKind.StructLit { tc_er_push_all(out, tc_er_held_row(program, x, owner, memo)) }
+        }
+        for x in leaves {
+            if x != v { tc_er_push_all(out, tc_er_held_row(program, x, owner, memo)) }
+        }
+        return out
+    }
+    let b = if k == NodeKind.Ident { tc_ident_binder_node(v) } else { -1 }
+    // A `for` binder holds an item of what the loop walks, and a match binder a part of what
+    // the match reads.
+    if b >= 0 && node_kind(b) == NodeKind.ForIn {
+        tc_er_push_all(out, tc_er_held_row(program, node_iterable(b), owner, memo))
+        return out
+    }
+    let scrut = if b >= 0 { tc_local_binder.match_scrutinee.get(b) ?? -1 } else { -1 }
+    if scrut >= 0 {
+        tc_er_push_all(out, tc_er_held_row(program, scrut, owner, memo))
+        return out
+    }
+    // The walk does not follow this value, so its type gives what it holds, as
+    // `m: Map[Str, Cleanup[! IO]]` holds `IO`. A name with no binder is a variant with no
+    // payload, such as `None`, or a fn, and holds no slotted value.
+    let proof = k == NodeKind.Ident && b < 0 && tc_global_decl_node(v) < 0
+    if !proof { tc_er_nested_slot_row(tc_lookup_node_tid(v), out, false) }
+    out
+}
+
+// Whether a container a `let` holds may get items after its initializer: a `let mut`, a
+// module `let`, or a local that goes anywhere but to a `for` or to a builtin method as its
+// receiver. A builtin method cannot add to a local that is not `mut`, but a fn, a method of
+// the program or an alias can.
+fn tc_er_let_may_grow(held: Int, owner: ErOwner, memo: Map[Str, List[Str]]) -> Bool ! TypeCheck.Resolve {
+    if node_kind(held) != NodeKind.LetBinding || node_is_mut(held) == 1 || owner.decl < 0 { return true }
+    let key = "grow.{held}"
+    match memo.get(key) {
+        Some(r) => return r.len() > 0
+        None => {}
+    }
+    let grows = tc_er_let_use_escapes(owner.decl, held, -1)
+    memo.insert(key, if grows { ["grows"] } else { [] })
+    grows
+}
+
+fn tc_er_let_use_escapes(n: Int, held: Int, parent: Int) -> Bool ! TypeCheck.Resolve {
+    if n < 0 { return false }
+    if node_kind(n) == NodeKind.Ident && tc_ident_binder_node(n) == held {
+        if parent < 0 { return true }
+        let pk = node_kind(parent)
+        if pk == NodeKind.ForIn && node_iterable(parent) == n { return false }
+        if pk == NodeKind.MethodCall && node_obj(parent) == n && !tc_late_call_is_qualified(parent) {
+            return tc_call_facts(parent).kind != CallReach.BuiltinMethod
+        }
+        return true
+    }
+    for kid in node_value_child_ids(n) {
+        if tc_er_let_use_escapes(kid, held, n) { return true }
+    }
+    false
+}
+
+// Adds to `out` the slot row of each slotted type inside type `t0`, through lists, options,
+// maps, results, sets, channels, iterators, tuples and type arguments. With `only_mutable`, only
+// those inside a list, map, set or channel, whose items a method can add.
+fn tc_er_nested_slot_row(t0: Int, out: List[Str], only_mutable: Bool) {
+    let t = resolve_alias_tid(tc_resolve(t0))
+    if t < 0 || t >= ty_pool.len() { return }
+    if tc_slot_decl(t) >= 0 {
+        if !only_mutable { tc_er_push_all(out, tc_slot_row_of_tid(t)) }
+        return
+    }
+    let e = ty_pool.get(t).unwrap()
+    let k = e.kind
+    let inner_only = only_mutable && k != TyKind.List && k != TyKind.Map && k != TyKind.Set && k != TyKind.Channel
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator || k == TyKind.Result || k == TyKind.Map {
+        tc_er_nested_slot_row(e.inner1, out, inner_only)
+        if k == TyKind.Result || k == TyKind.Map { tc_er_nested_slot_row(e.inner2, out, inner_only) }
+        return
+    }
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+        let mut i = 0
+        while i < e.params_count {
+            tc_er_nested_slot_row(ty_param_list.get(e.params_start + i).unwrap(), out, inner_only)
+            i = i + 1
+        }
+    }
+}
+
+// Whether type `t0` is or holds a slotted type.
+fn tc_er_type_holds_slot(t0: Int) -> Bool {
+    let t = resolve_alias_tid(tc_resolve(t0))
+    if t < 0 || t >= ty_pool.len() { return false }
+    if tc_slot_decl(t) >= 0 { return true }
+    let e = ty_pool.get(t).unwrap()
+    let k = e.kind
+    if k == TyKind.List || k == TyKind.Option || k == TyKind.Set || k == TyKind.Channel || k == TyKind.Iterator {
+        return tc_er_type_holds_slot(e.inner1)
+    }
+    if k == TyKind.Result || k == TyKind.Map { return tc_er_type_holds_slot(e.inner1) || tc_er_type_holds_slot(e.inner2) }
+    if k == TyKind.Tuple || k == TyKind.Struct || k == TyKind.Enum {
+        let mut i = 0
+        while i < e.params_count {
+            if tc_er_type_holds_slot(ty_param_list.get(e.params_start + i).unwrap()) { return true }
+            i = i + 1
+        }
+    }
+    false
+}
+
+// Whether `decl` is a method of an impl for a type with its row slot `[! _]`.
+fn tc_er_in_wild_slot_impl(decl: Int) -> Bool {
+    let block = if decl >= 0 { tc_method_block.get(decl) ?? -1 } else { -1 }
+    block != -1 && node_kind(block) == NodeKind.ImplBlock && tc_er_row_wild_site(node_effects(block)) != -1
+}
+
+// The row a call through a field runs when the field's type has `_`: the field's row with `_`
+// read as the slot row of the receiver. None for any other call of a value.
+fn tc_er_slot_field_call_row(program: Int, node: Int, owner: ErOwner) -> Option[List[Str]] ! TypeCheck.Resolve, Diag.Report {
+    let callee = if node_kind(node) == NodeKind.Call { node_left(node) } else { -1 }
+    let (obj, field) = if callee >= 0 && node_kind(callee) == NodeKind.FieldAccess {
+        (node_obj(callee), node_name(callee))
+    } else if node_kind(node) == NodeKind.MethodCall {
+        (node_obj(node), node_method(node))
+    } else {
+        (-1, "")
+    }
+    if obj < 0 { return None }
+    let decl = tc_slot_decl(tc_lookup_node_tid(obj))
+    if decl < 0 || !tc_slot_field_is_wild(decl, field) { return None }
+    // All `_` fields of one type share the one slot (§4.15.5).
+    let slot = tc_er_slot_field_row(program, obj, "", owner, Map())
+    let mut out: List[Str] = []
+    for e in tc_fr_type_row(tc_fr_callee_tid(node)) {
+        tc_er_push_all(out, if e == "_" { slot } else { [e] })
+    }
+    // A field whose declared row is all `_` may give the callee no row at this instance.
+    if out.len() == 0 { return Some(slot) }
+    Some(out)
+}
+
+// The name a call through a field shows: `c.action` for `(c.action)()`.
+fn tc_er_field_call_shown(node: Int) -> Str {
+    let callee = if node_kind(node) == NodeKind.Call { node_left(node) } else { node }
+    let field = if node_kind(callee) == NodeKind.FieldAccess { node_name(callee) } else { node_method(node) }
+    let obj = node_obj(callee)
+    if obj >= 0 && node_kind(obj) == NodeKind.Ident { "{node_name(obj)}.{field}" } else { field }
+}
+
+// What `_` in the row of `decl` stands for at call `node`, from the values the call passes: the
+// row of each fn value given to a `! _` fn parameter, and the slot rows tc_er_slot_arg_rows gives.
+fn tc_er_call_wild_row(program: Int, node: Int, decl: Int, owner: ErOwner, memo: Map[Str, List[Str]]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let out = tc_er_wild_row(decl, tc_er_call_binds(node, decl), 0)
+    tc_er_push_all(out, tc_er_slot_arg_rows(program, node, decl, owner, memo))
+    let ps = node_params(decl)
+    let args = node_args(node)
+    let lead = tc_er_self_lead(node, ps)
+    let mut i = 0
+    while ps != -1 && args != -1 && i < sublist_length(args) {
+        let arg = sublist_get(args, i)
+        let pidx = if node_kind(arg) == NodeKind.NamedArg { tc_er_param_index(ps, node_name(arg)) } else { i + lead }
+        if pidx >= 0 && pidx < sublist_length(ps) && !tc_is_default_fill(arg) && tc_er_param_is_wild_fn(sublist_get(ps, pidx)) {
+            let v = if node_kind(arg) == NodeKind.NamedArg { node_value(arg) } else { arg }
+            tc_er_push_all(out, tc_er_held_row(program, v, owner, memo))
+        }
+        i = i + 1
+    }
+    out
+}
+
+// The rows that the `T[! _]` parameters of `decl` take at this call: the slot row of each
+// argument given to one (§4.15.2), and of the receiver of a method of an impl for `T[! _]`. A
+// value given to a type parameter whose bound runs a method of an impl for `T[! _]` gives its
+// slot row too.
+fn tc_er_slot_arg_rows(program: Int, node: Int, decl: Int, owner: ErOwner, memo: Map[Str, List[Str]]) -> List[Str] ! TypeCheck.Resolve, Diag.Report {
+    let mut out: List[Str] = []
+    let ps = node_params(decl)
+    if ps == -1 || node < 0 { return out }
+    let k = node_kind(node)
+    if k != NodeKind.Call && k != NodeKind.MethodCall { return out }
+    let wild_self = tc_er_in_wild_slot_impl(decl)
+    let tparams = tc_er_wild_params(decl)
+    let binds = if tparams.len() > 0 { tc_er_call_binds(node, decl) } else { Map() }
+    let lead = tc_er_self_lead(node, ps)
+    if lead == 1 && wild_self { tc_er_push_all(out, tc_er_slot_field_row(program, node_obj(node), "", owner, memo)) }
+    let args = node_args(node)
+    let mut i = 0
+    while args != -1 && i < sublist_length(args) {
+        let arg = sublist_get(args, i)
+        let pidx = if node_kind(arg) == NodeKind.NamedArg { tc_er_param_index(ps, node_name(arg)) } else { i + lead }
+        if pidx >= 0 && pidx < sublist_length(ps) && !tc_is_default_fill(arg) {
+            let p = sublist_get(ps, pidx)
+            let v = if node_kind(arg) == NodeKind.NamedArg { node_value(arg) } else { arg }
+            if tc_er_param_is_wild_slot(p) || (node_name(p) == "self" && wild_self) {
+                tc_er_push_all(out, tc_er_slot_field_row(program, v, "", owner, memo))
+            } else if tc_er_bound_runs_slot(p, tparams, binds) {
+                tc_er_push_all(out, tc_er_held_row(program, v, owner, memo))
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// Whether the type of parameter `p` names a type parameter in `tparams` whose bound runs a
+// method of an impl for `T[! _]` for the type the call binds to it, as `t: T` or `ts: List[T]`.
+fn tc_er_bound_runs_slot(p: Int, tparams: List[ErWildParam], binds: Map[Str, Int]) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let ann = node_type_ann(p)
+    for wp in tparams {
+        if !tc_er_ann_names(ann, wp.name) { continue }
+        let a = resolve_alias_tid(tc_resolve(binds.get(wp.name) ?? -1))
+        if a < 0 || tc_slot_decl(a) < 0 { continue }
+        for tm in tc_er_wild_methods(wp.traits) {
+            for d in tc_er_impl_decls(a, tm, []) {
+                if tc_er_in_wild_slot_impl(d) { return true }
+            }
+        }
+    }
+    false
+}
+
+// Whether type annotation `ann` is the type named `name` or has it in its type arguments.
+fn tc_er_ann_names(ann: Int, name: Str) -> Bool {
+    if ann == -1 || node_kind(ann) != NodeKind.TypeAnn { return false }
+    if node_name(ann) == name { return true }
+    let els = node_elements(ann)
+    let mut i = 0
+    while els != -1 && i < sublist_length(els) {
+        if tc_er_ann_names(sublist_get(els, i), name) { return true }
+        i = i + 1
+    }
+    false
+}
+
+// 1 when the first parameter of `ps` is `self` and call `node` gives it as its receiver, as
+// `c.then2(f)` does. A call through the trait name, `Chain.then2(c, f)`, gives it as its first
+// argument, so there it is 0.
+fn tc_er_self_lead(node: Int, ps: Int) -> Int {
+    if node_kind(node) != NodeKind.MethodCall || tc_late_call_is_qualified(node) { return 0 }
+    if ps == -1 || sublist_length(ps) == 0 || node_name(sublist_get(ps, 0)) != "self" { return 0 }
+    1
+}
+
+fn tc_er_push_all(out: List[Str], row: List[Str]) {
+    for e in row {
+        if !out.contains(e) { out.push(e) }
+    }
+}
+
+// Whether parameter `p` is written `T[! _]`: a type, not a fn type, whose row slot is `_`.
+fn tc_er_param_is_wild_slot(p: Int) -> Bool {
+    let ann = node_type_ann(p)
+    ann != -1 && node_kind(ann) == NodeKind.TypeAnn && !is_fn_type_ann(ann) && tc_er_row_wild_site(node_effects(ann)) != -1
 }
