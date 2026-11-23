@@ -120,6 +120,8 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 
 ## Fixes (v0.61.0)
 
+- **`blink fmt` keeps the braces of a variant declared `A {}`.** It wrote the declaration as `A,` and kept the literal `K.A {  }` and the pattern, so the output failed with "variant `A` has no payload, and the literal has braces". fmt now writes `A {}`.
+
 - **`blink fmt` keeps the parens of a call of a fn field.** `(cb.action)(21)` and `(a.b.f)(x)`, in a string hole too, were written as `cb.action(21)`, a method call that fails with UnresolvedMethod. fmt now keeps the parens around a field access that is the callee of a call, and adds none to `f(x)` or `x.m(y)`.
 
 - **Two `@ffi` bindings of one C symbol that differ only in parameter names build (section 9.1.1).** A C prototype is its return and parameter types, so `fn fill_bytes(buf: Ptr[U8], n: U64) -> I32` and `fn fill_word(out: Ptr[I64], len: U64) -> I32` over `getentropy` now share one prototype: each `Ptr` to a scalar crosses as `void *`. Before, such a pair passed `blink check`, and the build stopped with the internal error ForeignSymbolTwoPrototypes. Two bindings whose C types differ still stop the build.
