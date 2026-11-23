@@ -3,7 +3,7 @@ import ast.{NodeKind, AstNode, ChildWalk, node_child_ids_into, node_unclaimed_ch
 import lexer.{tokens, is_utf8_text}
 import std.path.{path_dirname}
 import diagnostics.{
-    Diag, diag_error, diag_error_range, diag_source_file, diag_ice_abort, PARSER_INTERNAL_LIMIT, PARSER_INTERNAL_LIMIT_NAME,
+    Diag, diag_error, diag_error_range, diag_error_range_label, diag_source_file, diag_ice_abort, PARSER_INTERNAL_LIMIT, PARSER_INTERNAL_LIMIT_NAME,
     diag_error_span_label_at_notes, diag_count, diag_entry_count, diag_errors_since, diag_any_errors_since, diag_truncate, diag_file_for_node,
     INLINE_MODULE_NOT_SUPPORTED, UNEXPECTED_ANNOTATION, UNEXPECTED_TOKEN,
     UNEXPECTED_TOKEN_STRING, UNEXPECTED_TOKEN_PATTERN, KEYWORD_AS_IDENTIFIER,
@@ -12,6 +12,7 @@ import diagnostics.{
     INVALID_STRING_BACKED_ENUM, INTERP_PARSE_FAILURE,
     TEST_ANNOTATED_RETURN, ELEMENT_ACCESS_HELP, MIXED_OPERATOR_PRECEDENCE, VARIANT_FIELD_DEFAULT_HELP,
     INTERP_DOUBLE_BRACE, MISSING_INITIALIZER, FOREIGN_CONST_FORM, CHAINED_RANGE,
+    INVALID_ROW_SLOT, ROW_SLOT_AFTER_NAME, ROW_LIST_NEEDS_PARENS,
 }
 
 effect Parse {
@@ -3550,11 +3551,11 @@ pub fn parse_program() -> Int ! Parse, Diag.Report, Env.Read, IO.Eprint {
 // ── Type parameters ──────────────────────────────────────────────────
 
 fn parse_type_params() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
-    if !at(TokenKind.LBracket) {
-        return -1
-    }
-    advance()
-    let sl = new_sublist()
+    let (sl, _) = parse_bracket_params("", false)
+    sl
+}
+
+fn parse_one_type_param() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let (p_line, p_col) = (peek_line(), peek_col())
     let pname = expect_value(TokenKind.Ident)
     let mut bounds_sl = -1
@@ -3574,34 +3575,86 @@ fn parse_type_params() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         kind: NodeKind.TypeParam, name: pname, elements: bounds_sl,
         line: p_line, col: p_col,
     })
-    sublist_push(sl, tp)
-    while at(TokenKind.Comma) {
-        advance()
-        skip_newlines()
-        let (p2_line, p2_col) = (peek_line(), peek_col())
-        let pn2 = expect_value(TokenKind.Ident)
-        let mut bs2 = -1
-        if at(TokenKind.Colon) {
-            advance()
-            bs2 = new_sublist()
-            sublist_push(bs2, parse_type_annotation())
-            while at(TokenKind.Plus) {
-                advance()
-                skip_newlines()
-                sublist_push(bs2, parse_type_annotation())
-            }
-            finalize_sublist(bs2)
-        }
-        let tp2 = node_count()
-        node_push(AstNode {
-            kind: NodeKind.TypeParam, name: pn2, elements: bs2,
-            line: p2_line, col: p2_col,
-        })
-        sublist_push(sl, tp2)
+    tp
+}
+
+// The brackets of a declaration: its type parameters, then, when `slot_ok` (a type declaration),
+// at most one row slot, which is exactly `! _` (§4.15.5). Returns (type params, slot row); either
+// is -1 when not written.
+fn parse_bracket_params(name: Str, slot_ok: Bool) -> (Int, Int) ! Parse.Advance, Parse.Build, Diag.Report {
+    if !at(TokenKind.LBracket) {
+        return (-1, -1)
     }
+    advance()
+    let mut sl = -1
+    let mut slot = -1
+    let mut extra_reported = false
+    let mut late_reported = false
+    loop {
+        let (line, col) = (peek_line(), peek_col())
+        let at_slot = slot_ok && at(TokenKind.Bang)
+        if at_slot && slot == -1 {
+            slot = parse_type_slot(name, true)
+        } else if at_slot {
+            let _ = parse_bang_row()
+            if !extra_reported {
+                diag_error_range("InvalidRowSlot", INVALID_ROW_SLOT, "`{name}` has more than one row slot; a type has one row slot", line, col, tokens.end_cols.get(pos - 1).unwrap(), "every `! _` field of a type shares its one slot `[! _]`")
+                extra_reported = true
+            }
+        } else {
+            if sl == -1 { sl = new_sublist() }
+            let tp = parse_one_type_param()
+            sublist_push(sl, tp)
+            if slot != -1 && !late_reported {
+                diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, "the type parameters of `{name}` go before its row slot", line, col, tokens.end_cols.get(pos - 1).unwrap(), "write the type parameters first: `type {name}[T ! _]`")
+                late_reported = true
+            }
+        }
+        if at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+        } else if !(slot_ok && at(TokenKind.Bang)) || slot != -1 {
+            break
+        }
+    }
+    if sl != -1 { finalize_sublist(sl) }
     expect(TokenKind.RBracket)
-    finalize_sublist(sl)
-    sl
+    (sl, slot)
+}
+
+// The slot row of a declaration. A slot that is not exactly `! _` is E0571 (when `report`), and
+// the type then gets a `! _` slot, so its `_` fields do not also report a missing slot. That
+// slot's `_` has int_val 1, so no E0551 says that no field uses it.
+fn parse_type_slot(name: Str, report: Bool) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let (line, col) = (peek_line(), peek_col())
+    let r = parse_bang_row()
+    let n = sublist_length(r.row)
+    let first = if n > 0 { node_name(sublist_get(r.row, 0)) } else { "" }
+    let in_parens = (r.marks & TYPE_MARK_ROW_PARENS) != 0
+    if n == 1 && first == "_" && !in_parens { return r.row }
+    let end_col = tokens.end_cols.get(pos - 1).unwrap()
+    if report {
+        if n == 1 && first == "_" {
+            diag_error_range("InvalidRowSlot", INVALID_ROW_SLOT, "the row slot of `{name}` is in parentheses; a row slot is the bare `! _`", line, col, end_col, "write `[! _]`")
+        } else if n == 1 && is_row_variable_name(first) {
+            diag_error_range("InvalidRowSlot", INVALID_ROW_SLOT, "the row slot of `{name}` is named `{first}`; a row slot is the anonymous `! _`", line, col, end_col, "named rows are v2 (§4.15.6); write `type {name}[! _]` and `! _` in each field")
+        } else {
+            diag_error_range("InvalidRowSlot", INVALID_ROW_SLOT, "the row slot of `{name}` is a concrete row; a row slot in a declaration is `! _`", line, col, end_col, "write `[! _]`; a field with a fixed row writes it on its own fn type and needs no slot")
+        }
+    }
+    let fixed = new_sublist()
+    let u = node_count()
+    node_push(AstNode { kind: NodeKind.Ident, name: "_", int_val: 1, line: line, col: col, end_line: line, end_col: end_col })
+    sublist_push(fixed, u)
+    finalize_sublist(fixed)
+    fixed
+}
+
+// A row variable is spelled in lower case, as a type's effect is not: `! e` (§4.15.6).
+fn is_row_variable_name(name: Str) -> Bool {
+    if name == "" || name == "_" || name.contains(".") { return false }
+    let b = name.byte_at(0)
+    b >= 97 && b <= 122
 }
 
 // Parse a single `where` constraint: `Type: Bound (+ Bound)*`. Stored as a TypeParam node
@@ -3645,7 +3698,12 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
     let td_start_col = peek_col()
     expect(TokenKind.Type)
     let name = expect_value(TokenKind.Ident)
-    let tparams = parse_type_params()
+    let (tparams, bracket_slot) = parse_bracket_params(name, true)
+    // A missing slot goes after the name, or before the `]` of the type parameters.
+    let head_line = tokens.lines.get(pos - 1).unwrap()
+    let head_end = tokens.end_cols.get(pos - 1).unwrap()
+    let slot_col = if tparams != -1 { head_end - 1 } else { head_end }
+    let slot = if bracket_slot == -1 && at(TokenKind.Bang) { parse_slot_after_name(name, tparams != -1, head_line, slot_col) } else { bracket_slot }
     skip_newlines_and_comments()
     let mut flds = -1
     let mut td_end_line = -1
@@ -3667,15 +3725,17 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
                 diag_error_range("UnexpectedAnnotation", UNEXPECTED_ANNOTATION, "only @where is supported on type aliases, got @{ann_name}", peek_line(), peek_col(), peek_end_col(), "use @where(predicate) to add a refinement constraint")
             }
         }
+        reject_row_slot(slot, "`{name}` is a type alias, and a type alias has no row slot")
         let td = node_count()
         node_push(AstNode {
             kind: NodeKind.TypeDef,
-            name: name, type_params: tparams,
+            name: name, type_params: tparams, effects: -1,
             value: alias_type, condition: where_expr,
             line: td_start_line, col: td_start_col,
         })
         return td
     }
+    let body_errs = diag_count
     if at(TokenKind.LBrace) {
         expect(TokenKind.LBrace)
         skip_newlines_and_comments()
@@ -3869,14 +3929,48 @@ fn parse_type_def() -> Int ! Parse.Advance, Parse.Build, Diag.Report {
         expect(TokenKind.RBrace)
         finalize_sublist(flds)
     }
+    // A body with an error may read as variants that are not there.
+    let enum_slot = slot != -1 && diag_count == body_errs && type_body_has_variant(flds)
+    if enum_slot { reject_row_slot(slot, "`{name}` is an enum, and an enum has no row slot") }
+    let kept_slot = if enum_slot { -1 } else { slot }
     let td = node_count()
+    // int_val and binder_col keep where a missing slot goes, for the fix of E0551.
     node_push(AstNode {
         kind: NodeKind.TypeDef,
-        name: name, fields: flds, type_params: tparams,
+        name: name, fields: flds, type_params: tparams, effects: kept_slot,
+        int_val: head_line, binder_col: slot_col,
         line: td_start_line, col: td_start_col,
         end_line: td_end_line, end_col: td_end_col,
     })
     td
+}
+
+// §4.15.5 gives a row slot to a type with fields; on an enum or an alias the slot is a parse error.
+// E0573: `type Name ! _ {`. The one error, so a slot that is also not `! _` gets no E0571.
+fn parse_slot_after_name(name: Str, has_tparams: Bool, head_line: Int, slot_col: Int) -> Int ! Parse.Advance, Parse.Build, Diag.Report {
+    let (line, col) = (peek_line(), peek_col())
+    let slot = parse_type_slot(name, false)
+    let end_col = tokens.end_cols.get(pos - 1).unwrap()
+    let help = if has_tparams { "move `! _` inside the brackets, after the type parameters" } else { "write `type {name}[! _] \{`" }
+    let before = diag_entry_count()
+    diag_error_range_label("RowSlotAfterName", ROW_SLOT_AFTER_NAME, "the row slot of `{name}` must be in brackets", line, col, end_col, "the row slot goes after the name, inside `[ ]`", help)
+    let fix = if has_tparams { " ! _]" } else { "[! _]" }
+    if head_line == line && diag_entry_count() > before { diag_set_last_fix_at("put the row slot in brackets", fix, line, slot_col, line, end_col) }
+    slot
+}
+
+fn reject_row_slot(slot: Int, msg: Str) ! Diag.Report {
+    if slot == -1 { return }
+    let u = sublist_get(slot, 0)
+    diag_error_range("UnexpectedToken", UNEXPECTED_TOKEN, msg, node_line(u), node_col(u), node_col(u) + 1, "")
+}
+
+fn type_body_has_variant(flds: Int) -> Bool {
+    if flds == -1 { return false }
+    for i in 0..sublist_length(flds) {
+        if node_kind(sublist_get(flds, i)) == NodeKind.TypeVariant { return true }
+    }
+    false
 }
 
 fn reject_mut_field() ! Parse.Advance, Diag.Report {
@@ -4016,43 +4110,15 @@ fn parse_type_annotation_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.R
             ret_name = node_name(rt)
             ret_ann = rt
         }
-        // A bare row holds one effect or `_`: a comma after it ends it (§4.15.1).
-        let mut row = -1
-        let mut row_marks = 0
-        let mut row_start = 0
-        if at(TokenKind.Bang) {
-            row_start = written_pack(peek_line(), peek_col())
-            advance()
-            row = new_sublist()
-            if at(TokenKind.LParen) {
-                advance()
-                skip_newlines()
-                row_marks = TYPE_MARK_ROW_PARENS
-                while !at(TokenKind.RParen) && !at(TokenKind.EOF) {
-                    sublist_push(row, parse_effect_name_node())
-                    skip_newlines()
-                    if !at(TokenKind.Comma) { break }
-                    advance()
-                    skip_newlines_and_comments()
-                }
-                expect(TokenKind.RParen)
-            } else {
-                sublist_push(row, parse_effect_name_node())
-            }
-            finalize_sublist(row)
-        }
+        let mut r = BangRow { row: -1, marks: 0, start: 0, end: 0 }
+        if at(TokenKind.Bang) { r = parse_bang_row() }
         let ta = node_count()
         node_push(AstNode {
             kind: NodeKind.TypeAnn, name: "Fn", op: COMPILER_KNOWN_TYPE_ANN, elements: elems,
-            return_type: ret_name, type_ann: ret_ann, effects: row,
+            return_type: ret_name, type_ann: ret_ann, effects: r.row,
             line: peek_line(), col: peek_col(),
         })
-        if row != -1 {
-            type_sides_grow(ta)
-            node_sides.row_starts.set(ta, row_start)
-            node_sides.row_ends.set(ta, written_pack(tokens.lines.get(pos - 1).unwrap(), tokens.end_cols.get(pos - 1).unwrap()))
-            type_mark_add(ta, row_marks)
-        }
+        attach_bang_row(ta, r)
         return ta
     }
     if at(TokenKind.Handler) {
@@ -4075,24 +4141,30 @@ fn parse_type_annotation_unwritten() -> Int ! Parse.Advance, Parse.Build, Diag.R
         name = name.concat(".").concat(qualified)
     }
     let mut elems = -1
+    let mut slot = BangRow { row: -1, marks: 0, start: 0, end: 0 }
     if at(TokenKind.LBracket) {
         advance()
-        elems = new_sublist()
-        let mut prev = parse_type_annotation()
-        sublist_push(elems, prev)
-        while at(TokenKind.Comma) {
-            advance()
-            skip_newlines()
-            let item = parse_type_annotation()
-            mark_after_bare_row(prev, item)
-            sublist_push(elems, item)
-            prev = item
+        // `Name[! R]` gives a row slot and no type argument, so `elems` stays -1 (§4.15.5).
+        if !at(TokenKind.Bang) {
+            elems = new_sublist()
+            let mut prev = parse_type_annotation()
+            sublist_push(elems, prev)
+            while at(TokenKind.Comma) {
+                advance()
+                skip_newlines()
+                let item = parse_type_annotation()
+                mark_after_bare_row(prev, item)
+                sublist_push(elems, item)
+                prev = item
+            }
+            finalize_sublist(elems)
         }
+        if at(TokenKind.Bang) { slot = parse_bracket_row() }
         expect(TokenKind.RBracket)
-        finalize_sublist(elems)
     }
     let ta = node_count()
-    node_push(AstNode { kind: NodeKind.TypeAnn, name: name, elements: elems, line: peek_line(), col: peek_col() })
+    node_push(AstNode { kind: NodeKind.TypeAnn, name: name, elements: elems, effects: slot.row, line: peek_line(), col: peek_col() })
+    attach_bang_row(ta, slot)
     if at(TokenKind.Question) {
         // The caller records where `T?` was written; the `T` inside it needs its own place.
         written_put(ta, start, written_pack(tokens.lines.get(pos - 1).unwrap(), tokens.end_cols.get(pos - 1).unwrap()))
@@ -4132,6 +4204,66 @@ fn mark_after_bare_row(prev: Int, item: Int) {
     if node_kind(item) == NodeKind.TypeAnn && node_elements(item) == -1 && node_op(item) != COMPILER_KNOWN_TYPE_ANN && (node_type_marks(item) & TYPE_MARK_GROUPED) == 0 {
         row_prev_set(item, prev)
     }
+}
+
+type BangRow {
+    row: Int
+    marks: Int
+    start: Int
+    end: Int
+}
+
+// The `! R` row of a fn type, of a type's row slot, or of a handler type (§4.15.1, §4.15.5):
+// one effect or `_` bare, or a list in parentheses. The parser is at the `!`.
+fn parse_bang_row() -> BangRow ! Parse.Advance, Parse.Build, Diag.Report {
+    let start = written_pack(peek_line(), peek_col())
+    advance()
+    let row = new_sublist()
+    let mut marks = 0
+    if at(TokenKind.LParen) {
+        advance()
+        skip_newlines()
+        marks = TYPE_MARK_ROW_PARENS
+        while !at(TokenKind.RParen) && !at(TokenKind.EOF) {
+            sublist_push(row, parse_effect_name_node())
+            skip_newlines()
+            if !at(TokenKind.Comma) { break }
+            advance()
+            skip_newlines_and_comments()
+        }
+        expect(TokenKind.RParen)
+    } else {
+        sublist_push(row, parse_effect_name_node())
+    }
+    finalize_sublist(row)
+    let end = written_pack(tokens.lines.get(pos - 1).unwrap(), tokens.end_cols.get(pos - 1).unwrap())
+    BangRow { row: row, marks: marks, start: start, end: end }
+}
+
+// The `! R` row that ends a bracket list at a use site, `Name[T ! R]`: the `]` ends it, so a
+// comma after a bare row cannot join a second effect to it (E1136).
+fn parse_bracket_row() -> BangRow ! Parse.Advance, Parse.Build, Diag.Report {
+    let r = parse_bang_row()
+    if at(TokenKind.Comma) && (r.marks & TYPE_MARK_ROW_PARENS) == 0 {
+        let (line, col) = (peek_line(), peek_col())
+        let mut names: List[Str] = [node_name(sublist_get(r.row, 0))]
+        while at(TokenKind.Comma) {
+            advance()
+            skip_newlines()
+            if !at(TokenKind.Ident) { break }
+            names.push(parse_effect_name())
+        }
+        diag_error_range("RowListNeedsParens", ROW_LIST_NEEDS_PARENS, "a comma ends a bare row; a row of two or more effects is in parentheses", line, col, peek_col(), "write `! ({names.join(", ")})`")
+    }
+    r
+}
+
+fn attach_bang_row(ta: Int, r: BangRow) {
+    if r.row == -1 { return }
+    type_sides_grow(ta)
+    node_sides.row_starts.set(ta, r.start)
+    node_sides.row_ends.set(ta, r.end)
+    type_mark_add(ta, r.marks)
 }
 
 // ── Effect declarations ─────────────────────────────────────────────

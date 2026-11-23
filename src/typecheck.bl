@@ -39,7 +39,7 @@ import diagnostics.{
     UNSOLVED_TYPEVAR_AT_CODEGEN, CODEGEN_STAGE_NOT_BUILT, CODEGEN_STAGE_NOT_BUILT_NAME, CALL_NOT_ANSWERED, OPEN_TYPE_AFTER_CHECK, CALL_ROW_UNKNOWN, SEALED_OPS_REWRITE_INVARIANT, VARIANT_WITHOUT_ENUM,
     NO_SUCH_VARIANT, TYPE_ERROR, TEMPLATE_MISMATCH, UNEXPECTED_ANNOTATION, MISSING_RETURN, NO_CONVERSION_IMPL, CANNOT_INFER_TYPE, NOT_ITERABLE, MISSING_ELSE, UNLICENSED_SELF_OP, TRAIT_BOUND_NOT_SATISFIED, CAPABILITY_BUDGET, QM_INVALID_OPERAND, UNDEFINED_FUNCTION,
     UNRESOLVED_METHOD, AMBIGUOUS_METHOD_CALL, MISSING_DISPLAY_IMPL,
-    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, ROW_OWNER_AMBIGUOUS, ROW_LIST_NEEDS_PARENS, INVALID_RUNTIME_BINDING, FFI_INCOMPATIBLE_TYPE, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
+    MUTATION_REQUIRES_MUT, MUT_ON_PATTERN, NOT_A_PLACE, PARAM_ASSIGN, diag_error_label_at_notes, diag_add_note_at_spots_since, diag_error_span_label_at_notes, diag_warn_label_at_notes, EMPTY_ROW_OUTSIDE_FFI, PANIC_HOOK_PLACEMENT, TRACE_MESSAGE_EFFECT, METHOD_THROUGH_TYPE_NAME, ASSOCIATED_FN_THROUGH_TRAIT, SELF_OUTSIDE_TRAIT_OR_IMPL, SELF_SHAPE_IN_DEFAULT_BODY, ROW_SLOT_MISMATCH, EFFECTS_ANNOTATION_REMOVED, ANNOTATION_ARGUMENTS, ROW_OWNER_AMBIGUOUS, ROW_LIST_NEEDS_PARENS, INVALID_RUNTIME_BINDING, FFI_INCOMPATIBLE_TYPE, UNKNOWN_EFFECT, SUB_EFFECT_AS_TYPE, diag_fix_before_starts_with, diag_drop_fix_over_others, diag_drop_fix_at,
     UNDEFINED_VARIABLE, UNKNOWN_TYPE, QM_RESULT_IN_NON_RESULT,
     QM_OPTION_IN_NON_OPTION, QM_ERROR_MISMATCH,
     QM_TEST_DISPLAY_REQUIRED, TEST_ANNOTATED_RETURN, SKIP_OUTSIDE_TEST,
@@ -2793,6 +2793,33 @@ pub fn make_tuple_type(elem_types: List[Int]) -> Int {
 // compiled program.
 pub fn make_struct_instance_type(base_name: Str, arg_types: List[Int]) -> Int {
     ty_intern_variadic(TyKind.Struct, base_name, -1, arg_types)
+}
+
+// `tid` with no row in its slot: the struct mono and the C names see. A slotted struct with
+// no type arguments is its declared tid.
+pub fn tc_tid_without_row(tid: Int) -> Int {
+    if tid < 0 || tid >= ty_pool.len() { return tid }
+    let e = ty_pool.get(tid).unwrap()
+    if e.kind != TyKind.Struct || e.row == "" { return tid }
+    if e.params_count == 0 { return named_type_map.get(e.name) ?? tid }
+    let mut args: List[Int] = []
+    for i in 0..e.params_count { args.push(ty_param_at(e, i)) }
+    make_struct_instance_type(e.name, args)
+}
+
+// A struct with a row in its slot (§4.15.5): `Cleanup[! IO]`, `Job[Int ! IO]`. The row keys the
+// tid as it does a fn type's (make_fn_type_with_row) and, as there, nothing compares it yet, so
+// mono's canon_tid gives back the struct with no row. "" is the empty row: the instance, or for
+// a type with no type parameters the declared tid `base` itself.
+fn make_struct_type_with_row(base: Int, base_name: Str, arg_types: List[Int], row: Str) -> Int {
+    if row == "" {
+        if arg_types.len() == 0 { return base }
+        return make_struct_instance_type(base_name, arg_types)
+    }
+    let t = ty_intern_variadic_keyed(TyKind.Struct, base_name, "{base_name} ! {row}", -1, arg_types)
+    let e = ty_pool.get(t).unwrap()
+    if e.row != row { ty_pool.set(t, TypePoolEntry { row: row, ..e }) }
+    t
 }
 
 // A generic-enum INSTANCE tid (`Tree[Int]`), the enum analogue of
@@ -6309,7 +6336,8 @@ fn tc_struct_base_tid(tid0: Int) -> Int {
     if tid < 0 || tid >= ty_pool.len() { return tid0 }
     let t = ty_pool.get(tid).unwrap()
     if t.kind != TyKind.Struct { return tid0 }
-    if t.params_count == 0 { return tid }
+    // A slotted struct with a row and no type arguments (`Cleanup[! IO]`) has its own tid.
+    if t.params_count == 0 { return tc_tid_without_row(tid) }
     let base = lookup_named_type(strip_module_qualifier(t.name))
     if base == -1 { return tid }
     base
@@ -6861,6 +6889,7 @@ pub fn substitute_typevar_tid(t0: Int, binds: Map[Str, Int]) -> Int {
             i = i + 1
         }
         if changed == 0 { return t }
+        if e.row != "" { return make_struct_type_with_row(-1, e.name, elems, e.row) }
         return make_struct_instance_type(e.name, elems)
     }
     if k == TyKind.Enum {
@@ -14694,12 +14723,48 @@ fn tc_arity_help(n: Str, want: Int, got: Int) -> Str {
 // here at name resolution, from the declaration alone, before inference runs.
 fn tc_check_type_arg_arity(name: Str, core: Str, elems_sl: Int, ann_node: Int) ! Diag.Report {
     let want = tc_ctor_arity_meaning(name, core)
-    if want == -1 { return }
     let got = if elems_sl == -1 { 0 } else { sublist_length(elems_sl) }
-    if got == want { return }
     let n = strip_module_qualifier(name)
+    if tc_check_row_slot_use(n, core, want, got, ann_node) { return }
+    if want == -1 { return }
+    if got == want { return }
     let subjects: List[Int] = if core != "" { [] } else { [lookup_named_type(name)] }
     tc_error_naming_types("TypeArgArity", TYPE_ARG_ARITY, "type constructor `{n}` takes {want} type argument(s) but {got} were given", ann_node, tc_arity_help(n, want, got), subjects)
+}
+
+// 1 when the type `n` written in a type position declares a row slot, 0 when it is a type
+// with none, -1 when `n` is no type declaration or compiler-known type (a type parameter, an
+// unknown name).
+fn tc_written_type_slot(n: Str, core: Str) -> Int {
+    if (tc_active_tparams.get(n) ?? 0) > 0 { return -1 }
+    if core != "" { return 0 }
+    let decl = tc_type_decl_nodes.get(tc_written_type_nominal(n)) ?? -1
+    if decl == -1 { return -1 }
+    if node_effects(decl) != -1 { 1 } else { 0 }
+}
+
+// error[RowSlotMismatch] (E0572): a row on a type with no slot, or a type argument where a
+// slotted type takes its row (§4.15.5). True when the use was a type argument in the slot,
+// which is then this error alone and not also TypeArgArity.
+fn tc_check_row_slot_use(n: Str, core: Str, want: Int, got: Int, ann_node: Int) -> Bool ! Diag.Report {
+    if ann_node < 0 || core == "Fn" || node_kind(ann_node) != NodeKind.TypeAnn { return false }
+    let row = node_effects(ann_node)
+    // Neither error is possible: most annotations stop here, before the declaration lookup.
+    if row == -1 && (want < 0 || got != want + 1) { return false }
+    let slot = tc_written_type_slot(n, core)
+    if slot == -1 { return false }
+    if row != -1 && slot == 0 {
+        diag_error_at("RowSlotMismatch", ROW_SLOT_MISMATCH, "`{n}` has no row slot, so it takes no row", ann_node, "remove the row; only a type declared with `[! _]` takes a row in its brackets")
+        return false
+    }
+    if row == -1 && slot == 1 && want >= 0 && got == want + 1 {
+        let decl = tc_type_decl_nodes.get(tc_written_type_nominal(n)) ?? -1
+        let tps = if decl == -1 { -1 } else { node_type_params(decl) }
+        let shown = if tps == -1 { "{n}[! R]" } else { "{n}{tc_type_param_names(tps).replace("]", " ! R]")}" }
+        diag_error_at("RowSlotMismatch", ROW_SLOT_MISMATCH, "`{n}` takes a row in its row slot, not a type", ann_node, "write `{shown}`, where `R` is a row such as `IO`; a bare `{n}` is the empty row")
+        return true
+    }
+    false
 }
 
 // resolve_type_parts' answer where the annotation means the compiler-known type `name`, or -1
@@ -15022,8 +15087,12 @@ fn resolve_type_parts_at(name: Str, elems_sl: Int, ann_node: Int, at_context: Bo
         if tc_suppress_ann_validation == 0 && (type_kind(resolved) == TyKind.Struct || type_kind(resolved) == TyKind.Enum) {
             tc_validate_type_arg_hashability(tc_hash_oblig_at(tc_tid_decl_node(resolved)), elems_sl)
         }
+        let row = tc_struct_ann_row_key(resolved, ann_node)
         if type_kind(resolved) == TyKind.Struct && elems_sl != -1 && sublist_length(elems_sl) >= 1 {
-            return tc_produce_struct_instance_tid(ann_node, tc_instance_base_name(resolved), elems_sl)
+            return tc_produce_struct_instance_tid(ann_node, resolved, tc_instance_base_name(resolved), elems_sl, row)
+        }
+        if row != "" {
+            return tc_produce_struct_instance_tid(ann_node, resolved, tc_instance_base_name(resolved), -1, row)
         }
         // A generic-enum instance annotation (`t: Tree[Int]`) likewise memoizes its
         // structured instance tid onto the annotation node so codegen's param_c_type
@@ -15698,21 +15767,31 @@ pub fn tc_impl_recv_tid(im: Int) -> Int ! Diag.Report {
 // the pass byte-identical while leaving tid-building intact. Kept in its own fn
 // (not inlined into resolve_type_ann) so the save/restore idiom does not make the
 // effect analyzer flag resolve_type_ann's other unguarded mutating calls.
-fn tc_produce_struct_instance_tid(ann_node: Int, name: Str, elems_sl: Int) -> Int ! TypeCheck.Resolve, Diag.Report {
+fn tc_produce_struct_instance_tid(ann_node: Int, base: Int, name: Str, elems_sl: Int, row: Str) -> Int ! TypeCheck.Resolve, Diag.Report {
     let saved_suppress = tc_suppress_ann_validation
     tc_suppress_ann_validation = 1
     let mut arg_tids: List[Int] = []
     let mut ai = 0
-    while ai < sublist_length(elems_sl) {
+    let n = if elems_sl == -1 { 0 } else { sublist_length(elems_sl) }
+    while ai < n {
         arg_tids.push(resolve_type_ann(sublist_get(elems_sl, ai)))
         ai = ai + 1
     }
     tc_suppress_ann_validation = saved_suppress
-    let inst = make_struct_instance_type(name, arg_tids)
+    let inst = make_struct_type_with_row(base, name, arg_tids, row)
     if ann_node >= 0 && ann_node < tc_node_tid.len() {
         tc_node_tid.set(ann_node, inst)
     }
     inst
+}
+
+// The row key written in the slot of struct annotation `ann_node`, or "" for no row, and for a
+// row on a struct with no slot, which tc_check_row_slot_use reports.
+fn tc_struct_ann_row_key(resolved: Int, ann_node: Int) -> Str {
+    if ann_node < 0 || type_kind(resolved) != TyKind.Struct || node_kind(ann_node) != NodeKind.TypeAnn { return "" }
+    let decl = tc_tid_decl_node(resolved)
+    if decl < 0 || node_effects(decl) == -1 { return "" }
+    tc_fn_type_ann_row_key(ann_node)
 }
 
 // The enum analogue of tc_produce_struct_instance_tid: mint+memoize a
@@ -17420,6 +17499,7 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
         ffi_opaque_type_set.insert(tid, 1)
     }
     validate_runtime_handle(td)
+    tc_check_row_slot_fields(td)
     if tc_check_ffi_struct_names_its_header_and_c_struct(td) {
         tc_warn_missing_canonical_header(td, "ffi.struct")
     }
@@ -17430,6 +17510,56 @@ fn register_struct_type(td: Int) ! TypeCheck.Register, TypeCheck.Resolve, Diag.R
     if has_annotation(td, "deprecated") != 0 {
         depr_type_nodes.insert(name, td)
     }
+}
+
+// E0551 (§4.15.5): a `! _` in a field type needs the row slot of its type, and the slot needs a
+// field that uses it. Every `_` field of a type shares its one slot.
+fn tc_check_row_slot_fields(td: Int) ! Diag.Report {
+    let name = node_name(td)
+    let slot = node_effects(td)
+    let flds = node_fields(td)
+    let mut used = false
+    let mut i = 0
+    while flds != -1 && i < sublist_length(flds) {
+        let f = sublist_get(flds, i)
+        let site = if node_kind(f) == NodeKind.TypeField { tc_ann_row_wild_site(node_value(f)) } else { -1 }
+        if site != -1 {
+            used = true
+            if slot == -1 {
+                let tps = node_type_params(td)
+                let shown = if tps == -1 { "[! _]" } else { tc_type_param_names(tps).replace("]", " ! _]") }
+                let before = diag_entry_count()
+                diag_error_label_at_notes("UnsourcedEffectWildcard", UNSOURCED_EFFECT_WILDCARD,
+                    "`_` in the field `{node_name(f)}` of `{name}` has no row slot", site,
+                    "`{name}` has no row slot `[! _]`",
+                    "write `type {name}{shown}`, or name the effects of the field", [])
+                let (line, col) = (node_int_val(td), node_binder_col(td))
+                if diag_entry_count() > before { diag_set_last_fix_at("add the row slot", if tps == -1 { "[! _]" } else { " ! _" }, line, col, line, col) }
+            }
+        }
+        i = i + 1
+    }
+    // A slot that E0571 already reported (int_val 1) is not also unused.
+    if slot != -1 && !used && node_value(td) == -1 && node_int_val(sublist_get(slot, 0)) == 0 {
+        diag_error_label_at_notes("UnsourcedEffectWildcard", UNSOURCED_EFFECT_WILDCARD,
+            "the row slot `! _` of `{name}` has no field that uses it", sublist_get(slot, 0),
+            "no field of `{name}` has `_` in its row",
+            "remove the slot, or give a field a `! _` row", [])
+    }
+}
+
+fn tc_ann_row_wild_site(ann: Int) -> Int {
+    if ann == -1 || node_kind(ann) != NodeKind.TypeAnn { return -1 }
+    let own = tc_er_row_wild_site(node_effects(ann))
+    if own != -1 { return own }
+    let elems = node_elements(ann)
+    let mut i = 0
+    while elems != -1 && i < sublist_length(elems) {
+        let site = tc_ann_row_wild_site(sublist_get(elems, i))
+        if site != -1 { return site }
+        i = i + 1
+    }
+    tc_ann_row_wild_site(node_type_ann(ann))
 }
 
 // E1134 (§9.1.4, §11.1): `name` is the C type an @ffi.opaque handle points at and `header`
@@ -33248,9 +33378,12 @@ fn nr_check_type_ann_visibility(ann_node: Int) ! TypeCheck.Resolve, Diag.Report 
             }
         }
     }
-    // `fn(A, B) -> R` keeps its parameters in `elements` and its return in `type_ann`.
+    // `fn(A, B) -> R` keeps its parameters in `elements` and its return in `type_ann`; a
+    // `Cleanup[! R]` keeps the row of its slot in `effects` too (§4.15.5).
     if core == "Fn" {
         nr_check_type_ann_visibility(node_type_ann(ann_node))
+    }
+    if node_kind(ann_node) == NodeKind.TypeAnn {
         let row = node_effects(ann_node)
         if row != -1 {
             let mut i = 0

@@ -1,0 +1,263 @@
+// A type that stores a callback carries one row slot: `[! _]` at the declaration, after any
+// type parameters, and `[! R]` at a use site. A bare name is the empty row. The slot is
+// exactly one anonymous `! _` (E0571), a use site gives it a row and not a type (E0572), the
+// slot goes in brackets (E0573), and a `! _` field and the slot need each other (E0551)
+// (sections/04_effects.md §4.15.5).
+
+import compile_test_helpers
+
+// Each source parses: a row that passes on a parse error proves nothing about the slot.
+// The enum and alias rows expect a parse error, so they call the helper directly.
+fn capture(src: Str, tag: Str) -> Str ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read, IO.Print {
+    let out = compile_test_helpers.compile_and_capture(src, tag)
+    if out.contains("UnexpectedToken") {
+        io.println("FAIL: {tag} does not parse")
+        assert(false)
+    }
+    out
+}
+
+test "a slot declaration and its use sites compile" {
+    let src = #"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+type Job[T ! _] {
+    input: T
+    run: fn(T) -> Void ! _
+}
+fn a(x: Cleanup[! IO.Print]) ! IO.Print { (x.action)() }
+fn b(j: Job[Int ! IO]) ! IO { (j.run)(j.input) }
+fn c(x: Cleanup) { (x.action)() }
+fn main() { }
+"#
+    let out = capture(src, "row_slot_decl_and_uses")
+    compile_test_helpers.expect_compiles_clean(out, "a slot on a type, a type parameter and a slot, and each use form")
+}
+
+test "a field with _ in a type with no slot is E0551" {
+    let src = #"type Late {
+    action: fn() -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_field_without_slot")
+    compile_test_helpers.expect_error(out, "E0551", "a `! _` field needs a slot on its type")
+    compile_test_helpers.expect_contains(out, "[! _]", "the fix adds the slot in brackets")
+    compile_test_helpers.expect_contains(out, "\"line\":2", "the diagnostic points at the field")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0551\""), 1)
+}
+
+test "a slot that no field uses is E0551" {
+    let src = #"type Idle[! _] {
+    n: Int
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_unused")
+    compile_test_helpers.expect_error(out, "E0551", "a slot needs a field that uses it")
+    compile_test_helpers.expect_contains(out, "Idle", "the message names the type")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0551\""), 1)
+}
+
+test "a named slot is E0571 and names v2" {
+    let src = #"type Named[! e] {
+    action: fn() -> Void ! e
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_named")
+    compile_test_helpers.expect_error(out, "E0571", "named rows are v2")
+    compile_test_helpers.expect_contains(out, "v2", "the help names the v2 rule")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0571\""), 1)
+}
+
+test "two slots on one type are E0571" {
+    let src = #"type Two[! _, ! _] {
+    a: fn() -> Void ! _
+    b: fn() -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_two")
+    compile_test_helpers.expect_error(out, "E0571", "a type has one row slot")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0571\""), 1)
+}
+
+test "a concrete row in a declaration is E0571" {
+    let src = #"type Fixed[! IO] {
+    action: fn() -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_concrete_decl")
+    compile_test_helpers.expect_error(out, "E0571", "the slot is exactly `! _`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0571\""), 1)
+}
+
+test "a type argument in the slot is E0572 and names the row slot" {
+    let src = #"type Cleanup[! _] {
+    action: fn() -> Void ! _
+}
+fn e(s: Cleanup[Int]) { let _ = s }
+fn main() { }
+"#
+    let out = capture(src, "row_slot_type_arg")
+    compile_test_helpers.expect_error(out, "E0572", "Cleanup takes a row, not a type")
+    compile_test_helpers.expect_contains(out, "row slot", "the message names the row slot")
+    compile_test_helpers.expect_contains(out, "\"line\":4", "the diagnostic points at the use")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0572\""), 1)
+}
+
+test "a row on a type with no slot is E0572" {
+    let src = #"type Plain {
+    n: Int
+}
+fn f(p: Plain[! IO]) { let _ = p }
+fn main() { }
+"#
+    let out = capture(src, "row_slot_on_plain")
+    compile_test_helpers.expect_error(out, "E0572", "Plain has no row slot")
+    compile_test_helpers.expect_contains(out, "\"line\":4", "the diagnostic points at the use")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0572\""), 1)
+}
+
+test "a slot after the name is E0573 with a fix to brackets" {
+    let src = #"type Cleanup ! _ {
+    action: fn() -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_after_name")
+    compile_test_helpers.expect_error(out, "E0573", "the slot goes in brackets")
+    compile_test_helpers.expect_contains(out, "the row slot of `Cleanup` must be in brackets", "the message")
+    compile_test_helpers.expect_contains(out, "type Cleanup[! _] \{", "the help writes the bracket form")
+    compile_test_helpers.expect_contains(out, "\"line\":1,\"col\":14", "the diagnostic points at the `!`")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0573\""), 1)
+}
+
+test "an enum has no row slot" {
+    let src = #"type Step[! _] {
+    Run(fn() -> Void ! _)
+    Stop
+}
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "row_slot_on_enum")
+    compile_test_helpers.expect_error(out, "UnexpectedToken", "a slot on an enum is a parse error")
+    compile_test_helpers.expect_contains(out, "`Step` is an enum", "the error names the enum")
+    assert_eq(compile_test_helpers.count_of(out, "\"severity\":\"error\""), 1)
+}
+
+test "a type alias has no row slot" {
+    let src = #"type F[! _] = fn() -> Void ! _
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "row_slot_on_alias")
+    compile_test_helpers.expect_error(out, "UnexpectedToken", "a slot on a type alias is a parse error")
+    compile_test_helpers.expect_contains(out, "`F` is a type alias", "the error names the alias")
+    assert_eq(compile_test_helpers.count_of(out, "\"severity\":\"error\""), 1)
+}
+
+test "E0573 on a generic type moves the slot inside its brackets" {
+    let src = #"type Job[T] ! _ {
+    run: fn(T) -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_after_name_generic")
+    compile_test_helpers.expect_error(out, "E0573", "the slot goes in brackets")
+    compile_test_helpers.expect_contains(out, "\"text\":\" ! _]\"", "the fix puts the slot before the `]`")
+    compile_test_helpers.expect_contains(out, "\"line\":1,\"col\":11,\"end_line\":1,\"end_col\":16", "the fix spans from the `]` to the end of the row")
+    compile_test_helpers.expect_contains(out, "after the type parameters", "the help keeps the type parameters")
+    assert_eq(compile_test_helpers.count_of(out, "Job[! _]"), 0)
+}
+
+test "E0573 fixes from the end of the name, whatever the space before the slot" {
+    let src = #"type Cleanup!_ {
+    action: fn() -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_after_name_no_space")
+    compile_test_helpers.expect_error(out, "E0573", "the slot goes in brackets")
+    compile_test_helpers.expect_contains(out, "\"text\":\"[! _]\"", "the fix writes the bracket form")
+    compile_test_helpers.expect_contains(out, "\"line\":1,\"col\":13,\"end_line\":1,\"end_col\":15", "the fix starts after the name")
+    compile_test_helpers.expect_contains(out, "the row slot goes after the name, inside `[ ]`", "the label")
+}
+
+test "E0551 on a field with no slot has a fix that adds the slot" {
+    let src = #"type Late {
+    action: fn() -> Void ! _
+}
+type LateJob[T] {
+    run: fn(T) -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_field_without_slot_fix")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0551\""), 2)
+    compile_test_helpers.expect_contains(out, "\"text\":\"[! _]\",\"span\"", "the fix adds `[! _]`")
+    compile_test_helpers.expect_contains(out, "\"line\":1,\"col\":10,\"end_line\":1,\"end_col\":10", "after the name")
+    compile_test_helpers.expect_contains(out, "\"text\":\" ! _\",\"span\"", "the fix adds ` ! _` to the type parameters")
+    compile_test_helpers.expect_contains(out, "\"line\":4,\"col\":15,\"end_line\":4,\"end_col\":15", "before the `]`")
+    compile_test_helpers.expect_contains(out, "type LateJob[T ! _]", "the help keeps the type parameters")
+}
+
+test "a bad slot reports E0571 alone" {
+    let src = #"type Named[! e] {
+    action: fn() -> Void ! IO
+}
+type Fixed[! IO] {
+    action: fn() -> Void ! IO
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_bad_slot_alone")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0571\""), 2)
+    assert_eq(compile_test_helpers.count_of(out, "\"severity\":\"error\""), 2)
+}
+
+test "a slot in parentheses is E0571 and not a concrete row" {
+    let src = #"type Wrapped[! (_)] {
+    action: fn() -> Void ! _
+}
+fn main() { }
+"#
+    let out = capture(src, "row_slot_in_parens")
+    compile_test_helpers.expect_error(out, "E0571", "the slot is the bare `! _`")
+    assert_eq(compile_test_helpers.count_of(out, "concrete"), 0)
+    assert_eq(compile_test_helpers.count_of(out, "\"severity\":\"error\""), 1)
+}
+
+test "a type parameter after the slot is one error" {
+    let src = #"type Two[! _, T] {
+    input: T
+    run: fn(T) -> Void ! _
+}
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "row_slot_tparam_after_slot")
+    compile_test_helpers.expect_contains(out, "type parameters of `Two` go before its row slot", "the message")
+    assert_eq(compile_test_helpers.count_of(out, "\"severity\":\"error\""), 1)
+}
+
+test "a struct body with an error is not called an enum" {
+    let src = #"type Kept[! _] {
+    pub a: fn() -> Void ! _
+}
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "row_slot_broken_body")
+    assert_eq(compile_test_helpers.count_of(out, "is an enum"), 0)
+}
+
+test "a concrete row after the name is one error" {
+    let src = #"type Cleanup ! IO {
+    action: fn() -> Void ! IO
+}
+fn main() { }
+"#
+    let out = compile_test_helpers.compile_and_capture(src, "row_slot_concrete_after_name")
+    compile_test_helpers.expect_error(out, "E0573", "the slot goes in brackets")
+    assert_eq(compile_test_helpers.count_of(out, "\"severity\":\"error\""), 1)
+}
