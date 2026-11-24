@@ -1,6 +1,6 @@
 # Blink Language Reference
 
-> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.60.0**.
+> Blink is a statically-typed, effect-tracked language compiling to C. **Compiler v0.61.0**.
 
 ## Install
 
@@ -12,7 +12,7 @@ docker pull ghcr.io/blinklang/blink:latest
 docker run --rm -v "$PWD":/workspace ghcr.io/blinklang/blink run myfile.bl
 ```
 
-Tags: `latest`, `0.60`, `0.60.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
+Tags: `latest`, `0.61`, `0.61.0` (semver). Image is `debian:bookworm-slim` with `gcc`, `zig`, `blink`, and `libgc-dev`.
 
 ## Recent Changes
 
@@ -405,6 +405,7 @@ test "addition works" {
 - **A variant with a positional payload, written with no argument list, is a function value.** `xs.map(Some)` and `xs.map(Tree.Leaf)` work; `Tree.Node` of `Node(Tree, Tree)` is `fn(Tree, Tree) -> Tree` (two parameters, not a tuple), and payload labels drop. The enum's type parameters come from the expected type, as for a generic fn named as a value; when nothing fixes them it is `E0301` at the reference (`let f = Some`, or `xs.map(Ok)` with `E` unfixed): annotate, `let f: fn(Int) -> Option[Int] = Some`. A variant with named fields is not a function value (`E0300`; write `fn(r) { Shape.Circle { radius: r } }`). A variant with no payload is a value, not `fn() -> E`: write `fn() { Color.Red }`. As a value, `Ok` is only `fn(T) -> Result[T, E]`: write `fn() { Ok(()) }` for `fn() -> Result[(), E]`.
 - **`T.name` with no argument list is a function value** for a type-scoped fn (`Duration.ms`), one on a generic type (`Stack.empty`), a trait associated fn (`W.make`, `Int.default`) and one reached through a type parameter (`T.from`). `xs.map(Duration.ms)` works. The type is the declaration's type (`Self` is the head type); a fn's own `[...]` list gives the binders, and the expected type fixes them. When nothing fixes them it is `E0301` at the reference: `let e: fn() -> Stack[Int] = Stack.empty`. `Stack.empty[Int]` with no call is `E0314`. A name that two impls give `T` is `E0522` at the reference, and the help writes a closure: `fn(n) { (Alpha for Widget).make(n) }`; `(Alpha for Widget).make` with no call is not a value. `let s: Stack[Int] = Stack.empty` is `E0300`: call it, `Stack.empty()`. Method syntax does not reach it (§2.12.3).
 - **A trait method with `self` named through its trait is a function value.** `Same.same` is `fn(Self, Self) -> Bool`; the expected type fixes `Self`, the trait's type parameters and the method's own: `let f: fn(Int, Int) -> Bool = Same.same`, `xs.map(Clone.clone)`, `xs.map(Display.display)`. It runs what `Same.same(x, y)` runs. When nothing fixes a binder it is `E0301` at the reference (`let g = Same.same` with no later call); when the fixed `Self` has no impl it is `E0306` at the reference.
+- **A method that takes `self` is called on a value, not through its type.** `Int.abs(-3)`, `Str.len(s)` and `let f = Str.len` are `E0567 MethodThroughTypeName`: "`abs` is a method of `Int`, not a function of the type". Write `(-3).abs()` or `s.len()`, or name the trait: `Clone.clone(x)`. A type-scoped function with no `self` (`Duration.ms(5)`) is still called through the type.
 - **A trait function with no `self` goes through the type, not the trait.** `From.from(3)`, `Alpha.make()` and `[1, 2].map(From.from)` are `E0568 AssociatedFnThroughTrait`: the trait names no type whose impl to run, and the expected type never picks one. Write `W.from(3)` or `[1, 2].map(W.from)`. When the expected type fixes `Self`, the help names that type, and `blink fix` applies it when the type has one impl of the name and the rewritten site checks.
 - **Two `impl` blocks that can apply to one type for one trait are `E0526 OverlappingImpls`.**
 - **Two module-scope declarations of one name in one namespace are `E1016 DuplicateModuleBinding`** (values: `let`, `const`, `fn`; types: `type`, `alias`, `trait`, `effect`). A `let`, `fn` or type named `Some`, `None`, `Ok` or `Err` is also `E1016`, and so is an import entry that binds one (alias it: `import pal.{Ok as PalOk}`). A name of any other variant is free for a value or a type. A struct named like a variant of an enum in the package or the prelude is `E0518 NameCollision`, also at an import entry that binds it. A bare `Name { ... }` is only a struct literal; write `Enum.Variant { ... }` for the variant.
@@ -1054,7 +1055,7 @@ displays as `exit 3`, `signal SIGSEGV` or `limit timeout`.
 ## Process Child
 
 `Child` is opaque, has no methods, and implements `Eq`, `Hash` and `Debug`. A handler
-makes one with `Child.mock(id)` ("made by a handler", not "test only"; not built yet in v0.60.0: a call is an internal error). No getter reads
+makes one with `Child.mock(id)` ("made by a handler", not "test only"; not built yet: a call is E0505 UnresolvedMethod at check). No getter reads
 the key or the pid. A real `Child` prints as `Child(pid 4211)`, and `Child(pid 4211, ended)`
 after a wait reaped it. That text changes from run to run: never parse or compare it.
 
@@ -1474,6 +1475,7 @@ with stdin_from("1\n2") { /* code that reads stdin sees "1\n2" */ }
 **Rows with `_`:**
 
 - A `_` in a row needs a source: a type parameter whose bound has a method with a `_` row (`T: Closeable`). Else it is `E0551 UnsourcedEffectWildcard`. A `_` in a trait method declaration needs no source.
+- A row slot is one anonymous `! _` in brackets after the type parameters: `type Cleanup[! _] { run: fn() -> Int ! _ }`. Any other slot, such as `type Cleanup[! E]` or a concrete row, is `E0571 InvalidRowSlot`. `Cleanup[Int]` (a type in the slot) and `Plain[! IO]` (a row on a type with no slot) are `E0572 RowSlotMismatch`. `type Cleanup ! _ {` is `E0573 RowSlotAfterName`; write `type Cleanup[! _] {`.
 - An impl method's row may not be wider than its trait method's row (`E0904 TraitContractEffectMismatch`). Give the trait method `! _` to let each impl choose.
 - A generic fn that calls `t.close()`, or holds `with t`, through a `Closeable` or `BlockHandler` bound must declare `! _` (E0500).
 
