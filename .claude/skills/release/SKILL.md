@@ -122,20 +122,21 @@ Ask the user before the push: it is public. Then `git push origin main`.
 
 ## Step 10: Execute Release
 
-Run `task release -- vX.Y.Z`
+Run `task release -- vX.Y.Z` from main once Step 9 pushed it.
 
-This will:
-- Run full CI (`task ci-release`; its regen step needs a seeded build/, see CLAUDE.md Bootstrap)
-- Cross-compile binaries (`task build-binaries`)
-- Create git tag
-- Push tag
-- Create GitHub release with binaries + llms-full.md; the notes come from the CHANGELOG.md sections for the version
+It checks that the version is vX.Y.Z and equals `VERSION`, that CHANGELOG.md has its section, that HEAD is origin/main, and that origin has no tag vX.Y.Z. Then it dispatches `.github/workflows/release.yml` on main with that version and prints the run. It builds nothing on this machine.
 
-Run `task ci-release` on HEAD early, while Step 1 runs, so a failure shows before the release commit.
+The workflow runs `task ci-release` in parallel jobs and cross-compiles the four binaries. Only when every job passes does it create the tag vX.Y.Z on the commit it tested, create the GitHub release (binaries, `install.sh`, `llms-full.md`, notes from the CHANGELOG.md sections), and build the Docker image.
+
+Watch the run with `gh run watch <run id>`. A red run leaves no tag and no release: fix the fault, push, and run `task release -- vX.Y.Z` again. "Re-run failed jobs" on the run is enough when the fault was in the runner, not the tree.
+
+Run `task ci-release` on HEAD early, while Step 1 runs, so a failure shows before the release commit. A dispatch with no version (`gh workflow run release.yml --ref main`) runs the same gate on GitHub and releases nothing.
 
 ## Step 11: Verify
 
-Run `gh release view vX.Y.Z` and show the user the release URL.
+After the run is green, run `gh release view vX.Y.Z` and show the user the release URL. Then install the release on this machine with:
+
+`curl -sSL https://blinklang.org/install.sh | sh -s -- --version vX.Y.Z`
 
 ---
 
@@ -151,7 +152,9 @@ Run `gh release view vX.Y.Z` and show the user the release URL.
 - [ ] CLAUDE.md paths and tasks current
 - [ ] No new br IDs in the pushed range
 - [ ] `task ci-release` passes
-- [ ] Release created on GitHub with binaries
+- [ ] `task release -- vX.Y.Z` run is green (`gh run watch`)
+- [ ] `gh release view vX.Y.Z` shows the release with binaries
+- [ ] Installed with `install.sh --version vX.Y.Z`
 
 ### Anti-pattern check (reject the draft if any hit)
 

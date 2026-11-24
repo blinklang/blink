@@ -1,0 +1,77 @@
+// The hidden `blink __test-files <path>...` prints the test files that `blink test` with the
+// same paths runs, one per line. A CI job splits that list into shards, so the list must hold
+// the files `blink test` selects and no other. The fixture has a file in each class the rule
+// knows: a test file, one in a subdirectory, a file with no test block, a `// xtest` file and
+// test files under `build/` and a dot directory, which `blink test` skips.
+
+import std.process.{ProcessResult, ChildEnd}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let PASSING = "test \"t\" \{\n    assert(1 == 1)\n}\n"
+
+fn make_fixture() -> Str ! Process.Spawn, FS.Write {
+    let dir = sh("mktemp -d /tmp/blink_test_files_fixture.XXXXXX").out.trim()
+    let _ = sh("mkdir -p {dir}/tests/sub {dir}/tests/build {dir}/tests/.hidden")
+    fs.write("{dir}/tests/test_a.bl", PASSING).unwrap()
+    fs.write("{dir}/tests/sub/b.bl", PASSING).unwrap()
+    fs.write("{dir}/tests/build/c.bl", PASSING).unwrap()
+    fs.write("{dir}/tests/.hidden/d.bl", PASSING).unwrap()
+    fs.write("{dir}/tests/plain.bl", "fn main() \{\n}\n").unwrap()
+    fs.write("{dir}/tests/x.bl", "// xtest\n{PASSING}").unwrap()
+    dir
+}
+
+// The `file` of each per-file record of `blink test --json`.
+fn json_files(out: Str) -> List[Str] {
+    let key = "\"file\":\""
+    let mut files: List[Str] = []
+    for line in out.split("\n") {
+        if !line.starts_with("\{\"record\":\"file\"") {
+            continue
+        }
+        let at = line.index_of(key) ?? -1
+        if at < 0 {
+            continue
+        }
+        let rest = line.substring(at + key.len(), line.len())
+        let end = rest.index_of("\"") ?? rest.len()
+        files.push(rest.substring(0, end))
+    }
+    files.sort()
+}
+
+fn lines(out: Str) -> List[Str] {
+    let mut result: List[Str] = []
+    for line in out.split("\n") {
+        if line != "" {
+            result.push(line)
+        }
+    }
+    result.sort()
+}
+
+test "__test-files prints the files blink test runs for the same path" {
+    let dir = make_fixture()
+    // BLINK_BIN makes the build workers the compiler under test, not the blink on PATH.
+    let listed = sh("B=$(pwd)/build/blink; cd {dir} && $B __test-files tests")
+    let ran = sh("B=$(pwd)/build/blink; cd {dir} && env -u BLINK_PER_MODULE BLINK_BIN=$B $B test tests --json")
+    let _ = sh("rm -rf {dir}")
+
+    assert_eq(listed.end, ChildEnd.Exited(0))
+    assert_eq(ran.end, ChildEnd.Exited(0))
+    assert_eq(lines(listed.out), ["tests/sub/b.bl", "tests/test_a.bl"])
+    assert_eq(lines(listed.out), json_files(ran.out))
+}
+
+test "__test-files with a path that selects no test file is a usage error, as in blink test" {
+    let dir = make_fixture()
+    let listed = sh("B=$(pwd)/build/blink; cd {dir} && $B __test-files tests/missing")
+    let _ = sh("rm -rf {dir}")
+
+    assert_eq(listed.end, ChildEnd.Exited(2))
+    assert_eq(listed.out, "")
+    assert(listed.err_out.contains("error: path not found: tests/missing"))
+}

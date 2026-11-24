@@ -43,10 +43,9 @@ user C with a gen1-built archive; the link to gen0's archive is cut.
    `blink-gen0-<N>-linux-x86_64.tar.gz` and its `.sha256`. Set
    `GEN0_ASSET_SHA256` in `scripts/gen0_pin.sh` to the value it prints.
 4. Push the tag, then publish the asset as a prerelease that is never the
-   latest release. A published release fires every workflow that has
-   `on: release`. The `build-and-push` job of `.github/workflows/docker.yml`
-   skips a prerelease and a tag that does not start with `v`; publish only
-   when that guard is on origin, or the release pushes a wrong `latest` image:
+   latest release. Neither the tag nor the prerelease starts a workflow:
+   only a dispatch starts `.github/workflows/release.yml` (`task release`),
+   and only that workflow starts the Docker image build:
    `gh release create gen0-<N> --verify-tag --prerelease --latest=false --notes "Bootstrap seed, not a user release." <dir>/*`
 5. Check the download: `BLINK_GEN0_FORCE=1 scripts/gen0_asset.sh fetch`.
 

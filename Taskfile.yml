@@ -293,6 +293,8 @@ tasks:
   # any blinkc. `task ci` drives it with the gen1 compiler and no semantic
   # pass; `task test-fmt` and `ci-release` use the release build with all
   # three. The skip list names tests the formatter cannot round-trip.
+  # CI_SHARD="<i> <n>" checks only that shard (scripts/shard.sh) of the golden
+  # inputs and of the test files.
   __fmt-goldens:
     internal: true
     silent: true
@@ -301,7 +303,9 @@ tasks:
     cmds:
       - |
         skip_file=$(mktemp "${TMPDIR:-/tmp}/blink-fmt-skip-XXXXXX")
-        trap 'rm -f "$skip_file"' EXIT
+        golden_list=$(mktemp "${TMPDIR:-/tmp}/blink-fmt-golden-XXXXXX")
+        test_list=$(mktemp "${TMPDIR:-/tmp}/blink-fmt-tests-XXXXXX")
+        trap 'rm -f "$skip_file" "$golden_list" "$test_list"' EXIT
         # One marker thread per worker. Boehm sizes its marker pool from the
         # machine, so every fmt worker would otherwise start ~one marker per
         # core and the fan-out oversubscribes by that factor. A test binary
@@ -312,14 +316,26 @@ tasks:
         export BLINK_JOBS
         printf '%s\n' test_hof test_lazy_iter test_semver test_toml test_manifest test_lockfile test_http_types test_http_error test_json test_json_builder test_args test_args_cli test_derive_nested test_embed test_combining_iterators test_http_client test_iterators test_match_void_if test_multifile_visibility test_question_ops test_string_iter test_audit test_e2e_gitdep test_e2e_transitive test_e2e_pub_visibility test_async_spawn_types test_tcp_socket test_pub_import test_std_testing test_c_reserved_names test_module_qualified_types test_ue_complex_returns test_effects test_effect_vtable test_sqlite test_builtin_methods test_priv_access test_unused_import test_cross_module_effects test_cross_module_effects_helper test_map_seed_deterministic > "$skip_file"
 
-        golden_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} ::: tests/fmt/input_*.bl 2>&1 || true)
-        idem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
+        {{- if .CI_SHARD}}
+        # Each list is taken before the shard, so a failed ls fails the task;
+        # a pipe would hide it behind shard.sh's status.
+        all=$(ls tests/fmt/input_*.bl) || exit 2
+        printf '%s\n' "$all" | ./scripts/shard.sh {{.CI_SHARD}} > "$golden_list" || exit 2
+        all=$(ls tests/test_*.bl) || exit 2
+        printf '%s\n' "$all" | ./scripts/shard.sh {{.CI_SHARD}} > "$test_list" || exit 2
+        {{- else}}
+        ls tests/fmt/input_*.bl > "$golden_list"
+        ls tests/test_*.bl > "$test_list"
+        {{- end}}
+
+        golden_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_golden.sh {} {{.FMT_BLINKC}} :::: "$golden_list" 2>&1 || true)
+        idem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_idempotent.sh {} {{.FMT_BLINKC}} "$skip_file" :::: "$test_list" 2>&1 || true)
         # The semantic pass compiles and RUNS every formatted test. Those
         # binaries call the relative build/blink and build/blinkc, which only
         # a release build provides, so the rewrite gate skips this pass.
         sem_results=""
         if [ "{{.FMT_SEMANTIC}}" = 1 ]; then
-          sem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} "$skip_file" ::: tests/test_*.bl 2>&1 || true)
+          sem_results=$(parallel -j {{.JOBS}} --halt never ./scripts/run_fmt_semantic.sh {} {{.FMT_BLINKC}} "$skip_file" :::: "$test_list" 2>&1 || true)
         fi
 
         all_results=$(printf '%s\n%s\n%s' "$golden_results" "$idem_results" "$sem_results")
@@ -691,6 +707,107 @@ tasks:
       - task: ci-per-module-checks
       - task: corpus-per-module
 
+  # ci-release in parts, for .github/workflows/release.yml: one prepare run,
+  # then shards that each take a copy of its build/ and .task/. The test, fmt
+  # and corpus parts take `-- <i> <n>` and check shard i of n
+  # (scripts/shard.sh); the n shards of one part check what the whole part
+  # checks in ci-release. ci-release-rest runs the steps that are not split.
+  ci-release-prepare:
+    desc: "ci-release, part 1 of 5: the cheap checks, the self-host fixed point and the CLI the shards run"
+    silent: true
+    cmds: *capped
+
+  __ci-release-prepare:
+    internal: true
+    label: ci-release-prepare
+    silent: true
+    cmds:
+      - task: ratchet
+      - task: test-ratchet
+      - task: check-str-byte-methods
+      - task: test-check-str-byte-methods
+      - task: test-fmt-semantic
+      - task: __ci-monolith-build
+      - task: build-cli
+      - task: gen1
+
+  ci-release-test-shard:
+    desc: "ci-release, part 2 of 5: blink test --no-per-module on shard i of n (task ci-release-test-shard -- <i> <n>)"
+    silent: true
+    preconditions: &shard_args
+      - sh: ./scripts/shard.sh {{.CLI_ARGS}} < /dev/null
+        msg: "usage: task {{.TASK}} -- <i> <n>   (1 <= i <= n)"
+    cmds: *capped
+
+  __ci-release-test-shard:
+    internal: true
+    label: ci-release-test-shard
+    silent: true
+    preconditions: *shard_args
+    deps: [build-cli]
+    cmds:
+      - task: __ci-monolith-test
+        vars: { CI_SHARD: "{{.CLI_ARGS}}" }
+
+  ci-release-fmt-shard:
+    desc: "ci-release, part 3 of 5: formatter goldens, idempotency and semantic checks on shard i of n (task ci-release-fmt-shard -- <i> <n>)"
+    silent: true
+    preconditions: *shard_args
+    cmds: *capped
+
+  __ci-release-fmt-shard:
+    internal: true
+    label: ci-release-fmt-shard
+    silent: true
+    preconditions: *shard_args
+    deps: [build-cli]
+    cmds:
+      - task: __fmt-goldens
+        vars: { FMT_BLINKC: "{{.BLINKC}}", CI_SHARD: "{{.CLI_ARGS}}" }
+
+  ci-release-corpus-shard:
+    desc: "ci-release, part 4 of 5: the per-module corpus on shard i of n of tests/test_*.bl (task ci-release-corpus-shard -- <i> <n>)"
+    silent: true
+    preconditions: *shard_args
+    cmds: *capped
+
+  # corpus.sh --only exits 1 when a listed file fails, known failures too, so
+  # the check judges the run; 2 means the run cannot be trusted.
+  __ci-release-corpus-shard:
+    internal: true
+    label: ci-release-corpus-shard
+    silent: true
+    preconditions: *shard_args
+    cmds:
+      - task: gen1
+      - |
+        list=build/corpus_per_module_shard.txt
+        # The list is taken before the shard, so a failed ls fails the task.
+        all=$(ls tests/test_*.bl) || exit 2
+        printf '%s\n' "$all" | ./scripts/shard.sh {{.CLI_ARGS}} > "$list" || exit 2
+        # Exit 1 only says a listed file failed; the check below judges that
+        # against the known-failure list. Task runs a cmd with errexit on.
+        rc=0
+        CORPUS_PER_MODULE=1 ./scripts/corpus.sh --only "$list" || rc=$?
+        [ "$rc" -le 1 ] || exit "$rc"
+        CORPUS_JSON=build/corpus_per_module_subset.json ./scripts/corpus_per_module_check.sh --slice "$list"
+
+  ci-release-rest:
+    desc: "ci-release, part 5 of 5: the steps not split into shards (per-module checks, installed layout, sqlite peel, cross-compile smoke)"
+    silent: true
+    cmds: *capped
+
+  __ci-release-rest:
+    internal: true
+    label: ci-release-rest
+    silent: true
+    cmds:
+      - task: test-bootstrap-cold
+      - task: test-sqlite-peel
+      - task: test-installed
+      - task: __build-binaries-smoke
+      - task: ci-per-module-checks
+
   gen1:
     desc: Compile the current compiler sources with the pinned gen0 (build/gen1/blinkc)
     silent: true
@@ -988,6 +1105,7 @@ tasks:
         ./scripts/lint_commit_messages.sh
         ./scripts/test_lint_commit_messages.sh
         ./scripts/test_release_notes.sh
+        ./scripts/test_release_check.sh
         ./scripts/test_check_build_warnings.sh
         ./scripts/test_check_clean.sh
         ./scripts/test_runtime_c.sh
@@ -995,6 +1113,7 @@ tasks:
         ./scripts/test_capped_child.sh
         ./scripts/test_gate_budget.sh
         ./scripts/test_scratch.sh
+        ./scripts/test_shard.sh
         ./scripts/test_gate_slice.sh
         ./scripts/check_spec_refs.sh
         ./scripts/test_check_spec_refs.sh
@@ -1141,6 +1260,21 @@ tasks:
       - llms-full.md
       - CHANGELOG.md
     cmds:
+      - task: __ci-monolith-build
+      - task: __ci-monolith-test
+      - task: test-bootstrap-cold
+      - task: test-sqlite-peel
+      - task: __fmt-goldens
+        vars: { FMT_BLINKC: "{{.BLINKC}}" }
+      - task: test-installed
+      - task: __build-binaries-smoke
+
+  # The monolith gate's first part: the self-host fixed point, the registry
+  # check and the archive-linked CLI that the later parts run.
+  __ci-monolith-build:
+    internal: true
+    silent: true
+    cmds:
       - |
         output=$(./bootstrap/bootstrap.sh 2>&1)
         if echo "$output" | grep -q "Bootstrap verified"; then
@@ -1160,18 +1294,28 @@ tasks:
         {{.BLINKC}} --link-archive {{.BUILD_DIR}}/libblink_std.h src/cli.bl {{.BUILD_DIR}}/cli.c 2>/dev/null
         scripts/stamp_cli_version.sh {{.BUILD_DIR}}/cli.c "{{.VERSION}}-dev+$(date +%Y%m%d%H%M%S)"
         scripts/cc_unit.sh {{.BLINKC}} cc {{.LINK_OPT}} -I{{.BUILD_DIR}} -- {{.BUILD_DIR}}/cli.c -- -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
+
+  # Every test file on the monolith path, or with CI_SHARD="<i> <n>" only the
+  # files of that shard (scripts/shard.sh).
+  __ci-monolith-test:
+    internal: true
+    silent: true
+    cmds:
       # A test binary's own per-module build would start one cc per CPU, and
       # Boehm one marker per CPU, in each of the JOBS workers.
       - |
         BLINK_JOBS=$(./scripts/inner_jobs.sh {{.JOBS}}) || exit 2
         export BLINK_JOBS GC_MARKERS="${GC_MARKERS:-1}"
+        {{- if .CI_SHARD}}
+        # The list is taken before the shard, so a failed listing fails the task.
+        all=$({{.BUILD_DIR}}/blink __test-files tests/) || exit 2
+        files=$(printf '%s\n' "$all" | ./scripts/shard.sh {{.CI_SHARD}}) || exit 2
+        [ -n "$files" ] || { echo "ci-monolith-test: shard {{.CI_SHARD}} holds no test file"; exit 2; }
+        # shellcheck disable=SC2086
+        BLINK_ROOT="$(pwd)" ./scripts/blink_test_capped.sh {{.BUILD_DIR}}/blink test $files --no-per-module --parallel {{.JOBS}} --quiet
+        {{- else}}
         BLINK_ROOT="$(pwd)" ./scripts/blink_test_capped.sh {{.BUILD_DIR}}/blink test tests/ --no-per-module --parallel {{.JOBS}} --quiet
-      - task: test-bootstrap-cold
-      - task: test-sqlite-peel
-      - task: __fmt-goldens
-        vars: { FMT_BLINKC: "{{.BLINKC}}" }
-      - task: test-installed
-      - task: __build-binaries-smoke
+        {{- end}}
 
   ci-profile:
     desc: |
@@ -1669,37 +1813,22 @@ tasks:
         echo "build-binaries-smoke: ok (x86_64-linux archive-mode link, zero sqlite symbols)"
 
   release:
-    desc: "Create a GitHub release (usage: task release -- v0.5.0)"
+    desc: "Dispatch .github/workflows/release.yml on main for a version; it gates, tags and publishes it (usage: task release -- v0.5.0)"
     preconditions:
       - sh: test -n "{{.CLI_ARGS}}"
         msg: "Version required. Usage: task release -- v0.5.0"
-      - sh: echo "{{.CLI_ARGS}}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'
-        msg: "Version must match vX.Y.Z format (e.g. v0.5.0)"
-      - sh: test "v{{.VERSION}}" = "{{.CLI_ARGS}}"
-        msg: "Tag {{.CLI_ARGS}} does not match VERSION file (v{{.VERSION}}). Update VERSION first."
       - sh: test -z "$(git status --porcelain)"
         msg: "Working directory must be clean. Commit or stash changes first."
       - sh: scripts/release_notes.sh {{.CLI_ARGS}} > /dev/null
         msg: "CHANGELOG.md has no section for {{.CLI_ARGS}}. Add one first."
+      # The workflow runs on origin's main, so that must be the commit checked here.
+      - sh: git fetch -q origin main && test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+        msg: "HEAD is not origin/main. Push main first, and release from main."
     cmds:
-      - task: ci-release
-      - task: build-binaries
-      - git tag {{.CLI_ARGS}}
-      - git push origin {{.CLI_ARGS}}
-      - |
-        set -e
-        PREV=$(git describe --tags --abbrev=0 --match 'v*' {{.CLI_ARGS}}^)
-        scripts/release_notes.sh {{.CLI_ARGS}} "$PREV" > {{.BUILD_DIR}}/release-notes.md
-        gh release create {{.CLI_ARGS}} \
-          {{.BUILD_DIR}}/blink-linux-x86_64.tar.gz \
-          {{.BUILD_DIR}}/blink-linux-aarch64.tar.gz \
-          {{.BUILD_DIR}}/blink-macos-x86_64.tar.gz \
-          {{.BUILD_DIR}}/blink-macos-aarch64.tar.gz \
-          install.sh \
-          llms-full.md \
-          --title "{{.CLI_ARGS}}" \
-          --notes-file {{.BUILD_DIR}}/release-notes.md
-      - echo "Released {{.CLI_ARGS}} — https://github.com/blinklang/blink/releases/tag/{{.CLI_ARGS}}"
-      - scripts/stamp_cli_version.sh {{.BUILD_DIR}}/cli.c "{{.VERSION}}"
-      - scripts/cc_unit.sh {{.BLINKC}} cc {{.LINK_OPT}} -I{{.BUILD_DIR}} -- {{.BUILD_DIR}}/cli.c -- -o {{.BUILD_DIR}}/blink {{.BUILD_DIR}}/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections
-      - task: build
+      # A cmd, not a precondition: Task hides a precondition's stderr, and
+      # that is where release_check names the fault.
+      - scripts/release_check.sh {{.CLI_ARGS}}
+      # A new gh prints the run URL; an older one prints nothing, so list the newest run too.
+      - gh workflow run release.yml --ref main -f version={{.CLI_ARGS}}
+      - sleep 5 && gh run list --workflow release.yml -L1
+      - echo "Watch the run with gh run watch <run id>. A red run leaves no tag; fix it and run task release again."

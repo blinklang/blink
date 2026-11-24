@@ -1,0 +1,225 @@
+name: Release
+
+# `task release -- vX.Y.Z` dispatches this workflow on main with that
+# version. It runs `task ci-release` in parts and builds the four binaries.
+# Only when every job passes does it create the tag and the GitHub release,
+# and then build the Docker image (docker.yml). So a red run leaves no tag:
+# fix the fault and dispatch again.
+# A dispatch with no version runs the same jobs and releases nothing.
+#
+# Each part is a Task task (see ci-release-prepare in Taskfile.yml), so a
+# job here runs what `task ci-release` runs on a workstation. The shards of
+# one part split its file list with scripts/shard.sh; "Re-run failed jobs"
+# reruns one shard on the same files.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The release to create (vX.Y.Z, equal to v + VERSION). Empty runs the gate only.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # A runner has no systemd user manager, so the gate's cgroup caps cannot
+  # apply; the runner VM is the cap.
+  BLINK_GATE_CAP: '0'
+  # Without it each child falls back to a 2G address-space cap, a limit the
+  # gate's own runs never have.
+  BLINK_CHILD_CAP: '0'
+  # Workers for each fan-out: a runner has 4 CPUs.
+  CI_JOBS: '4'
+  CORPUS_JOBS: '4'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      # The full history holds the gen0 tag and the commit the ratchet compares with.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The release job checks this again; here it stops a bad dispatch
+      # before an hour of runner time.
+      - name: Check the version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "a release runs from main, not $GITHUB_REF"; exit 1; }
+          scripts/release_check.sh "$RELEASE_VERSION"
+      - name: Install tools
+        run: scripts/ci_install_tools.sh
+      - name: Fetch the pinned gen0
+        run: scripts/gen0_asset.sh fetch
+      # bootstrap.sh compares the C that the seed compiler emits with the C
+      # that the compiler it builds emits. Only a seed built from this tree
+      # (gen1) holds that fixed point when codegen changed after the pin.
+      - name: Seed build/ with gen1
+        run: |
+          task gen1
+          cp build/gen1/bin/blinkc build/gen1/bin/blink build/
+      - name: Prepare
+        run: task ci-release-prepare JOBS="$CI_JOBS"
+      # upload-artifact keeps no symlinks or exec bits, and build/ needs both.
+      # .task/ holds Task's checksums, so a shard finds the compiler current
+      # and does not build it again. Without blink.lock the first build of a
+      # job prints "resolving dependencies...", and the output compare of
+      # ci-per-module-checks fails on that line.
+      - name: Pack build/
+        run: tar -cf build-state.tar build .task blink.lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-state
+          path: build-state.tar
+          retention-days: 3
+          compression-level: 1
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    name: test (${{ matrix.shard }})
+    steps: &shard_steps
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install tools
+        run: scripts/ci_install_tools.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-state
+      - name: Unpack build/
+        run: tar -xf build-state.tar && rm build-state.tar
+      - name: Run
+        env:
+          PART: ${{ github.job }}
+          SHARD_INDEX: ${{ strategy.job-index }}
+          SHARD_TOTAL: ${{ strategy.job-total }}
+        run: task "ci-release-$PART-shard" JOBS="$CI_JOBS" -- "$((SHARD_INDEX + 1))" "$SHARD_TOTAL"
+
+  fmt:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    name: fmt (${{ matrix.shard }})
+    steps: *shard_steps
+
+  corpus:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    name: corpus (${{ matrix.shard }})
+    steps: *shard_steps
+
+  rest:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install tools
+        run: scripts/ci_install_tools.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-state
+      - name: Unpack build/
+        run: tar -xf build-state.tar && rm build-state.tar
+      - name: Run
+        run: task ci-release-rest JOBS="$CI_JOBS"
+
+  build-binaries:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install tools
+        run: scripts/ci_install_tools.sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-state
+      - name: Unpack build/
+        run: tar -xf build-state.tar && rm build-state.tar
+      - name: Build
+        run: task build-binaries JOBS="$CI_JOBS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: build/blink-*.tar.gz
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    needs: [prepare, test, fmt, corpus, rest, build-binaries]
+    if: inputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      # The full history holds the tags: the check needs them, and the notes
+      # name the previous release.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: build
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "a release runs from main, not $GITHUB_REF"; exit 1; }
+          scripts/release_check.sh "$RELEASE_VERSION"
+          PREV=$(git describe --tags --abbrev=0 --match 'v*' HEAD)
+          scripts/release_notes.sh "$RELEASE_VERSION" "$PREV" > build/release-notes.md
+          # The tag goes on the commit every gate job ran on. A tag that
+          # GITHUB_TOKEN makes starts no workflow, so docker runs below.
+          gh release create "$RELEASE_VERSION" --target "$GITHUB_SHA" \
+            build/blink-linux-x86_64.tar.gz \
+            build/blink-linux-aarch64.tar.gz \
+            build/blink-macos-x86_64.tar.gz \
+            build/blink-macos-aarch64.tar.gz \
+            install.sh \
+            llms-full.md \
+            --title "$RELEASE_VERSION" \
+            --notes-file build/release-notes.md
+
+  docker:
+    needs: release
+    if: inputs.version != ''
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: ${{ inputs.version }}
