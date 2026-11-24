@@ -35,7 +35,7 @@ import cname.{
 import cg_print.{
     print_effect_default_vtable, print_effect_vtable_typedef,
     print_ev, print_ev_with_external_default, print_ev_typedef, print_epilogue, print_fn, print_fn_decl, print_vtable_slot_fn, print_vtable_slot_fn_decl, print_foreign_decl, print_global_decl,
-    print_global_init, print_prologue, print_prologue_declares, print_foreign_includes, print_ffi_layout_asserts, print_ffi_struct_spellings,
+    print_global_init, print_prologue, print_prologue_declares, print_foreign_includes, print_foreign_include_unless, print_ffi_layout_asserts, print_ffi_struct_spellings,
     print_simple_enum_typedef, print_struct_typedef, print_tagged_enum_typedef, print_swap_lines, print_take,
     print_typedef_blocks,
 }
@@ -1384,7 +1384,30 @@ pub fn cg_decl_emit_foreign_const_defs(own_globals: List[Int]) ! Diag.Report {
             gates.set(i, "")
         }
     }
-    print_foreign_includes(headers, gates)
+    // The prologue may already read a header, and a second read of one with no include guard
+    // defines its structs twice. Read it here only where the prologue's gate leaves it out.
+    let held = program_foreign_includes()
+    let mut fresh: List[Str] = []
+    let mut fresh_gates: List[Str] = []
+    let mut i = 0
+    while i < headers.len() {
+        let header = headers.get(i).unwrap()
+        let gate = gates.get(i).unwrap()
+        let mut held_gate = "-"
+        let mut j = 0
+        while j < held.headers.len() {
+            if held.headers.get(j).unwrap() == header { held_gate = held.gates.get(j).unwrap() }
+            j = j + 1
+        }
+        if held_gate == "-" {
+            fresh.push(header)
+            fresh_gates.push(gate)
+        } else if held_gate != "" && held_gate != gate {
+            print_foreign_include_unless(header, gate, held_gate)
+        }
+        i = i + 1
+    }
+    print_foreign_includes(fresh, fresh_gates)
     for g in foreign_const_defs {
         let spelling = cg_decl_require_spelling(tid_of_node(g), Position.Local)
         print_global_init("const {spelling}", c_global_name(g), "({c_ffi_symbol(g)})")
@@ -1416,7 +1439,9 @@ pub fn cg_decl_emit_prologue(user_tu: Bool, over_std: Bool, define_storage: Bool
         UnitLinkage.WholeUnit
     }
     print_prologue(user_tu || over_std, define_storage, test_build, header_guard, self_header, program_native_gates(), shims_decls_only)
-    emit_foreign_prologue()
+    // A unit's own header includes the types header, which holds the foreign prologue. A
+    // header with no include guard must reach a unit once: C17 rejects a struct defined twice.
+    if self_header == "" { emit_foreign_prologue() }
 }
 
 // The prologue of a user unit up to its own declarations, as the prototype test (§9.1)

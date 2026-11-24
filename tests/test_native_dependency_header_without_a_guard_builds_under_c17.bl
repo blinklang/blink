@@ -1,0 +1,79 @@
+// A native dependency's header need not have an include guard, so each unit of the program
+// must read it once. C17 rejects a second definition of a struct where C23 takes one that is
+// the same, so the build runs cc as -std=gnu17, the default of gcc 14 and older, through a cc
+// on PATH that adds the flag. Each build sets its path in the env, as a gate's env may set
+// the other one.
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let MANIFEST = "[package]\nname = \"unguarded\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nwidget = \{ type = \"vendored\", path = \"vendor/widget.c\", headers = [\"widget.h\"] \}\n"
+
+let HEADER = "#include <stdint.h>\n#define WIDGET_MAX 8\nstruct widget_time \{ int64_t sec; int64_t nsec; };\nstruct widget \{ int64_t count; struct widget_time w_atim; };\nint64_t widget_sum(int64_t a, int64_t b);\n"
+
+let MIRRORS = #"@ffi("widget", "widget_sum", header: "widget.h")
+@trusted(audit: "T1")
+fn widget_sum(a: Int, b: Int) -> Int ! () {}
+
+@ffi.struct(header: "widget.h", name: "widget_time")
+type WidgetTime { sec: Int, nsec: Int }
+
+@ffi.struct(header: "widget.h", name: "widget")
+type Widget { count: Int, w_atim: WidgetTime }
+"#
+
+let STRUCTS_MAIN = #"
+fn main() {
+    let w = Widget { count: 1, w_atim: WidgetTime { sec: 20, nsec: 300 } }
+    io.println("{widget_sum(w.count, w.w_atim.sec) + w.w_atim.nsec}")
+}
+"#
+
+let CONST_MAIN = #"
+@ffi("WIDGET_MAX", header: "widget.h")
+let WIDGET_MAX: Int
+
+fn main() {
+    let w = Widget { count: 1, w_atim: WidgetTime { sec: 20, nsec: 300 } }
+    io.println("{widget_sum(w.count, w.w_atim.sec) + w.w_atim.nsec + WIDGET_MAX}")
+}
+"#
+
+// The output of the program main builds into, after one build with BLINK_PER_MODULE=per_module,
+// or the build's error text.
+fn build_and_run(main: Str, per_module: Int) -> Str ! Process.Spawn, FS.Write, Env.Read {
+    let root = sh("pwd -P").out.trim()
+    let dir = "{compile_test_helpers.scratch_root()}/_unguarded_header_{getpid()}_{per_module}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}/src {dir}/vendor {dir}/fakebin")
+    fs.write("{dir}/blink.toml", MANIFEST).unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/vendor/widget.h", HEADER).unwrap()
+    fs.write("{dir}/vendor/widget.c", "#include \"widget.h\"\nint64_t widget_sum(int64_t a, int64_t b) \{ return a + b; }\n").unwrap()
+    fs.write("{dir}/src/main.bl", "{MIRRORS}{main}").unwrap()
+    fs.write("{dir}/fakebin/cc", "#!/bin/sh\nexec {sh("command -v cc").out.trim()} -std=gnu17 \"$@\"\n").unwrap()
+    let _ = sh("chmod +x {dir}/fakebin/cc")
+    // No object cache: an object built without -std=gnu17 would hide the unit's compile.
+    let r = sh("cd {dir} && env CCACHE_DISABLE=1 BLINK_CACHE_DIR= BLINK_PER_MODULE={per_module} PATH={dir}/fakebin:$PATH timeout 300 {root}/build/blink build src/main.bl -o {dir}/out")
+    let ran = if r.success() { sh("{dir}/out").out } else { "build failed: {r.out}{r.err_out}" }
+    let _ = sh("rm -rf {dir}")
+    ran
+}
+
+test "a native dependency header with no include guard builds under C17, one unit per module" {
+    assert_eq(build_and_run(STRUCTS_MAIN, 1), "321\n")
+}
+
+test "a native dependency header with no include guard builds under C17, one unit" {
+    assert_eq(build_and_run(STRUCTS_MAIN, 0), "321\n")
+}
+
+test "a foreign constant from a header with no include guard builds under C17, one unit per module" {
+    assert_eq(build_and_run(CONST_MAIN, 1), "329\n")
+}
+
+test "a foreign constant from a header with no include guard builds under C17, one unit" {
+    assert_eq(build_and_run(CONST_MAIN, 0), "329\n")
+}
