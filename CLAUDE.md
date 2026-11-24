@@ -35,6 +35,7 @@ Bootstrap: `task bootstrap` — builds blinkc at `build/blinkc`. Needs build/bli
 Regen: `task regen` — rebuild compiler from source + verify (Gen1 vs Gen2 fixed-point). Runs once build/ is seeded as above
 Adding a lib/std or lib/pkg module: `task regen` refreshes the embedded registry. Without a seeded build/, run `./scripts/gen_embedded_stdlib.sh` and commit src/embedded_stdlib_registry.bl; `task ci` checks it
 Known-good compilers: /home/nhumrich/blinklang/compilers/ holds every gen0 pin (MANIFEST.txt has version + sha256). Copy each new pin there before installing it. Recover from a miscompile with `BLINK_GEN0_SEED=<dir>/bin/blink` or by copying a dir back to build/gen0
+Gen0 asset: each pin is also a GitHub prerelease named for its tag. `scripts/gen0_asset.sh fetch` installs it as build/gen0 with no seed compiler (CI runners use it); `scripts/gen0_asset.sh pack <dir>` makes the asset at a re-pin
 CLI: `build/blink build <file.bl>` | `build/blink run <file.bl>` | `build/blink check <file.bl>` | `build/blink doc <module>`
 Build CLI: `task build-cli` — produces `build/blink` (needs a seeded build/, see Bootstrap). `task gen1` produces `build/gen1/bin/{blinkc,blink}` without one
 Test: `task test` — compile+run all test_*.bl in tests/
@@ -76,8 +77,8 @@ and diffing the output — they must match
 
 `task ci` builds src with the pinned gen0, not with build/blinkc, so a regen
 does not lock a feature in for the gate. Step 1 of each dance below is: add the feature, `task ci`.
-Before src may use it, re-pin gen0 to a build that has it (new tag, scripts/gen0.sh default, copy
-into the compilers dir). `task regen` still proves the fixed point once build/ is seeded
+Before src may use it, re-pin gen0 to a build that has it (new tag, GEN0_TAG in scripts/gen0_pin.sh, copy
+into the compilers dir, publish the release asset: docs/codegen-rewrite/harness.md "Re-pin gen0"). `task regen` still proves the fixed point once build/ is seeded
 
 Adding a new feature (2-step):
 1. Add the feature to the compiler (parser/codegen/etc) → `task regen`

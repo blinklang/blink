@@ -6,9 +6,10 @@ how to add a lint row. The gate is `task ci`. The old full gate is now
 
 ## The compilers
 
-- **gen0** is the pinned compiler, built from the tag
-  `gen0-32` into `build/gen0/`. Run
-  `task gen0` to build it. It is a fixed binary per pin, so it
+- **gen0** is the pinned compiler, built from the tag that `GEN0_TAG` in
+  `scripts/gen0_pin.sh` names, into `build/gen0/`. Run
+  `task gen0` to build it, or `scripts/gen0_asset.sh fetch` to download
+  it from the GitHub prerelease of that tag. It is a fixed binary per pin, so it
   is a reference, never a thing under test.
 - **gen1** is the current source compiled by gen0. `task gen1` writes
   `build/gen1/bin/blinkc` and `build/gen1/bin/blink`. It fails when gen0
@@ -32,6 +33,25 @@ and repoints `libblink_std.{a,h}`, `skip_modules.txt`, `.archive-id` and `monoli
 at the result. `native/` sidecars still come from gen0 — those are C,
 not codegen output. Every gen1 compile therefore mixes gen1-emitted
 user C with a gen1-built archive; the link to gen0's archive is cut.
+
+### Re-pin gen0
+
+1. Tag the commit `gen0-<N>` and set `GEN0_TAG` in `scripts/gen0_pin.sh`.
+2. `BLINK_GEN0_FORCE=1 task gen0` builds the pin into `build/gen0/`. Copy
+   it into the known-good compilers dir and add it to `MANIFEST.txt`.
+3. `scripts/gen0_asset.sh pack <dir>` writes
+   `blink-gen0-<N>-linux-x86_64.tar.gz` and its `.sha256`. Set
+   `GEN0_ASSET_SHA256` in `scripts/gen0_pin.sh` to the value it prints.
+4. Push the tag, then publish the asset as a prerelease that is never the
+   latest release. A published release fires every workflow that has
+   `on: release`. The `build-and-push` job of `.github/workflows/docker.yml`
+   skips a prerelease and a tag that does not start with `v`; publish only
+   when that guard is on origin, or the release pushes a wrong `latest` image:
+   `gh release create gen0-<N> --verify-tag --prerelease --latest=false --notes "Bootstrap seed, not a user release." <dir>/*`
+5. Check the download: `BLINK_GEN0_FORCE=1 scripts/gen0_asset.sh fetch`.
+
+A runner without the asset cannot build the tree, so publish it before the
+commit that moves the pin reaches `main` on GitHub.
 
 ## The tasks
 

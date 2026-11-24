@@ -19,7 +19,7 @@
 # BLINK_ROOT when you run the gen0 binaries: it overrides that root.
 #
 # Env:
-#   BLINK_GEN0_TAG    tag to pin (default: gen0-32)
+#   BLINK_GEN0_TAG    tag to pin (default: GEN0_TAG in scripts/gen0_pin.sh)
 #   BLINK_GEN0_WORK   scratch dir for the worktree (default: mktemp under $TMPDIR)
 #   BLINK_GEN0_SEED   path of the `blink` binary that seeds the bootstrap
 #                     (default: build/blink of this tree, else `blink` on PATH).
@@ -30,7 +30,8 @@ set -eu
 CALLER_DIR="$(pwd)"
 cd "$(dirname "$0")/.."
 ROOT_DIR="$(pwd)"
-TAG="${BLINK_GEN0_TAG:-gen0-32}"
+. "$ROOT_DIR/scripts/gen0_pin.sh"
+TAG="${BLINK_GEN0_TAG:-$GEN0_TAG}"
 OUT="$ROOT_DIR/build/gen0"
 
 TAG_SHA="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
