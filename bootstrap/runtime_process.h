@@ -748,10 +748,16 @@ static int blink_cg_write(const char* path, const char* text) {
     return e;
 }
 
+/* path = dir/file: 0, or ENAMETOOLONG when it does not fit, and a path cut short would name
+ * some other file. */
+static int blink_cg_file(char path[BLINK_CG_PATH], const char* dir, const char* file) {
+    return snprintf(path, BLINK_CG_PATH, "%s/%s", dir, file) < BLINK_CG_PATH ? 0 : ENAMETOOLONG;
+}
+
 /* The number on the line "<key> <n>" of a flat-keyed cgroup file; -1 when there is none. */
 static int64_t blink_cg_count(const char* cg, const char* file, const char* key) {
     char path[BLINK_CG_PATH];
-    if (snprintf(path, sizeof(path), "%s/%s", cg, file) >= (int)sizeof(path)) return -1;
+    if (blink_cg_file(path, cg, file) != 0) return -1;
     char* text = blink_cg_slurp(path);
     if (text == NULL) return -1;
     int64_t n = -1;
@@ -781,7 +787,7 @@ static int blink_cg_has_word(const char* text, const char* word) {
 
 static int blink_cg_exists(const char* dir, const char* file, int mode) {
     char path[BLINK_CG_PATH];
-    if (snprintf(path, sizeof(path), "%s/%s", dir, file) >= (int)sizeof(path)) return 0;
+    if (blink_cg_file(path, dir, file) != 0) return 0;
     return access(path, mode) == 0;
 }
 
@@ -811,7 +817,7 @@ static int blink_cg_is_ours(pid_t pid, pid_t self) {
 /* 1 when every process in cgroup.procs of dir is ours (or gone), else 0. */
 static int blink_cg_all_ours(const char* dir) {
     char path[BLINK_CG_PATH];
-    if (snprintf(path, sizeof(path), "%s/cgroup.procs", dir) >= (int)sizeof(path)) return 0;
+    if (blink_cg_file(path, dir, "cgroup.procs") != 0) return 0;
     char* procs = blink_cg_slurp(path);
     if (procs == NULL) return 0;
     pid_t self = getpid();
@@ -845,7 +851,7 @@ static void blink_cg_check(void) {
     struct statfs fs;
     if (statfs(BLINK_CG_ROOT, &fs) != 0 || (unsigned long)fs.f_type != BLINK_CG2_SUPER_MAGIC) return;
     char path[BLINK_CG_PATH];
-    snprintf(path, sizeof(path), "%s/cgroup.type", dir);
+    if (blink_cg_file(path, dir, "cgroup.type") != 0) return;
     char* type = blink_cg_slurp(path);
     int domain = type != NULL && strcmp(type, "domain\n") == 0;
     free(type);
@@ -856,7 +862,7 @@ static void blink_cg_check(void) {
         return;
     }
     if (!blink_cg_all_ours(dir)) return;
-    snprintf(path, sizeof(path), "%s/cgroup.controllers", dir);
+    if (blink_cg_file(path, dir, "cgroup.controllers") != 0) return;
     char* ctl = blink_cg_slurp(path);
     if (ctl == NULL) return;
     /* memory.swap.max: the kernel counts swap, so the child cannot pass its limit through it.
@@ -881,10 +887,11 @@ static int blink_cg_supported(int kind) {
  * of times. */
 static int blink_cg_move_now(void) {
     char leaf[BLINK_CG_PATH], leaf_procs[BLINK_CG_PATH], d_procs[BLINK_CG_PATH], subtree[BLINK_CG_PATH];
-    snprintf(leaf, sizeof(leaf), "%s/blink.self", blink_cg.dir);
-    snprintf(leaf_procs, sizeof(leaf_procs), "%s/cgroup.procs", leaf);
-    snprintf(d_procs, sizeof(d_procs), "%s/cgroup.procs", blink_cg.dir);
-    snprintf(subtree, sizeof(subtree), "%s/cgroup.subtree_control", blink_cg.dir);
+    if (blink_cg_file(leaf, blink_cg.dir, "blink.self") != 0 || blink_cg_file(leaf_procs, leaf, "cgroup.procs") != 0
+        || blink_cg_file(d_procs, blink_cg.dir, "cgroup.procs") != 0
+        || blink_cg_file(subtree, blink_cg.dir, "cgroup.subtree_control") != 0) {
+        return ENAMETOOLONG;
+    }
     if (mkdir(leaf, 0755) != 0 && errno != EEXIST) return errno;
     const char* enable = blink_cg.memory_ok && blink_cg.pids_ok ? "+memory +pids"
         : (blink_cg.memory_ok ? "+memory" : "+pids");
@@ -934,7 +941,7 @@ static int blink_cg_move_locked(void) {
 
 static int blink_cg_watch(const char* cg, const char* file) {
     char path[BLINK_CG_PATH];
-    snprintf(path, sizeof(path), "%s/%s", cg, file);
+    if (blink_cg_file(path, cg, file) != 0) return ENAMETOOLONG;
     return inotify_add_watch(blink_cg.ino_fd, path, IN_MODIFY) < 0 ? errno : 0;
 }
 
@@ -962,20 +969,20 @@ static int blink_cg_child_make(int64_t memory, int64_t processes, char** cg_out,
     char path[BLINK_CG_PATH], num[32];
     if (memory >= 0) {
         snprintf(num, sizeof(num), "%lld", (long long)memory);
-        snprintf(path, sizeof(path), "%s/memory.max", cg);
-        e = blink_cg_write(path, num);
-        snprintf(path, sizeof(path), "%s/memory.swap.max", cg);
+        e = blink_cg_file(path, cg, "memory.max");
+        if (e == 0) e = blink_cg_write(path, num);
+        if (e == 0) e = blink_cg_file(path, cg, "memory.swap.max");
         if (e == 0) e = blink_cg_write(path, "0");
         /* The kernel ends the whole tree at the limit, not one process in it. */
-        snprintf(path, sizeof(path), "%s/memory.oom.group", cg);
+        if (e == 0) e = blink_cg_file(path, cg, "memory.oom.group");
         if (e == 0) e = blink_cg_write(path, "1");
         if (e == 0) e = blink_cg_watch(cg, "memory.events");
     }
     if (e == 0 && processes >= 0) {
         if (processes >= BLINK_CG_PIDS_MAX) snprintf(num, sizeof(num), "max");
         else snprintf(num, sizeof(num), "%lld", (long long)processes);
-        snprintf(path, sizeof(path), "%s/pids.max", cg);
-        e = blink_cg_write(path, num);
+        e = blink_cg_file(path, cg, "pids.max");
+        if (e == 0) e = blink_cg_write(path, num);
         if (e == 0) e = blink_cg_watch(cg, "pids.events.local");
     }
     if (e == 0) e = blink_cg_watch(cg, "cgroup.events");
@@ -984,10 +991,10 @@ static int blink_cg_child_make(int64_t memory, int64_t processes, char** cg_out,
         if (*dir_fd < 0) e = errno;
     }
     if (e == 0) {
-        snprintf(path, sizeof(path), "%s/cgroup.procs", cg);
-        *procs_fd = open(path, O_WRONLY | O_CLOEXEC);
-        if (*procs_fd < 0) {
-            e = errno;
+        e = blink_cg_file(path, cg, "cgroup.procs");
+        *procs_fd = e == 0 ? open(path, O_WRONLY | O_CLOEXEC) : -1;
+        if (e == 0 && *procs_fd < 0) e = errno;
+        if (e != 0) {
             close(*dir_fd);
             *dir_fd = -1;
         }
@@ -1011,8 +1018,7 @@ static int blink_cg_child_make(int64_t memory, int64_t processes, char** cg_out,
 /* Ends every process in the cgroup of a child. */
 static void blink_cg_kill(blink_limit_rec* rec) {
     char path[BLINK_CG_PATH];
-    snprintf(path, sizeof(path), "%s/cgroup.kill", rec->cg);
-    blink_cg_write(path, "1");
+    if (blink_cg_file(path, rec->cg, "cgroup.kill") == 0) blink_cg_write(path, "1");
     rec->cg_killed = 1;
 }
 
@@ -1038,7 +1044,7 @@ static int blink_cg_remove_tree(const char* cg, int depth) {
             if (ent->d_name[0] == '.') continue;
             struct stat st;
             if (fstatat(dirfd(dir), ent->d_name, &st, 0) != 0 || !S_ISDIR(st.st_mode)) continue;
-            if (snprintf(path, sizeof(path), "%s/%s", cg, ent->d_name) >= (int)sizeof(path)) continue;
+            if (blink_cg_file(path, cg, ent->d_name) != 0) continue;
             blink_cg_remove_tree(path, depth + 1);
         }
         closedir(dir);
@@ -1086,7 +1092,7 @@ static void blink_cg_left_locked(void) {
  * tree, so no listed process ends and passes its pid on before its kill. */
 static void blink_cg_signal_tree(const char* cg, int sig, int depth) {
     char path[BLINK_CG_PATH];
-    if (snprintf(path, sizeof(path), "%s/cgroup.procs", cg) >= (int)sizeof(path)) return;
+    if (blink_cg_file(path, cg, "cgroup.procs") != 0) return;
     char* procs = blink_cg_slurp(path);
     if (procs != NULL) {
         for (char* p = procs; *p != 0;) {
@@ -1107,7 +1113,7 @@ static void blink_cg_signal_tree(const char* cg, int sig, int depth) {
         if (ent->d_name[0] == '.') continue;
         struct stat st;
         if (fstatat(dirfd(dir), ent->d_name, &st, 0) != 0 || !S_ISDIR(st.st_mode)) continue;
-        if (snprintf(path, sizeof(path), "%s/%s", cg, ent->d_name) >= (int)sizeof(path)) continue;
+        if (blink_cg_file(path, cg, ent->d_name) != 0) continue;
         blink_cg_signal_tree(path, sig, depth + 1);
     }
     closedir(dir);
@@ -1124,8 +1130,7 @@ static int blink_cg_send(blink_limit_rec* rec, int sig) {
         return 1;
     }
     char path[BLINK_CG_PATH];
-    snprintf(path, sizeof(path), "%s/cgroup.freeze", rec->cg);
-    if (blink_cg_write(path, "1") != 0) return 0;
+    if (blink_cg_file(path, rec->cg, "cgroup.freeze") != 0 || blink_cg_write(path, "1") != 0) return 0;
     int frozen = 0;
     for (int i = 0; i < 200 && !(frozen = blink_cg_count(rec->cg, "cgroup.events", "frozen") == 1); i++) {
         struct timespec ts = { 0, 1000000L };
