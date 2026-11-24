@@ -22,7 +22,7 @@ Ignore short-term gain, and always think about what is most correct according to
 Pipeline: lexer → parser → typecheck → mono → lowering to IR → C printer
 Codegen layer: src/cg.bl (driver, four emit modes) over src/cg_*.bl (stages), src/mono.bl,
 src/layout.bl (C shape of a tid), src/cname.bl (C symbol names), src/ir.bl (typed lowered IR)
-gen0 is pinned to tag gen0-27 (main at e6f0b30f, VERSION 0.59.0).
+gen0 is pinned to tag gen0-32 (main at 7417505d, VERSION 0.60.0).
 `task ci` is the gate for each change; `task ci-release` is the release gate
 Entry points: src/compiler.bl (compiler), src/cli.bl (CLI tool), src/blinkc_main.bl (compiler binary)
 Stdlib: lib/std/. Tests: tests/. Spec: sections/. Decisions: decisions/
@@ -50,6 +50,8 @@ Quick run: `build/blink run <file.bl>` — compiles and runs in one step. Prefer
 Low-level (dev): `build/blinkc <file.bl> <output.c>` then `cc -o <binary> <output.c> -lm`
 Archive-linked (dev): `build/blinkc --link-archive build/libblink_std.h <file.bl> <out.c>` then `cc -o <bin> <out.c> -Ibuild build/libblink_std.a -lm -lgc -pthread -Wl,--gc-sections`
 After modifying compiler sources: `task ci`; `task regen` then `task ci-release` at release points
+Quiet gates (Claude): run a gate as `scripts/quiet.sh <task> [-- args]` (for example `scripts/quiet.sh ci`). It prints one PASS line, or up to 40 error lines and one FAIL line, and keeps the exit code. Humans run `task <name>` as before
+Gate failed: read `build/logs/<task>.log` with `rg` or `offset`/`limit`, never whole. Each run overwrites its log
 
 ## Debugging
 
