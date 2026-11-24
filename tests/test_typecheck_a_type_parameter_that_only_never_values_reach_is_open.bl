@@ -1,0 +1,158 @@
+// A type parameter that only Never values reach is an open slot (sections/03_types.md §3.2):
+// inference never chooses Never for it. An annotation, the expected type or a later use fills
+// it, as for `[]`; with none of them it is E0301 CannotInferType at the place a repair goes
+// (§3.4): the `let` when the result carries the parameter, else the call.
+
+import typecheck.{check_types, TypeCheck}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+import lexer.{Lex}
+import parser.{Parse}
+
+fn probe(path: Str, src: Str) -> Int ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        program
+    }
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int ! IO.Print {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat("{d.code} {d.message} | help: {d.help}\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.code} {d.message} | help: {d.help}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) ! IO.Print {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+// No error from the first line holding `from` through the line holding `to`.
+fn assert_clean_between(from: Str, to: Str) ! IO.Print {
+    let a = line_of(probe_src(), from)
+    let b = line_of(probe_src(), to)
+    let mut msgs = ""
+    let mut l = a
+    while l <= b {
+        msgs = msgs.concat(errors_on_line(l))
+        l = l + 1
+    }
+    if msgs != "" { io.println("FAIL: lines {a}..{b} ({from}..{to}) must report nothing, got: {msgs}") }
+    assert_eq(msgs, "")
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn probe_src() -> Str {
+    #"type Box[T] {
+    v: T
+}
+
+type Opt1[T] {
+    Has(T)
+    Empty
+}
+
+fn pick[T](_a: T, b: T) -> T { b }
+
+fn wrap[T](a: T) -> List[T] { [a] }
+
+fn count[T](_a: T) -> Int { 1 }
+
+// OK_BEGIN
+fn filled_by_annotation() -> Int {
+    let l: List[Int] = wrap(todo())
+    let b: Box[Int] = Box { v: panic("x") }
+    let _e: Opt1[Int] = Opt1.Has(panic("x"))
+    let x: Int = pick(todo(), todo())
+    l.len() + b.v + x
+}
+
+fn filled_by_return_type() -> List[Int] {
+    wrap(todo())
+}
+
+fn filled_by_later_use() -> Int {
+    let mut xs = wrap(todo())
+    xs.push(1)
+    xs.len()
+}
+
+fn filled_by_type_arguments() -> Int {
+    count[Int](todo())
+}
+
+fn never_with_no_type_parameter_stays_never() -> Int {
+    let x = todo()
+    x
+}
+// OK_END
+
+fn open_struct_field() {
+    let q = Box { v: panic("x") }  // E_STRUCT
+}
+
+fn open_variant_payload() {
+    let q = Opt1.Has(panic("x"))  // E_VARIANT
+}
+
+fn open_result_of_a_call() {
+    let x = pick(todo(), todo())  // E_CALL_RESULT
+}
+
+fn open_parameter_the_result_does_not_carry() -> Int {
+    count(todo())  // E_CALL_ARGS
+}
+
+fn main() {
+}
+"#
+}
+
+test "an annotation, the expected type, a later use or type arguments fill a parameter only Never values reach" {
+    let _p = probe("build/tc_never_open_slot_src.bl", probe_src())
+    assert_clean_between("OK_BEGIN", "OK_END")
+}
+
+test "a parameter only Never values reach, with nothing to fill it, is E0301 where the repair goes" {
+    let _p = probe("build/tc_never_open_slot_src.bl", probe_src())
+    assert_error_at("E_STRUCT", "E0301 cannot infer a type for `q`")
+    assert_error_at("E_VARIANT", "E0301 cannot infer a type for `q`")
+    assert_error_at("E_CALL_RESULT", "E0301 cannot infer a type for `x`")
+    assert_error_at("E_CALL_ARGS", "E0301 type parameter `T` of `count` is unbound at this call")
+}

@@ -1,0 +1,144 @@
+// A diverging value fixes no type parameter (sections/03_types.md §3.2), but the values that do
+// fix one are still held to one type. A Never value between two clashing values does not let the
+// clash through, and `List[Never]` is not a `List[Int]`: the subtype rule does not go through a
+// type constructor.
+
+import typecheck.{check_types, TypeCheck}
+import compiler.{compile_to_program}
+import diagnostics.{diag_entries, diag_reset, Diag}
+import embedded_stdlib_registry.{init_embedded_stdlib}
+import std.fs
+import std.io
+import lexer.{Lex}
+import parser.{Parse}
+
+fn probe(path: Str, src: Str) -> Int ! FS, Env.Exit, Env.Read, IO {
+    with handler Diag {}, handler Lex {}, handler Parse {}, handler TypeCheck {} {
+        init_embedded_stdlib()
+        fs.write(path, src).unwrap()
+        diag_reset()
+        let program = compile_to_program(path, 1)
+        check_types(program)
+        let _ = fs.delete(path)
+        program
+    }
+}
+
+// The 1-based line of the one source line that holds `marker`.
+fn line_of(src: Str, marker: Str) -> Int ! IO.Print {
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        if lines.get(i).unwrap().contains(marker) { return i + 1 }
+        i = i + 1
+    }
+    io.println("FAIL: probe has no line marked '{marker}'")
+    assert(false)
+    -1
+}
+
+fn errors_on_line(line: Int) -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" && d.line == line { out = out.concat("{d.code} {d.message}\n") }
+    }
+    out
+}
+
+fn all_errors() -> Str {
+    let mut out = ""
+    for d in diag_entries {
+        if d.severity == "error" { out = out.concat("{d.line}: {d.code} {d.message}\n") }
+    }
+    out
+}
+
+fn assert_error_at(marker: Str, want: Str) ! IO.Print {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if !msgs.contains(want) {
+        io.println("FAIL: no error on line {line} ({marker}) contains '{want}'; errors were:\n{all_errors()}")
+    }
+    assert(msgs.contains(want))
+}
+
+// `want` is the one error on the line: a Never value must add no error of its own beside it.
+fn assert_only_error_at(marker: Str, want: Str) ! IO.Print {
+    let line = line_of(probe_src(), marker)
+    let msgs = errors_on_line(line)
+    if msgs != "E0300 {want}\n" {
+        io.println("FAIL: line {line} ({marker}) must report only '{want}'; errors were:\n{msgs}")
+    }
+    assert_eq(msgs, "E0300 {want}\n")
+}
+
+// One probe holds every shape. Typecheck's named-type map is not reset between compiles in
+// one binary, so a second probe would be measuring the first one's leftovers.
+fn probe_src() -> Str {
+    #"type Pair[T] {
+    a: T
+    b: T
+}
+
+type Trio[T] {
+    a: T
+    b: T
+    c: T
+}
+
+type Opt2[T] {
+    Two(T, T)
+    Empty
+}
+
+fn pick[T](_a: T, b: T) -> T { b }
+
+fn pick3[T](_a: T, _b: T, c: T) -> T { c }
+
+fn add_to[T](xs: List[T], x: T) { xs.push(x) }
+
+fn plain_clash() -> Int { pick(1, "a") }  // E_PLAIN
+
+fn clash_after_never() -> Int { pick3(panic("x"), 1, "a") }  // E_AFTER_NEVER
+
+fn field_clash_after_never() -> Int {
+    let t = Trio { a: panic("x"), b: 1, c: "a" }  // E_FIELD_AFTER_NEVER
+    0
+}
+
+fn field_against_annotation() -> Int {
+    let p: Pair[Str] = Pair { a: panic("x"), b: 1 }  // E_FIELD_ANNOTATION
+    0
+}
+
+fn payload_against_return_type() -> Opt2[Str] {
+    Opt2.Two(panic("x"), 1)  // E_PAYLOAD_RETURN
+}
+
+fn list_of_never_is_not_a_list_of_int(xs: List[Never]) {
+    add_to(xs, 1)  // E_LIST_NEVER
+}
+
+fn main() {
+    let _ = plain_clash()
+}
+"#
+}
+
+test "a real clash between two values for one type parameter is still refused" {
+    let _p = probe("build/tc_never_real_mismatch_src.bl", probe_src())
+    assert_error_at("E_PLAIN", "argument 2 of `pick` expects Int, got Str")
+    assert_only_error_at("E_AFTER_NEVER", "argument 3 of `pick3` expects Int, got Str")
+    assert_only_error_at("E_FIELD_AFTER_NEVER", "field `c` of `Trio[Int]`: declared type Int but got Str")
+}
+
+test "an expected type that a value clashes with is still refused next to a Never value" {
+    let _p = probe("build/tc_never_real_mismatch_src.bl", probe_src())
+    assert_only_error_at("E_FIELD_ANNOTATION", "variable `p`: declared type Pair[Str] but got Pair[Int]")
+    assert_only_error_at("E_PAYLOAD_RETURN", "return value type Opt2[Int] does not match function `payload_against_return_type` return type Opt2[Str]")
+}
+
+test "a Never type argument binds a type parameter inside a type constructor" {
+    let _p = probe("build/tc_never_real_mismatch_src.bl", probe_src())
+    assert_error_at("E_LIST_NEVER", "argument 2 of `add_to` expects Never, got Int")
+}

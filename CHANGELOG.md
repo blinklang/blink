@@ -2,6 +2,16 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Changes (unreleased)
+
+### Breaking Changes
+
+- **A type parameter that only `Never` values reach is E0301 CannotInferType when nothing else fixes it (section 3.4).** Inference never chooses `Never` for a slot the program left open (section 3.2). Before, `let q = Box { v: panic("x") }` gave `q` the type `Box[Never]`, and `let x = pick(todo(), todo())` gave `x` the type `Never`. Each is now E0301 at the `let`: "cannot infer a type for `q`: it is never given one by an annotation or a later use". When the result does not carry the parameter, as in `count(todo())` for `fn count[T](a: T) -> Int`, the error is at the call: "type parameter `T` of `count` is unbound at this call and nothing supplies it". Write the type: `let q: Box[Int] = Box { v: panic("x") }`, or `count[Int](todo())`. A later use fills the slot too, as for `[]`: `let mut xs = wrap(todo())` then `xs.push(1)`. `let x = todo()` has no type parameter and stays `Never`.
+
+### Fixes
+
+- **A `Never` value no longer fixes a type parameter (section 3.2).** In `fn pick[T](a: T, b: T) -> T`, the call `pick(todo(), 2)` bound `T` to `Never` and then refused the `2`, while `pick(2, todo())` passed. Both now give `T = Int`. The same holds for a struct literal field (`Pair { a: todo(), b: 6 }`), a variant payload (`let e: Either[Int] = Either.Some1(panic("x"))`), an alias head (`let b: BoxAlias[Int] = BoxAlias { v: panic("x") }`), a struct-style variant field (`Shape.Pt { x: todo(), y: 20 }`) and an expected type (`let l: List[Int] = wrap(todo())`). The other values, the expected type or a later use fix the parameter, in any order. A `Never` inside a type constructor still binds: `List[Never]` is not a `List[Int]`.
+
 ## Breaking Changes (v0.61.0)
 
 - **A `! _` field in a type with no row slot is an error (section 4.15.5).** `type Cleanup { run: fn() -> Void ! _ }` is now E0551 UnsourcedEffectWildcard at the `_`: "`_` in the field `run` of `Cleanup` has no row slot". Before, `blink check` passed it, and the `_` had no source. The help says that `Cleanup` has no row slot `[! _]`, and `blink fix` adds `[! _]` after the name, or ` ! _` after the type parameters. Write `type Cleanup[! _] { run: fn() -> Void ! _ }`; a use site writes `Cleanup[! IO]`, and a bare `Cleanup` is the empty row. A slot that no field uses is E0551 too. The new slot forms have their own errors: E0571 InvalidRowSlot for a slot that is not the one bare `! _`, E0572 RowSlotMismatch for a row on a type with no slot or a type in the slot, and E0573 RowSlotAfterName for `type Cleanup ! _ {`.
