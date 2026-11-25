@@ -5485,12 +5485,24 @@ fn test_report_bytes_text(line: Bytes) -> Str {
 
 // Writes the mark that tells the main task a file's task is done. The main task waits for
 // it, so a mark that cannot be written (a full disk, a removed run dir) would hang the run:
-// the run stops with an error instead.
-fn write_test_mark(path: Str) ! IO, FS.Write, FS.Read, Env.Exit {
-    let _ = fs.write(path, "")
-    if !build_fs.path_exists(path) {
-        io.eprintln("error: blink test cannot write {path}")
-        env.exit(1)
+// the run stops with an error instead. Only the write's own result says whether it worked:
+// the main task deletes a mark as soon as it sees it, so the file can be gone at once.
+// With hold (the mark fault), the task waits after the write until the main task has taken
+// the mark, at most 5 s, so a test sees that window.
+fn write_test_mark(path: Str, hold: Bool) ! IO, FS.Write, FS.Read, Env.Exit, Time.Sleep {
+    match fs.write(path, "") {
+        Ok(_) => {}
+        Err(e) => {
+            io.eprintln("error: blink test cannot write a mark: {e}")
+            env.exit(1)
+        }
+    }
+    if hold {
+        let mut waited = 0
+        while waited < 500 && build_fs.path_exists(path) {
+            time.sleep(Duration.ms(10))
+            waited = waited + 1
+        }
     }
 }
 
@@ -6137,7 +6149,8 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
     // Dev knob: BLINK_DEV_TEST_FAULT=<mode>:<test file> forces a runner fault on that file, so a
     // test can check how the runner reports it without racing the host. start spawns a program
     // that does not exist; wait runs the binary, then takes its wait as failed; lost runs the
-    // binary, then ends the task without its result.
+    // binary, then ends the task without its result; mark makes the task wait after it writes its
+    // done mark until the main task has taken it.
     let fault_knob = env.var("BLINK_DEV_TEST_FAULT") ?? ""
     let fault_colon = fault_knob.byte_index_of(":", 0) ?? -1
     let fault_mode = if fault_colon < 0 { "" } else { fault_knob.byte_slice(0, fault_colon) }
@@ -6207,7 +6220,7 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                         test_progress_mark(dot_ch, "{esc}[31mE{esc}[0m")
                     }
                     sem.send(1)
-                    write_test_mark(done_mark)
+                    write_test_mark(done_mark, forced == "mark")
                     return 0
                 }
                 // A test reads the null device, never the terminal that started the runner
@@ -6242,13 +6255,13 @@ fn cmd_test(_p: ArgParser, a: Args) ! Lex.Tokenize, Parse, Parse.Build, Diag.Rep
                 remove_test_scratch(scratch)
                 if forced == "lost" {
                     sem.send(1)
-                    write_test_mark("{run_dir}/{idx}.lost")
+                    write_test_mark("{run_dir}/{idx}.lost", false)
                     return 0
                 }
                 results.send(result)
                 sem.send(1)
                 // The last act of the task: once the mark is there, the result is in the channel.
-                write_test_mark(done_mark)
+                write_test_mark(done_mark, forced == "mark")
                 0
             })
             si = si + 1

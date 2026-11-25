@@ -1,0 +1,33 @@
+// The runner's main loop takes a file's done mark and deletes it as soon as it sees it, so the
+// mark can be gone before the task that wrote it looks again. A task must judge its write by the
+// write's own result, never by the file still being there, or a fast main loop ends the run with
+// "cannot write" on a mark it wrote fine.
+//
+// BLINK_DEV_TEST_FAULT=mark:<file> makes that file's task, after it writes its done mark, wait
+// until the main loop has deleted it. That holds the window open on every run.
+// Fixture basenames must be unique per worker: `blink test` writes each binary to build/<basename>.
+
+import compile_test_helpers
+
+fn run_holding(scratch: Str, held: Str) -> Str ! Process.Spawn {
+    let r = process.run("sh", ["-c", "BLINK_DEV_TEST_FAULT=mark:{held} build/blink test --quiet {scratch} 2>&1; echo \"exit=$?\""]).unwrap()
+    r.out
+}
+
+test "a done mark the main loop takes at once still counts as written" {
+    let scratch = "{compile_test_helpers.scratch_root()}/_test_mark_taken_{getpid()}"
+    process.run("sh", ["-c", "rm -rf {scratch}"])?
+    process.run("sh", ["-c", "mkdir -p {scratch}"])?
+    let mut gi = 0
+    while gi < 2 {
+        fs.write("{scratch}/mark_taken_good_{gi}_{getpid()}.bl", "test \"good_{gi}\" \{\n    assert(1 + 1 == 2)\n}\n").unwrap()
+        gi = gi + 1
+    }
+    let held = "{scratch}/mark_taken_good_0_{getpid()}.bl"
+    let out = run_holding(scratch, held)
+    process.run("sh", ["-c", "rm -rf {scratch}"])?
+    let diag = "captured:\n{out}"
+    assert(!out.contains("cannot write"), "a mark the main loop took must not read as a failed write; {diag}")
+    assert(out.contains("2 passed, 0 failed (of 2)\n"), "expected both files to run and pass; {diag}")
+    assert(out.contains("exit=0"), "expected the run to pass; {diag}")
+}
