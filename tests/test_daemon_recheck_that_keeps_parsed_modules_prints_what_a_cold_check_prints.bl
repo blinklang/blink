@@ -1,8 +1,12 @@
 // A warm daemon check keeps the parsed nodes of each source whose bytes did not change and
-// parses only the edited ones. Over a run of edits to the compiler's own src/cname.bl and
-// src/cli.bl, each warm check must print what a cold check of a twin tree prints, byte for
-// byte, in human and JSON form, and the daemon must say it reused sources, so a fast path
-// that fell back to cold on every check cannot pass unseen.
+// parses only the edited ones. Over a run of edits to a small program whose modules have the
+// compiler's names and shapes (tests/daemon_recheck_app: the entry src/cli.bl, src/cname.bl
+// with a fn that writes a global, src/cg.bl that loads after it, src/mono.bl that the entry
+// does not import), each warm check must print what a cold check of a twin tree prints, byte
+// for byte, in human and JSON form, and the daemon must say it reused sources, so a fast path
+// that fell back to cold on every check cannot pass unseen. The program is small so that the
+// 132 checks run in seconds. A second, short run of edits checks a copy of the compiler's own
+// src/, so the kept nodes also meet every node kind a large program has.
 
 import std.process.{ProcessResult}
 import std.testing.{cleanup}
@@ -12,18 +16,25 @@ fn sh(cmd: Str) -> Str ! Process.Spawn {
     process.run("sh", ["-c", cmd]).unwrap().out.trim()
 }
 
-fn dev_tree(root: Str, tree: Str) ! Process.Spawn, FS.Write {
+// A tree whose app/ is a copy of `app`. The compiler's own tree also gets what its src/
+// embeds, so its first check is clean too.
+fn dev_tree(app: Str, tree: Str, compiler: Bool) ! Process.Spawn, FS.Write {
     process.run("sh", ["-c", "rm -rf {tree}"]).unwrap()
-    process.run("sh", ["-c", "mkdir -p {tree}/build {tree}/app"]).unwrap()
+    process.run("sh", ["-c", "mkdir -p {tree}/build"]).unwrap()
     // A copy, not a link: the install root comes from realpath(argv[0]).
     process.run("sh", ["-c", "cp {sh("readlink -f build/blink")} {tree}/build/blink"]).unwrap()
+    let root = sh("pwd -P")
     process.run("sh", ["-c", "ln -s {root}/lib {tree}/build/lib && ln -s {root}/lib {tree}/lib"]).unwrap()
-    process.run("sh", ["-c", "cp -rL {root}/src {tree}/app/src && cp {root}/blink.toml {tree}/app/blink.toml"]).unwrap()
-    // What src/ embeds, so the first check is clean and runs the build analyses, which
-    // write to the nodes a recheck keeps.
-    process.run("sh", ["-c", "mkdir -p {tree}/app/build {tree}/app/.claude"]).unwrap()
-    for p in ["lib", "bootstrap", "CHANGELOG.md", "llms.md", "llms-full.md", "build/gc_unity.c", ".claude/blink-marketplace"] {
-        process.run("sh", ["-c", "ln -s {root}/{p} {tree}/app/{p}"]).unwrap()
+    // The program checks clean, so the first check runs the build analyses, which write to
+    // the nodes a recheck keeps.
+    if compiler {
+        process.run("sh", ["-c", "mkdir -p {tree}/app/build {tree}/app/.claude"]).unwrap()
+        process.run("sh", ["-c", "cp -rL {app}/src {tree}/app/src && cp {app}/blink.toml {tree}/app/blink.toml"]).unwrap()
+        for p in ["lib", "bootstrap", "CHANGELOG.md", "llms.md", "llms-full.md", "build/gc_unity.c", ".claude/blink-marketplace"] {
+            process.run("sh", ["-c", "ln -s {app}/{p} {tree}/app/{p}"]).unwrap()
+        }
+    } else {
+        process.run("sh", ["-c", "cp -r {app} {tree}/app"]).unwrap()
     }
     // A lock no older than blink.toml keeps "resolving dependencies..." out of every check.
     fs.write("{tree}/app/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
@@ -139,8 +150,8 @@ fn append_both(warm: Str, cold: Str, file: Str, text: Str) ! FS.Write, FS.Read {
     }
 }
 
-fn restore_both(root: Str, warm: Str, cold: Str, file: Str) ! Process.Spawn {
-    for t in [warm, cold] { process.run("sh", ["-c", "cp {root}/src/{file} {t}/app/src/{file}"]).unwrap() }
+fn restore_both(app: Str, warm: Str, cold: Str, file: Str) ! Process.Spawn {
+    for t in [warm, cold] { process.run("sh", ["-c", "cp {app}/src/{file} {t}/app/src/{file}"]).unwrap() }
 }
 
 // A trait with a default body, an impl, a test block, a fn whose call leaves a keyword
@@ -193,12 +204,13 @@ let MISSING_EMBED: Str = "\nlet CNAME_MISSING_EMBED: Str = #embed(\"no_such_file
 let STRIP_BLINK: Str = "fn strip_blink(c_name: Str) -> Str \{\n"
 let STRIP_EXTENSION: Str = "fn strip_extension(filename: Str) -> Str \{\n"
 
-test "a warm recheck of the compiler after each edit prints what a cold check prints" {
-    let root = sh("pwd -P")
+test "a warm recheck of a multi-module program after each edit prints what a cold check prints" {
+    let app = "{sh("pwd -P")}/tests/daemon_recheck_app"
     let warm = "{compile_test_helpers.scratch_root()}/_daemon_keep_parsed_warm_{getpid()}"
     let cold = "{compile_test_helpers.scratch_root()}/_daemon_keep_parsed_cold_{getpid()}"
-    dev_tree(root, warm)
-    dev_tree(root, cold)
+    dev_tree(app, warm, false)
+    dev_tree(app, cold, false)
+    warm_checks = 0
     let pid = start_daemon(warm)
     let mut problems: List[Str] = []
     let mut reused = -1
@@ -281,9 +293,42 @@ test "a warm recheck of the compiler after each edit prints what a cold check pr
         problems.push(compare(warm, cold, "a parse error under a manifest that warns"))
         edit_both(warm, cold, "cname.bl", "\nfn cname_broken_again(\n", "\n")
         problems.push(compare(warm, cold, "that parse error fixed"))
-        for t in [warm, cold] { process.run("sh", ["-c", "cp {root}/blink.toml {t}/app/blink.toml"])? }
+        for t in [warm, cold] { process.run("sh", ["-c", "cp {app}/blink.toml {t}/app/blink.toml"])? }
         problems.push(compare(warm, cold, "the manifest restored"))
-        for f in ["cname.bl", "cli.bl", "cg.bl", "mono.bl"] { restore_both(root, warm, cold, f) }
+        for f in ["cname.bl", "cli.bl", "cg.bl", "mono.bl"] { restore_both(app, warm, cold, f) }
+        problems.push(compare(warm, cold, "going back to the first bytes"))
+        reused = served(warm, "reused")
+        checks = served(warm, "checks")
+    }
+    process.run("sh", ["-c", "rm -rf {warm} {cold}"])?
+    let found: List[Str] = problems.filter(fn(p) { p != "" })
+    assert_eq(found.join("\n"), "")
+    assert_eq(checks, warm_checks)
+    assert(reused > 0, "the daemon reused no source: reused={reused}")
+}
+
+test "a warm recheck of the compiler after an edit to one module and to two prints what a cold check prints" {
+    let root = sh("pwd -P")
+    let warm = "{compile_test_helpers.scratch_root()}/_daemon_keep_parsed_compiler_warm_{getpid()}"
+    let cold = "{compile_test_helpers.scratch_root()}/_daemon_keep_parsed_compiler_cold_{getpid()}"
+    dev_tree(root, warm, true)
+    dev_tree(root, cold, true)
+    warm_checks = 0
+    let pid = start_daemon(warm)
+    let mut problems: List[Str] = []
+    let mut reused = -1
+    let mut checks = -1
+    with cleanup(fn() { stop_daemon(pid) }) {
+        assert(pid > 0, "the daemon did not start: {fs.read("{warm}/daemon.log").unwrap()}")
+        problems.push(compare(warm, cold, "the first check"))
+        edit_both(warm, cold, "cli.bl", STRIP_EXTENSION, "{STRIP_EXTENSION}    let spare_local = 1\n")
+        problems.push(compare(warm, cold, "a new local that warns"))
+        problems.push(printed("a new local that warns", ["spare_local", "cli.bl"]))
+        edit_both(warm, cold, "cname.bl", STRIP_BLINK, "{STRIP_BLINK}    let spare_in_cname = 1\n")
+        edit_both(warm, cold, "cg.bl", "    reset_unit_state()\n    cg_reg_reset()\n", "    let spare_in_cg = 1\n    reset_unit_state()\n    cg_reg_reset()\n")
+        problems.push(compare(warm, cold, "edits to two modules at once"))
+        problems.push(printed("edits to two modules at once", ["spare_in_cname", "spare_in_cg"]))
+        for f in ["cname.bl", "cli.bl", "cg.bl"] { restore_both(root, warm, cold, f) }
         problems.push(compare(warm, cold, "going back to the first bytes"))
         reused = served(warm, "reused")
         checks = served(warm, "checks")

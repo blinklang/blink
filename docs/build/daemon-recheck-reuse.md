@@ -504,8 +504,10 @@ not kept. `node_pop` below the parsed end stops the parser (`parser_limit_stop`)
 
 **Tests.**
 - `tests/test_daemon_recheck_that_keeps_parsed_modules_prints_what_a_cold_check_prints.bl`:
-  the edit set of section 5 on `src/cli.bl` with `src/cname.bl`, warm against cold, human
-  and JSON. It asserts `reused > 0`.
+  the edit set of section 5, warm against cold, human and JSON, on
+  `tests/daemon_recheck_app`: a five-module program with the compiler's module names and the
+  shapes each edit needs. A second test runs three of the edits on a copy of the compiler's
+  own `src/`. Both assert `reused > 0`.
 - `tests/test_daemon_recheck_after_a_body_edit_of_a_corpus_file_prints_what_a_cold_check_prints.bl`:
   a body edit of six corpus files. `BODY_EDIT_ALL=1` runs every `tests/test_*.bl`.
   In the full run (2303 files, 1718 edited, 8042 checks), every check printed what a cold
