@@ -1,0 +1,107 @@
+// A C function may return a pointer to const data, which a binding takes as a `Ptr`, an
+// `@ffi.opaque` handle or an `Option` of one. The wrapper must hold that answer without
+// dropping the qualifier, at any depth, and must hand back the binding's type without a cast
+// that drops it, or every build of the program warns. The build runs cc with
+// -Werror=discarded-qualifiers and -Werror=cast-qual, through a cc on PATH that adds the
+// flags, so either warning fails it.
+import compile_test_helpers
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+let MANIFEST = "[package]\nname = \"constret\"\nversion = \"0.1.0\"\n\n[native-dependencies]\nwidget = \{ type = \"vendored\", path = \"vendor/widget.c\", headers = [\"widget.h\"] \}\n"
+
+let HEADER = "#include <stdint.h>\n#ifndef WIDGET_H\n#define WIDGET_H\nstruct widget \{ int64_t count; };\nstruct handle;\nconst char* widget_name(void);\nconst char* const* widget_names(void);\nchar* widget_label(void);\nconst struct widget* widget_first(void);\nstruct widget* const* widget_list(void);\nconst struct handle* widget_handle(void);\nconst struct handle* widget_maybe(void);\nstruct handle* const* widget_handles(void);\nint64_t widget_handle_id(const struct handle* h);\n#endif\n"
+
+let SOURCE = "#include \"widget.h\"\nstruct handle \{ int64_t id; };\nstatic const char* names[] = \{ \"gear\", \"cog\" };\nstatic char label[] = \"bolt\";\nstatic const struct widget first = \{ 7 };\nstatic struct widget second = \{ 9 };\nstatic struct widget* list[] = \{ &second };\nstatic struct handle one = \{ 3 };\nstatic struct handle* handles[] = \{ &one };\nconst char* widget_name(void) \{ return names[0]; }\nconst char* const* widget_names(void) \{ return names; }\nchar* widget_label(void) \{ return label; }\nconst struct widget* widget_first(void) \{ return &first; }\nstruct widget* const* widget_list(void) \{ return list; }\nconst struct handle* widget_handle(void) \{ return &one; }\nconst struct handle* widget_maybe(void) \{ return &one; }\nstruct handle* const* widget_handles(void) \{ return handles; }\nint64_t widget_handle_id(const struct handle* h) \{ return h->id; }\n"
+
+let MAIN = #"@ffi("widget", "widget_name", header: "widget.h")
+@trusted(audit: "T1: returns a static NUL-terminated string")
+fn widget_name() -> Ptr[U8] ! () {}
+
+@ffi("widget", "widget_names", header: "widget.h")
+@trusted(audit: "T1: returns a static array of two strings")
+fn widget_names() -> Ptr[Ptr[U8]] ! () {}
+
+@ffi("widget", "widget_label", header: "widget.h")
+@trusted(audit: "T1: returns a static NUL-terminated string")
+fn widget_label() -> Ptr[U8] ! () {}
+
+@ffi.struct(header: "widget.h", name: "widget")
+type Widget { count: Int }
+
+@ffi("widget", "widget_first", header: "widget.h")
+@trusted(audit: "T1: returns a static widget")
+fn widget_first() -> Ptr[Widget] ! () {}
+
+@ffi("widget", "widget_list", header: "widget.h")
+@trusted(audit: "T1: returns a static array of one widget pointer")
+fn widget_list() -> Ptr[Ptr[Widget]] ! () {}
+
+@ffi.opaque(header: "widget.h", name: "struct handle")
+type Grip
+
+@ffi("widget", "widget_handle", header: "widget.h")
+@trusted(audit: "T1: returns a static handle")
+fn widget_handle() -> Grip ! () {}
+
+@ffi("widget", "widget_maybe", header: "widget.h")
+@trusted(audit: "T1: returns a static handle")
+fn widget_maybe() -> Option[Grip] ! () {}
+
+@ffi("widget", "widget_handles", header: "widget.h")
+@trusted(audit: "T1: returns a static array of one handle")
+fn widget_handles() -> Ptr[Grip] ! () {}
+
+@ffi("widget", "widget_handle_id", header: "widget.h")
+@trusted(audit: "T1: reads a static handle")
+fn widget_handle_id(h: Grip) -> Int ! () {}
+
+@trusted(audit: "T1: reads static data")
+fn report() -> Str {
+    let name = widget_name().to_str() ?? "?"
+    let second = widget_names().offset(1).deref().to_str() ?? "?"
+    let label = widget_label().to_str() ?? "?"
+    let listed = widget_list().deref().deref().count
+    let maybe = match widget_maybe() {
+        Some(h) => widget_handle_id(h)
+        None => -1
+    }
+    let held = widget_handle_id(widget_handles().deref())
+    "{name} {second} {label} {widget_first().deref().count} {listed} {widget_handle_id(widget_handle())} {maybe} {held}"
+}
+
+fn main() {
+    io.println(report())
+}
+"#
+
+// The output of the program, after one build with BLINK_PER_MODULE=per_module, or the
+// build's error text.
+fn build_and_run(per_module: Int) -> Str ! Process.Spawn, FS.Write, Env.Read {
+    let root = sh("pwd -P").out.trim()
+    let dir = "{compile_test_helpers.scratch_root()}/_const_result_{getpid()}_{per_module}"
+    let _ = sh("rm -rf {dir} && mkdir -p {dir}/src {dir}/vendor {dir}/fakebin")
+    fs.write("{dir}/blink.toml", MANIFEST).unwrap()
+    fs.write("{dir}/blink.lock", "[metadata]\nlockfile-version = 1\n").unwrap()
+    fs.write("{dir}/vendor/widget.h", HEADER).unwrap()
+    fs.write("{dir}/vendor/widget.c", SOURCE).unwrap()
+    fs.write("{dir}/src/main.bl", MAIN).unwrap()
+    fs.write("{dir}/fakebin/cc", "#!/bin/sh\nexec {sh("command -v cc").out.trim()} -Werror=discarded-qualifiers -Werror=cast-qual \"$@\"\n").unwrap()
+    let _ = sh("chmod +x {dir}/fakebin/cc")
+    // No object cache: an object built without the flags would hide the unit's compile.
+    let r = sh("cd {dir} && env CCACHE_DISABLE=1 BLINK_CACHE_DIR= BLINK_PER_MODULE={per_module} PATH={dir}/fakebin:$PATH timeout 300 {root}/build/blink build src/main.bl -o {dir}/out")
+    let ran = if r.success() { sh("{dir}/out").out } else { "build failed: {r.out}{r.err_out}" }
+    let _ = sh("rm -rf {dir}")
+    ran
+}
+
+test "a pointer to const that a foreign function returns keeps its qualifier, one unit per module" {
+    assert_eq(build_and_run(1), "gear cog bolt 7 9 3 3 3\n")
+}
+
+test "a pointer to const that a foreign function returns keeps its qualifier, one unit" {
+    assert_eq(build_and_run(0), "gear cog bolt 7 9 3 3 3\n")
+}

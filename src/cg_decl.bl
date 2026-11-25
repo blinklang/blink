@@ -957,7 +957,7 @@ pub fn cg_decl_emit_fn_def(fn_node: Int, is_static: Bool, body: Int) ! Diag.Repo
 //
 // A pointer whose pointee names no C type is such a type too: `uint8_t **` is not the
 // header's `char **`. It crosses as `void *` at every depth, and its answer comes back the
-// same way, by plain assignment (07 §9.1.1, *A `Ptr` at an `@ffi` Call*).
+// same way (07 §9.1.1, *A `Ptr` at an `@ffi` Call*).
 //
 // Which prototype that is decides the rest. A symbol the prologue already declares is
 // checked against the prologue's header: a Blink signature cannot spell what such a header
@@ -989,7 +989,7 @@ pub fn cg_decl_emit_foreign_wrapper(fn_node: Int) ! Diag.Report {
     }
     let pass = foreign_call_args(fn_node, crossings, sides)
     print_fn(false, ret, cg_decl_c_name(fn_node), params, cg_decl_takes_ev(fn_node),
-        foreign_call_block(fn_node, symbol, ret, pass, back))
+        foreign_call_block(fn_node, symbol, ret, pass, answer_type(fn_ret_tid(fn_node), back, ret)))
     emit_display_dispatch_def(fn_node, false)
 }
 
@@ -1023,11 +1023,13 @@ pub fn cg_decl_foreign_call_shape(fn_node: Int) -> Option[ForeignCallShape] ! Di
     }
     let args = foreign_c_param_types(spellings, sides)
     let back = sides.get(n) ?? ""
-    if back != "" { return Some(ForeignCallShape { args: args, ret: back }) }
+    if back != "" { return Some(ForeignCallShape { args: args, ret: held_result_type(back) }) }
     let tid = fn_ret_tid(fn_node)
     let k = tc_tid_kind(tc_resolve(tid))
     if k == TyKind.Void || k == TyKind.Never { return Some(ForeignCallShape { args: args, ret: "" }) }
-    Some(ForeignCallShape { args: args, ret: cg_decl_require_spelling(tid, Position.Return) })
+    let ret = cg_decl_require_spelling(tid, Position.Return)
+    let answer = answer_type(tid, "", ret)
+    Some(ForeignCallShape { args: args, ret: if answer == "" { ret } else { held_result_type(answer) } })
 }
 
 // Whether the wrapper written for an undeclared symbol, from `sides`, passes the same
@@ -1089,10 +1091,11 @@ type ForeignPass {
 // A value-returning wrapper that drops the call's answer falls off the end of a function
 // whose signature promises one, so the return type decides the statement, not the call. The
 // test is the one layout uses to spell a return `void`, or the two could disagree.
-// `back` is the header's type for a mirror the call returns, or "" for none.
-fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, pass: ForeignPass, back: Str) -> Int ! Diag.Report {
+// `answer` is the type the call's answer crosses as when the wrapper holds it before it
+// returns it, or "" when the wrapper returns the call as it is (`answer_type`).
+fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, pass: ForeignPass, answer: Str) -> Int ! Diag.Report {
     let tid = fn_ret_tid(fn_node)
-    if back != "" { return foreign_cast_back_block(fn_node, tid, symbol, ret, back, pass) }
+    if answer != "" { return foreign_cast_back_block(fn_node, tid, symbol, ret, answer, pass) }
     let k = tc_tid_kind(tc_resolve(tid))
     let drops = k == TyKind.Void || k == TyKind.Never
     let direct = ir_call_direct(tid, fn_node, ret, symbol, SlotForm.Inline, pass.args)
@@ -1108,26 +1111,23 @@ fn foreign_call_block(fn_node: Int, symbol: Str, ret: Str, pass: ForeignPass, ba
     ir_block(fn_node, stmts)
 }
 
-// A mirror that comes back arrives as the C struct the header names, and a pointer to a
-// pointee that names no C type as `void*`. The answer is first held in a local of that type,
-// so C checks the header's return type against the binding by plain assignment; a cast
-// straight on the call would accept any return, even an integer. Only then does it become
-// the wrapper's type: a `void*` by plain assignment, a mirror pointer by a cast, a mirror
-// value by a copy, since C has no cast between two struct types.
+// A mirror that comes back arrives as the C struct the header names, a pointer to a
+// pointee that names no C type as `void*`, and any other pointer as the wrapper spells it.
+// The answer is first held in a local of that type (`held_result_type`), so C checks the
+// header's return type against the binding by plain conversion; a cast straight on the call
+// would accept any return, even an integer (07 §9.1.1, *A `Ptr` at an `@ffi` Call*). Only
+// then does it become the wrapper's type: a mirror value by a copy, since C has no cast
+// between two struct types, and a pointer by a cast through `uintptr_t`, which drops the
+// held `const` with no warning under -Wcast-qual.
 fn foreign_cast_back_block(fn_node: Int, tid: Int, symbol: Str, ret: Str, header_type: Str, pass: ForeignPass) -> Int {
+    let held_type = held_result_type(header_type)
     let held = c_mint_local("ffi_ret")
-    let call = ir_call_direct(tid, fn_node, header_type, symbol, SlotForm.Inline, pass.args)
-    let answer = ir_var_ref(tid, fn_node, header_type, held, SlotForm.Inline)
+    let call = ir_call_direct(tid, fn_node, held_type, symbol, SlotForm.Inline, pass.args)
+    let answer = ir_var_ref(tid, fn_node, held_type, held, SlotForm.Inline)
     let mut stmts = pass.prep
-    stmts.push(ir_let(tid, fn_node, header_type, held, SlotForm.Inline, call))
-    let cross = crossing_of(tid)
-    if crossing_is_erased(cross) {
-        // `void*` converts to the wrapper's pointer type by plain assignment.
-        stmts.push(ir_return(fn_node, answer))
-        return ir_block(fn_node, stmts)
-    }
-    if cross.ptr_depth > 0 {
-        stmts.push(ir_return(fn_node, ir_cast(tid, fn_node, ret, answer)))
+    stmts.push(ir_let(tid, fn_node, held_type, held, SlotForm.Inline, call))
+    if header_type.ends_with("*") {
+        stmts.push(ir_return(fn_node, ir_cast(tid, fn_node, ret, ir_cast(tid, fn_node, "uintptr_t", answer))))
         return ir_block(fn_node, stmts)
     }
     let out = c_mint_local("ffi_out")
@@ -1135,6 +1135,36 @@ fn foreign_cast_back_block(fn_node: Int, tid: Int, symbol: Str, ret: Str, header
     stmts.push(struct_copy(tid, fn_node, ir_var_ref(tid, fn_node, ret, out, SlotForm.Inline), ret, answer, header_type))
     stmts.push(ir_return(fn_node, ir_var_ref(tid, fn_node, ret, out, SlotForm.Inline)))
     ir_block(fn_node, stmts)
+}
+
+// The type the answer of a foreign call crosses as when the wrapper holds it before it
+// returns it, or "" when the wrapper returns the call as it is: `back`, the header's type of
+// a mirror or of a pointer that names no C type, when there is one, else `ret`, the
+// wrapper's own spelling, for an answer that is a pointer to C: a `Ptr`, an `@ffi.opaque`
+// handle and an `Option` of one. A header may return any of these as a pointer to const.
+fn answer_type(tid: Int, back: Str, ret: Str) -> Str {
+    if back != "" { return back }
+    let r = tc_resolve(tid)
+    let k = tc_tid_kind(r)
+    let inner = if k == TyKind.Option { tc_resolve(tc_tid_child(r, 0)) } else { r }
+    let decl = tc_tid_decl_node(inner)
+    let pointer = k == TyKind.Ptr || (decl >= 0 && is_handle_type(decl))
+    if pointer && ret.ends_with("*") { ret } else { "" }
+}
+
+// The type of the local that holds the answer of a foreign call, from `header_type`, the
+// type the answer crosses as. A pointer is held with `const` on the level the header may
+// qualify, as the prototype test binds a result (07 §9.1, *What E0861 prints*): `T *`
+// becomes `const T *`, and `T **` becomes `T *const *`. C converts a `T *` and a
+// `const T *` to `const T *`, and a `T **` and a `T *const *` to `T *const *`, with no
+// warning, so a header that returns `const char *` for a `Ptr[U8]` binds as one that
+// returns `char *`. The wrapper hands back the binding's type, as its signature says. A
+// mirror by value is no pointer and keeps its type.
+fn held_result_type(header_type: Str) -> Str {
+    if !header_type.ends_with("*") { return header_type }
+    let pointee = header_type.byte_slice(0, header_type.byte_len() - 1)
+    if pointee.ends_with("*") { return "{pointee} const*" }
+    "const {header_type}"
 }
 
 // `memcpy(&dst, &src, sizeof(dst_type))`. The mirror and its C struct have one size, which

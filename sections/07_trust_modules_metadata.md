@@ -2342,7 +2342,7 @@ fn main() {
 }
 ```
 
-**What C sees.** The C call keeps the pointee type of a pointee that names a C type by its name: an `@ffi.struct` or an `@ffi.opaque` type. The C type is the `name:` of the declaration. `name:` spells the C type exactly as the header of the target spells it, and the compiler writes it as it is written. Every other pointee becomes `void *` at every depth: `Void`, each scalar (`Int`, `Float`, `U8`, `I32` and the rest), and a `Ptr` to any of these. C converts a `void *` to any object pointer type with no diagnostic. A `Ptr` result is read through the same conversion, never through a cast.
+**What C sees.** The C call keeps the pointee type of a pointee that names a C type by its name: an `@ffi.struct` or an `@ffi.opaque` type. The C type is the `name:` of the declaration. `name:` spells the C type exactly as the header of the target spells it, and the compiler writes it as it is written. Every other pointee becomes `void *` at every depth: `Void`, each scalar (`Int`, `Float`, `U8`, `I32` and the rest), and a `Ptr` to any of these. C converts a `void *` to any object pointer type with no diagnostic. A `Ptr` result is first bound by plain conversion to its C type with `const` added one level down (`T *` is held as `const T *`, and `T **` as `T *const *`), so C checks the type that the header returns, and no cast comes before that check. Only after it does the result lose the `const` and become the `Ptr` of the signature.
 
 | Blink parameter | C type at the call | Checked against the header |
 |-----------------|--------------------|----------------------------|
