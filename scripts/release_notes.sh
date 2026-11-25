@@ -2,6 +2,9 @@
 # Prints the CHANGELOG.md sections for one release as GitHub release notes.
 # Usage: scripts/release_notes.sh vX.Y.Z [previous-tag]
 # CHANGELOG=<path> overrides the changelog file.
+# GitHub refuses a release body over 125000 characters. Notes over NOTES_MAX
+# (default that cap) keep each heading and the bold lead of each bullet, and
+# link the full changelog at the tag. Notes that do not fit even then fail.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -34,9 +37,30 @@ if [ -z "$NOTES" ]; then
     exit 1
 fi
 
-# $(...) already dropped trailing blank lines; sed drops the leading ones.
-printf '%s\n' "$NOTES" | sed '/./,$!d'
+MAX="${NOTES_MAX:-125000}"
+# Count what the file holds, its final newline too.
+chars() { printf '%s\n' "$1" | LC_ALL=C.UTF-8 wc -m; }
 
+FOOTER=""
 if [ -n "$PREV" ]; then
-    printf '\n**Full Changelog**: https://github.com/blinklang/blink/compare/%s...%s\n' "$PREV" "$VERSION"
+    FOOTER=$(printf '\n\n**Full Changelog**: https://github.com/blinklang/blink/compare/%s...%s' "$PREV" "$VERSION")
 fi
+
+# $(...) already dropped trailing blank lines; sed drops the leading ones.
+BODY=$(printf '%s\n' "$NOTES" | sed '/./,$!d')
+OUT="$BODY$FOOTER"
+
+if [ "$(chars "$OUT")" -gt "$MAX" ]; then
+    # A bullet keeps its first line, cut after a bold lead; other lines go.
+    SHORT=$(printf '%s\n' "$BODY" \
+        | awk '/^## / || /^$/ { print; next }
+               /^- / { if (match($0, /^- \*\*[^*]+\*\*/)) print substr($0, 1, RLENGTH); else print }' \
+        | cat -s)
+    OUT=$(printf '%s\n\nThese notes keep the first sentence of each change. Each change is in full in [CHANGELOG.md](https://github.com/blinklang/blink/blob/%s/CHANGELOG.md).%s' "$SHORT" "$VERSION" "$FOOTER")
+    if [ "$(chars "$OUT")" -gt "$MAX" ]; then
+        echo "release_notes: the notes for $VERSION are over $MAX characters even with only the first sentence of each change" >&2
+        exit 1
+    fi
+fi
+
+printf '%s\n' "$OUT"
