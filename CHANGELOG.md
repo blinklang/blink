@@ -11,6 +11,7 @@ Single source of truth for release history. `blink llms` and `blink llms --full`
 ### Fixes
 
 - **A `Never` value no longer fixes a type parameter (section 3.2).** In `fn pick[T](a: T, b: T) -> T`, the call `pick(todo(), 2)` bound `T` to `Never` and then refused the `2`, while `pick(2, todo())` passed. Both now give `T = Int`. The same holds for a struct literal field (`Pair { a: todo(), b: 6 }`), a variant payload (`let e: Either[Int] = Either.Some1(panic("x"))`), an alias head (`let b: BoxAlias[Int] = BoxAlias { v: panic("x") }`), a struct-style variant field (`Shape.Pt { x: todo(), y: 20 }`) and an expected type (`let l: List[Int] = wrap(todo())`). The other values, the expected type or a later use fix the parameter, in any order. A `Never` inside a type constructor still binds: `List[Never]` is not a `List[Int]`.
+- **A project outside the blink tree builds SQLite from blink's own copy.** A blink run from its source tree looked for the bundled SQLite source in the dir of the project it builds, not in its own tree. In any other project it compiled no SQLite object and linked the system libsqlite3, so the program needed that library at run time, and the build failed where it was not installed. It now finds the source in its own tree and links SQLite into the program.
 
 ## Breaking Changes (v0.61.0)
 
