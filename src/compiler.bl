@@ -16,9 +16,9 @@ import diagnostics.{
     FILE_NOT_FOUND,
 }
 import pkg.lockfile.{lockfile_load, lockfile_clear, lockfile_find_pkg, lockfile_pkg_count, lock_pkg_sources, lock_pkg_names, lock_pkg_versions}
-import pkg.manifest.{manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels, manifest_print_warnings, manifest_issues, ManifestIssueKind}
+import pkg.manifest.{manifest_native_dep_count, manifest_native_dep_name_at, manifest_native_dep_type, manifest_native_dep_path, manifest_native_dep_link, manifest_clear, manifest_load, manifest_has_dep, manifest_name, lint_names, lint_levels, manifest_print_warnings, manifest_issues, ManifestIssueKind, validate_package_name}
 import std.path.{path_join, path_dirname, path_parent, path_basename, path_stem}
-import std.toml.{toml_read_value, toml_parse_doc}
+import std.toml.{toml_read_value, toml_parse_doc, TomlEntry, TOML_STRING, TOML_INLINE_TABLE}
 import comment_attach.{attach_comments_pass}
 import limit_values.{limit_kind_named, limit_key_help}
 import audit_records.{audit_records_parse, audit_records_empty, AuditRecords}
@@ -150,6 +150,7 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report, FS.Read, IO, Env.Read {
         manifest_print_warnings = print_was
         if load_rc == 0 {
             apply_manifest_lints(manifest_path)
+            note_root_native_deps(path_dirname(manifest_path))
         } else {
             report_config_unloaded(manifest_path)
         }
@@ -159,6 +160,171 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report, FS.Read, IO, Env.Read {
     }
 }
 
+// A [native-dependencies] entry of the package graph a build links: the root manifest's, or
+// that of a lock package. path is read from dir, the dir of the package that declares it,
+// which for a lock package is the dir the loader reads its modules from. pkg is "" for the
+// root.
+pub type GraphNativeDep {
+    pkg: Str
+    dir: Str
+    key: Str
+    dep_type: Str
+    path: Str
+    link: Str
+}
+
+// A manifest `path` names a file relative to the dir of the package that declares it.
+fn rebase_native_path(dir: Str, path: Str) -> Str {
+    if path == "" || dir == "" || dir == "." || path.starts_with("/") { path } else { path_join(dir, path) }
+}
+
+fn note_root_native_deps(dir: Str) {
+    let mut i = 0
+    while i < manifest_native_dep_count() {
+        let key = manifest_native_dep_name_at(i)
+        loaded_inputs.native_deps.push(GraphNativeDep { pkg: "", dir: dir, key: key, dep_type: manifest_native_dep_type(key), path: rebase_native_path(dir, manifest_native_dep_path(key)), link: manifest_native_dep_link(key) })
+        i = i + 1
+    }
+}
+
+// Each lock package's entries, read from its blink.toml text, so the root's manifest stays
+// loaded. A package's manifest that does not load stops the compile: its native dependencies
+// are inputs of the build.
+fn note_lock_native_deps() ! Diag.Report, FS.Read, Env.Read {
+    let mut i = 0
+    while i < lock_pkg_names.len() {
+        let name = lock_pkg_names.get(i).unwrap()
+        let dir = lock_source_dir(lock_pkg_sources.get(i).unwrap())
+        i = i + 1
+        if dir == "" { continue }
+        let manifest = path_join(dir, "blink.toml")
+        if !probe_file(manifest) { continue }
+        let text = match fs.read(manifest) {
+            Ok(t) => note_config_text(manifest, t)
+            Err(_) => {
+                report_config_unloaded(manifest)
+                continue
+            }
+        }
+        let entries = toml_parse_doc(text).entries
+        let cause = manifest_load_error(entries)
+        if cause != "" {
+            report_config_unloaded_because(manifest, cause)
+            continue
+        }
+        for e in native_deps_of_entries(name, dir, entries) {
+            loaded_inputs.native_deps.push(e)
+        }
+    }
+}
+
+fn first_entry(entries: List[TomlEntry], key: Str) -> Option[TomlEntry] {
+    for e in entries {
+        if e.key == key { return Some(e) }
+    }
+    None
+}
+
+// Why the manifest lib's manifest_load would not load a manifest with these entries, or ""
+// when it would: the checks of its [package] and of each [dependencies] and
+// [dev-dependencies] entry.
+fn manifest_load_error(entries: List[TomlEntry]) -> Str {
+    let name = match first_entry(entries, "package.name") {
+        Some(e) => e.value
+        None => return "[package] section missing required field 'name'"
+    }
+    let version = match first_entry(entries, "package.version") {
+        Some(e) => e.value
+        None => return "[package] section missing required field 'version'"
+    }
+    if name == "" { return "package name must not be empty" }
+    if version == "" { return "package version must not be empty" }
+    if validate_package_name(name) == 0 {
+        return "package name '{name}' is invalid — must match [a-z][a-z0-9_]* (no hyphens, no dots, no uppercase)"
+    }
+    for section in ["dependencies", "dev-dependencies"] {
+        let prefix = "{section}."
+        let mut names: List[Str] = []
+        for e in entries {
+            if !e.key.starts_with(prefix) { continue }
+            let dep = dep_name_of_key(e.key.byte_slice(prefix.byte_len(), e.key.byte_len()))
+            if dep != "" && !names.contains(dep) { names.push(dep) }
+        }
+        for dep in names {
+            let base = "{section}.{dep}"
+            let mut sources = 0
+            let mut sub_keys = true
+            match first_entry(entries, base) {
+                Some(e) => {
+                    if e.vtype == TOML_STRING { sources = 1 }
+                    sub_keys = e.vtype == TOML_INLINE_TABLE
+                }
+                None => {}
+            }
+            if sub_keys {
+                for sub in ["version", "git", "path"] {
+                    if first_entry(entries, "{base}.{sub}").is_some() { sources = sources + 1 }
+                }
+            }
+            if sources == 0 { return "dependency '{dep}' has no source (need version, git, or path)" }
+            if sources > 1 { return "dependency '{dep}' has multiple sources (must specify exactly one of: version, git, path)" }
+        }
+    }
+    ""
+}
+
+// The dependency name of a key under [dependencies], as the manifest lib reads it: a name can
+// hold dots and slashes, so it ends at the dot before a known sub-key.
+fn dep_name_of_key(rest: Str) -> Str {
+    let mut i = 0
+    while i < rest.byte_len() {
+        if rest.byte_at(i) == 46 {
+            let after = rest.byte_slice(i + 1, rest.byte_len())
+            if after == "git" || after == "tag" || after == "path" || after == "version" || after == "features" || after.starts_with("features[") {
+                return rest.byte_slice(0, i)
+            }
+        }
+        i = i + 1
+    }
+    rest
+}
+
+// The [native-dependencies] entries of a blink.toml, read with the rules of the manifest lib's
+// load_native_deps but with no manifest state.
+fn native_deps_of_entries(pkg: Str, dir: Str, entries: List[TomlEntry]) -> List[GraphNativeDep] {
+    let prefix = "native-dependencies."
+    let mut value_of: Map[Str, Str] = Map()
+    let mut names: List[Str] = []
+    for e in entries {
+        if !e.key.starts_with(prefix) { continue }
+        // The first entry of a key wins, as in the manifest store.
+        if !value_of.contains_key(e.key) {
+            value_of.insert(e.key, e.value)
+        }
+        let rest = e.key.byte_slice(prefix.byte_len(), e.key.byte_len())
+        let name = match rest.byte_index_of(".", 0) {
+            Some(j) => if j > 0 { rest.byte_slice(0, j) } else { rest }
+            None => rest
+        }
+        if !names.contains(name) {
+            names.push(name)
+        }
+    }
+    let mut out: List[GraphNativeDep] = []
+    for name in names {
+        let base = "native-dependencies.{name}"
+        let mut dep_type = ""
+        if value_of.contains_key("{base}.system") { dep_type = "system" }
+        if value_of.contains_key("{base}.path") { dep_type = "vendored" }
+        if value_of.contains_key("{base}.pkg-config") { dep_type = "pkg-config" }
+        if value_of.contains_key("{base}.type") { dep_type = value_of.get("{base}.type") ?? "" }
+        if dep_type == "" { dep_type = "system" }
+        let path = rebase_native_path(dir, value_of.get("{base}.path") ?? "")
+        out.push(GraphNativeDep { pkg: pkg, dir: dir, key: name, dep_type: dep_type, path: path, link: value_of.get("{base}.link") ?? "" })
+    }
+    out
+}
+
 // Each command reports blink.toml issues through diag, on stderr. The lib would print them as
 // well, on stdout, which carries the `check --json` status line and the LSP frames, so each
 // binary turns that print off at its start.
@@ -166,11 +332,16 @@ pub fn load_lint_overrides(src_root: Str) ! Diag.Report, FS.Read, IO, Env.Read {
 // goes on without its [lints] or its dependencies. The lib prints the cause, so this names
 // the file only.
 fn report_config_unloaded(path: Str) ! Diag.Report {
+    report_config_unloaded_because(path, "")
+}
+
+// The same report, with the cause when no manifest lib call printed it.
+fn report_config_unloaded_because(path: Str, cause: Str) ! Diag.Report {
     if loaded_inputs.unloaded_configs.contains_key(path) { return }
     loaded_inputs.unloaded_configs.insert(path, true)
-    diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "cannot load {path}", "")
+    diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "cannot load {path}", cause)
     if loaded_inputs.input_read_error == "" {
-        loaded_inputs.input_read_error = "cannot load {path}"
+        loaded_inputs.input_read_error = if cause == "" { "cannot load {path}" } else { "cannot load {path}: {cause}" }
     }
 }
 
@@ -620,11 +791,14 @@ fn read_pkg_name_from_toml(path: Str) -> Str ! FS.Read, Diag.Report {
     if !probe_file(path) {
         return ""
     }
-    let content = match fs.read(path) {
-        Ok(text) => note_config_text(path, text)
-        Err(_) => {
-            report_config_unloaded(path)
-            return ""
+    let content = match noted_config_text(path) {
+        Some(text) => text
+        None => match fs.read(path) {
+            Ok(text) => note_config_text(path, text)
+            Err(_) => {
+                report_config_unloaded(path)
+                return ""
+            }
         }
     }
     toml_read_value(content, "package", "name") ?? ""
@@ -643,6 +817,17 @@ fn note_config_file(path: Str) ! FS.Read {
 }
 
 // A config file the loader read, with the bytes it read; returns those bytes.
+// The text of a config file this load already read, so a second reader neither reads nor
+// notes it again.
+fn noted_config_text(path: Str) -> Option[Str] {
+    let mut i = 0
+    while i < loaded_inputs.config_paths.len() {
+        if loaded_inputs.config_paths.get(i).unwrap() == path { return loaded_inputs.config_texts.get(i) }
+        i = i + 1
+    }
+    None
+}
+
 fn note_config_text(path: Str, text: Str) -> Str {
     loaded_inputs.config_paths.push(path)
     loaded_inputs.config_texts.push(text)
@@ -656,7 +841,7 @@ fn note_config_text(path: Str, text: Str) -> Str {
 // Given a src_root like "examples/with_deps/mathlib/src/", return the path
 // of the sibling blink.toml. Falls back to cwd "blink.toml" for loose files
 // (src_root == "").
-pub fn manifest_path_for_src_root(src_root: Str) -> Str {
+fn manifest_path_for_src_root(src_root: Str) -> Str {
     if src_root == "" {
         return "blink.toml"
     }
@@ -705,15 +890,16 @@ fn validate_lockfile_versions() ! Diag.Report {
 
 let mut lockfile_loaded: Int = 0
 
-fn load_lockfile_or_report(path: Str) ! Diag.Report, FS.Read, IO {
+fn load_lockfile_or_report(path: Str) ! Diag.Report, FS.Read, IO, Env.Read {
     if lockfile_load(path) != 0 {
         report_config_unloaded(path)
         return
     }
     validate_lockfile_versions()
+    note_lock_native_deps()
 }
 
-fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report, FS.Read, IO {
+fn ensure_lockfile_loaded(src_root: Str) ! Diag.Report, FS.Read, IO, Env.Read {
     if lockfile_loaded == 1 {
         return
     }
@@ -771,7 +957,7 @@ fn compiler_get_home() -> Str ! Env.Read {
 
 // The dir a blink.lock package's source names: a path source as the lock spells it, relative
 // to the project root, or a git source's checkout in the cache. "" for any other source.
-pub fn lock_source_dir(source: Str) -> Str ! Env.Read {
+fn lock_source_dir(source: Str) -> Str ! Env.Read {
     let mut base_dir = ""
     if source.starts_with("path:") {
         base_dir = source.byte_slice(5, source.byte_len())
@@ -807,6 +993,28 @@ pub fn lock_source_dir(source: Str) -> Str ! Env.Read {
         base_dir = path_join(home, path_join(".blink/cache/git", path_join(cache_name, commit_hash)))
     }
     base_dir
+}
+
+// A file of lock package `pkg`, recorded so a later stage knows the package of its nodes
+// from the import that found it, not from a guess at its path.
+fn dep_file(path: Str, pkg: Str) -> Str {
+    loaded_inputs.dep_file_pkgs.insert(path, pkg)
+    path
+}
+
+// The lock package whose file holds `node`, or "" for a file of the root package, the
+// standard library or a toolchain package.
+pub fn package_of_node(node: Int) -> Str {
+    let mut i = 0
+    while i < loaded_inputs.source_first_nodes.len() {
+        let first = loaded_inputs.source_first_nodes.get(i).unwrap()
+        let end = loaded_inputs.source_end_nodes.get(i).unwrap()
+        if node >= first && node < end {
+            return loaded_inputs.dep_file_pkgs.get(loaded_inputs.source_paths.get(i).unwrap()) ?? ""
+        }
+        i = i + 1
+    }
+    ""
 }
 
 fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag.Report, FS.Read, Env.Read {
@@ -921,7 +1129,7 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
         // dots-to-slashes translation is needed here.
         let entry_path = path_join(base_dir, path_join("src", entry_name.concat(".bl")))
         if probe_file(entry_path) {
-            return Some(entry_path)
+            return Some(dep_file(entry_path, pkg_name))
         }
         diag_error_no_loc("PackageEntryNotFound", PACKAGE_ENTRY_NOT_FOUND, "package entry not found: `{dotted_path}` — expected `{entry_path}`", "create `{entry_path}`, or check the `name` field in `{manifest_path}`")
         return Some("")
@@ -930,11 +1138,11 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
     let sub_rel = dots_to_slashes(sub_path)
     let resolved_bl = path_join(base_dir, path_join("src", sub_rel.concat(".bl")))
     if probe_file(resolved_bl) {
-        return Some(resolved_bl)
+        return Some(dep_file(resolved_bl, pkg_name))
     }
     let resolved = path_join(base_dir, path_join("src", sub_rel.concat(".pact")))
     if probe_file(resolved) {
-        return Some(resolved)
+        return Some(dep_file(resolved, pkg_name))
     }
     None
 }
@@ -1347,10 +1555,15 @@ pub type LoadedInputs {
     input_read_error: Str
     // Each blink.toml and blink.lock that is there but did not load, so each is reported once.
     unloaded_configs: Map[Str, Bool]
+    // The [native-dependencies] entries of the root manifest, then of each lock package in
+    // lock order.
+    native_deps: List[GraphNativeDep]
+    // The lock package of each file an import found through the lockfile, by its path.
+    dep_file_pkgs: Map[Str, Str]
 }
 
 fn loaded_inputs_empty() -> LoadedInputs {
-    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], interface_parts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map(), audit_dirs: Map(), audit_records: Map(), input_read_error: "", unloaded_configs: Map() }
+    LoadedInputs { files: [], source_paths: [], source_texts: [], source_modules: [], source_first_nodes: [], source_end_nodes: [], source_interfaces: [], interface_parts: [], config_paths: [], config_texts: [], embed_paths: [], embed_texts: Map(), probe_paths: [], probe_found: Map(), audit_dirs: Map(), audit_records: Map(), input_read_error: "", unloaded_configs: Map(), native_deps: [], dep_file_pkgs: Map() }
 }
 
 pub let mut loaded_inputs: LoadedInputs = loaded_inputs_empty()

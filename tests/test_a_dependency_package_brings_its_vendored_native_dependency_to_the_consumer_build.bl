@@ -103,3 +103,122 @@ test "an edit to a dependency's vendored source reaches the next build" {
     assert(r2.success(), "got: {r2.out}{r2.err_out}")
     assert_eq(ran2, "105\n")
 }
+
+test "a path dependency moved to another dir links the object of the new dir's source" {
+    let root = new_root()
+    // Written before the first build, so its source is older than the object that build makes.
+    write_lib("{root}/lib2", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    fs.write("{root}/lib2/vendor/addc.c", "#include \"addc.h\"\nlong addc_add(long a, long b) \{ return a + b + 1000; \}\n").unwrap()
+    let _ = sh("sleep 1")
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let (r1, ran1) = build_app(root)
+    write_app("{root}/app", "addlib", "../lib2", ADD_MAIN)
+    let (r2, ran2) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r1.success(), "got: {r1.out}{r1.err_out}")
+    assert_eq(ran1, "5\n")
+    assert(r2.success(), "got: {r2.out}{r2.err_out}")
+    assert_eq(ran2, "1005\n")
+}
+
+test "a key that the root and a dependency both declare links the root's object only" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let _ = sh("mkdir -p {root}/app/vendor && cp {root}/lib/vendor/addc.h {root}/app/vendor/")
+    fs.write("{root}/app/vendor/addc.c", "#include \"addc.h\"\nlong addc_add(long a, long b) \{ return a + b + 7; \}\n").unwrap()
+    fs.write("{root}/app/blink.toml", pkg_manifest("app", "\n[dependencies]\naddlib = \{ path = \"../lib\" \}\n", NATIVE)).unwrap()
+    let (r, ran) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "12\n")
+}
+
+test "a dependency whose blink.toml does not load stops the build" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let (r1, _) = build_app(root)
+    // No version: the manifest fails the [package] checks.
+    fs.write("{root}/lib/blink.toml", "[package]\nname = \"addlib\"\n{NATIVE}").unwrap()
+    let (r2, _) = build_app(root)
+    // Two sources: the manifest fails the [dependencies] checks.
+    fs.write("{root}/lib/blink.toml", pkg_manifest("addlib", "\n[dependencies]\nfoo = \{ path = \"../x\", version = \"1\" \}\n", NATIVE)).unwrap()
+    let (r3, _) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r1.success(), "got: {r1.out}{r1.err_out}")
+    assert(!r2.success(), "the build passed: {r2.out}{r2.err_out}")
+    assert(r2.err_out.contains("cannot load"), "got: {r2.out}{r2.err_out}")
+    assert(r2.err_out.contains("lib/blink.toml: [package] section missing required field 'version'"), "got: {r2.out}{r2.err_out}")
+    assert(!r3.success(), "the build passed: {r3.out}{r3.err_out}")
+    assert(r3.err_out.contains("lib/blink.toml: dependency 'foo' has multiple sources"), "got: {r3.out}{r3.err_out}")
+}
+
+// A foreign constant of a dependency in lib_dir: the key is the dependency's
+// whatever the names of the dirs above it.
+fn dep_const_at(lib_dir: Str) -> (ProcessResult, Str) ! FS.Write, Process.Spawn {
+    let root = new_root()
+    let lib = "{root}/{lib_dir}"
+    write_lib(lib, "\"addc\", \"addc_add\", header: \"addc.h\"", "\n@ffi(\"addc\", \"ADDC_BASE\", header: \"addc.h\")\npub let BASE: Int\n")
+    write_app("{root}/app", "addlib", "../{lib_dir}", "import addlib\n\nfn main() \{\n    io.println(\"\{addlib.add(addlib.BASE, 2)}\")\n}\n")
+    let out = build_app(root)
+    let _ = sh("rm -rf {root}")
+    out
+}
+
+test "a foreign constant of a dependency under a dir named src names the dependency's key" {
+    let (r, ran) = dep_const_at("src/lib")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "42\n")
+}
+
+test "a foreign constant of a dependency under a lib/pkg dir names the dependency's key" {
+    let (r, ran) = dep_const_at("w/lib/pkg/addlib")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "42\n")
+}
+
+test "a root foreign constant whose key only a dependency declares is MissingNativeDep" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    write_app("{root}/app", "addlib", "../lib", "import addlib\n\n@ffi(\"addc\", \"ADDC_BASE\", header: \"addc.h\")\nlet BASE: Int\n\nfn main() \{\n    io.println(\"\{addlib.add(BASE, 2)}\")\n}\n")
+    let (r, _) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(!r.success(), "the build passed: {r.out}{r.err_out}")
+    assert(r.err_out.contains("MissingNativeDep"), "got: {r.out}{r.err_out}")
+}
+
+// Builds app/src/main.bl in app/ for a cross target. Only the dependency check is of interest,
+// which runs before any C compile.
+fn cross_build_app(root: Str) -> ProcessResult ! Process.Spawn {
+    sh("B=$(pwd)/build/blink; cd {root}/app && timeout 300 $B build --target linux-arm64 src/main.bl -o {root}/out")
+}
+
+let LIB_SYSTEM_NATIVE = "\n[native-dependencies]\naddc = \{ type = \"vendored\", path = \"vendor/addc.c\" \}\nzz = \{ system = true \}\n"
+
+test "a dependency's system-only key that the root supplies does not stop a cross build" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    fs.write("{root}/lib/blink.toml", pkg_manifest("addlib", "", LIB_SYSTEM_NATIVE)).unwrap()
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let _ = sh("mkdir -p {root}/app/vendor && touch {root}/app/vendor/zz.c")
+    fs.write("{root}/app/blink.toml", pkg_manifest("app", "\n[dependencies]\naddlib = \{ path = \"../lib\" \}\n", "\n[native-dependencies]\nzz = \{ type = \"vendored\", path = \"vendor/zz.c\" \}\n")).unwrap()
+    let r = cross_build_app(root)
+    let arch = sh("file {root}/out").out
+    let _ = sh("rm -rf {root}")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert(arch.contains("aarch64"), "got: {arch}")
+}
+
+test "a dependency's system-only key in a cross build names the dependency's manifest" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    fs.write("{root}/lib/blink.toml", pkg_manifest("addlib", "", LIB_SYSTEM_NATIVE)).unwrap()
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let r = cross_build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r.err_out.contains("NativeDepUnavailableCrossTarget"), "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("`addlib`"), "got: {r.out}{r.err_out}")
+    assert(r.err_out.contains("lib/blink.toml"), "got: {r.out}{r.err_out}")
+}

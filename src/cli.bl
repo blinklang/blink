@@ -18,12 +18,10 @@ import std.errno.{Errno}
 import std.process.{ChildEnd, ChildLimits, LimitKind, ProcessError, ProcessOp}
 import std.time.{Duration}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
-import pkg.lockfile.{lockfile_load, lock_pkg_names, lock_pkg_sources}
+import pkg.lockfile.{lockfile_load}
 import pkg.manifest.{
     manifest_clear, manifest_load, manifest_has_dep, manifest_blink_version,
-    manifest_name, manifest_print_warnings, manifest_test_timeout,
-    manifest_native_dep_type, manifest_native_dep_link, manifest_native_dep_count,
-    manifest_native_dep_name_at, manifest_native_dep_path, manifest_has_native_dep,
+    manifest_name, manifest_print_warnings, manifest_test_timeout, manifest_has_native_dep,
     validate_package_name,
 }
 import pkg.resolver.{resolve_and_lock}
@@ -51,7 +49,7 @@ import compiler.{
     loaded_inputs, import_map_nodes, embedded_get_source,
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc, apply_manifest_lints, quiet_manifest_lib,
-    lock_source_dir, manifest_path_for_src_root,
+    GraphNativeDep, package_of_node,
 }
 import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
@@ -94,7 +92,7 @@ import diagnostics.{
     diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_ice, diag_ice_at, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, diag_register_source, json_escape,
-    MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE, MODULE_NOT_FOUND,
+    MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
     TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, GENERATED_C_DID_NOT_COMPILE,
     LINK_FAILED, NATIVE_DEPENDENCY_BUILD_FAILED, diag_panic_exit, diag_passed_check, PASSES_CHECK_NOTE,
 }
@@ -336,83 +334,6 @@ fn try_pkg_config(lib: Str) -> Option[Str] ! Process.Spawn {
     }
 }
 
-// A [native-dependencies] entry of the package graph a build links: the root manifest's, or
-// that of a blink.lock package. Its `path` is read from the dir of the package that declares
-// it. pkg is "" for the root.
-type GraphNativeDep {
-    pkg: Str
-    key: Str
-    dep_type: Str
-    path: Str
-    link: Str
-}
-
-// A manifest `path` names a file relative to the dir of the package that declares it.
-fn rebase_path(dir: Str, path: Str) -> Str {
-    if path == "" || dir == "" || dir == "." || path.starts_with("/") { path } else { path_join(dir, path) }
-}
-
-fn loaded_native_entries(pkg: Str, dir: Str) -> List[GraphNativeDep] {
-    let mut out: List[GraphNativeDep] = []
-    let count = manifest_native_dep_count()
-    let mut i = 0
-    while i < count {
-        let key = manifest_native_dep_name_at(i)
-        let path = rebase_path(dir, manifest_native_dep_path(key))
-        out.push(GraphNativeDep { pkg: pkg, key: key, dep_type: manifest_native_dep_type(key), path: path, link: manifest_native_dep_link(key) })
-        i = i + 1
-    }
-    out
-}
-
-// The native dependencies of the project that holds source_path and of each package of its
-// blink.lock. The root's come from the manifest the compile loaded.
-// Loading another manifest replaces the manifest state, so the root manifest is loaded again
-// at the end. A dependency's manifest that does not load stops the build: its native
-// dependencies are inputs of the build.
-fn load_graph_native_deps(source_path: Str) -> Option[List[GraphNativeDep]] ! Diag.Report, IO, FS.Read, Env.Read {
-    let root_manifest = manifest_path_for_src_root(find_src_root(source_path))
-    if !build_fs.path_exists(root_manifest) {
-        return Some(loaded_native_entries("", ""))
-    }
-    let project_dir = path_dirname(root_manifest)
-    let mut entries = loaded_native_entries("", project_dir)
-    let lock = path_join(project_dir, "blink.lock")
-    if !build_fs.path_exists(lock) || lockfile_load(lock) != 0 {
-        manifest_clear()
-        let _ = manifest_load(root_manifest)
-        return Some(entries)
-    }
-    let names = lock_pkg_names
-    let sources = lock_pkg_sources
-    let mut failed = ""
-    let mut i = 0
-    while i < names.len() && failed == "" {
-        let name = names.get(i).unwrap()
-        let dir = rebase_path(project_dir, lock_source_dir(sources.get(i).unwrap()))
-        i = i + 1
-        let manifest = if dir == "" { "" } else { path_join(dir, "blink.toml") }
-        if manifest == "" || !build_fs.path_exists(manifest) { continue }
-        manifest_clear()
-        if manifest_load(manifest) != 0 {
-            failed = manifest
-            continue
-        }
-        for e in loaded_native_entries(name, dir) {
-            entries.push(e)
-        }
-    }
-    manifest_clear()
-    let _ = manifest_load(root_manifest)
-    if failed != "" {
-        // The same report as the compile's for a blink.toml that does not load.
-        diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "cannot load {failed}", "")
-        diag_flush()
-        return None
-    }
-    Some(entries)
-}
-
 // The first entry of the graph with this key, the root's before a dependency's.
 fn graph_native_dep(natives: List[GraphNativeDep], key: Str) -> Option[GraphNativeDep] {
     for e in natives {
@@ -421,8 +342,25 @@ fn graph_native_dep(natives: List[GraphNativeDep], key: Str) -> Option[GraphNati
     None
 }
 
-fn graph_has_native_dep(natives: List[GraphNativeDep], key: Str) -> Bool {
-    graph_native_dep(natives, key).is_some()
+// The entry of each key that a build uses: the first, as in graph_native_dep.
+fn graph_native_winners(natives: List[GraphNativeDep]) -> List[GraphNativeDep] {
+    let mut seen: Map[Str, Bool] = Map()
+    let mut out: List[GraphNativeDep] = []
+    for e in natives {
+        if seen.contains_key(e.key) { continue }
+        seen.insert(e.key, true)
+        out.push(e)
+    }
+    out
+}
+
+// The entries that one package's own manifest declares; pkg "" is the root.
+fn package_native_deps(natives: List[GraphNativeDep], pkg: Str) -> List[GraphNativeDep] {
+    let mut out: List[GraphNativeDep] = []
+    for e in natives {
+        if e.pkg == pkg { out.push(e) }
+    }
+    out
 }
 
 fn resolve_ffi_link_flags(lib: Str, target: Str, natives: List[GraphNativeDep]) -> Str ! Process.Spawn {
@@ -837,6 +775,8 @@ type CompiledText {
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
     entry: EntryMain
+    // The [native-dependencies] entries of the package graph the compile loaded.
+    natives: List[GraphNativeDep]
 }
 
 // ── A program with no `fn main` (§6.7.7) ────────────────────────────────────
@@ -982,6 +922,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
         Err(rc) => return Err(rc)
     }
     let foreign = foreign_consts_in(final_program)
+    let natives = loaded_inputs.native_deps
 
     let skip_raw = env.var("BLINK_SKIP_MODULES") ?? ""
     let mut skip_modules: Map[Str, Int] = Map()
@@ -1038,7 +979,7 @@ fn compile_to_text(source_path: Str, debug_mode: Int, strict_mode: Int, test_bui
     }
 
     let prototypes = prototypes_of(final_program, test_build)?
-    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), mirrors: ffi_struct_mirrors_in(final_program), prototypes: prototypes, ffi_note: own_ffi_note(final_program), entry: entry_main_of(final_program) })
+    Ok(CompiledText { c: c_output, foreign: foreign, headers: foreign_headers_in(final_program), mirrors: ffi_struct_mirrors_in(final_program), prototypes: prototypes, ffi_note: own_ffi_note(final_program), entry: entry_main_of(final_program), natives: natives })
 }
 
 // Whether the compiler archive's evidence vector has a slot for every effect `program`
@@ -1467,18 +1408,24 @@ fn resolve_native_dep_source(name: Str, natives: List[GraphNativeDep]) -> Str ! 
     ""
 }
 
-// The object a native dep compiles to in the native cache; a cross build keys it by target.
-// A dependency's entry has a dir of its package's own, so two packages that use one key never
-// share an object.
-fn vendored_object_path(pkg: Str, name: Str, target: Str) -> Str {
-    let dir = if pkg == "" { native_cache_dir() } else { "{native_cache_dir()}/deps/{pkg}" }
+// The object a native dep compiles to in `dir`; a cross build keys it by target.
+fn native_object_in(dir: Str, name: Str, target: Str) -> Str {
     if target == "" { "{dir}/{name}.o" } else { "{dir}/{name}-{target}.o" }
+}
+
+// A manifest entry's object has a dir of its own, keyed on its package and its source, so two
+// packages that use one key never share an object, and an object made from one source is
+// never reused for another whose mtime is older.
+fn entry_object_path(e: GraphNativeDep, target: Str) -> Str ! FS.Read {
+    let src = build_fs.real_path(e.path) ?? e.path
+    let owner = if e.pkg == "" { "root" } else { "deps/{e.pkg}" }
+    native_object_in("{native_cache_dir()}/{owner}-{sha256_hex(src).byte_slice(0, 16)}", e.key, target)
 }
 
 // The objects of the native deps a build links. None when the build stops, with the error
 // printed: in a test build, when a dep did not compile; in any build, when the gc sources
 // cannot be written. Any other build links the objects that did compile.
-fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str, test_build: Bool, natives: List[GraphNativeDep]) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
+fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str, test_build: Bool, winners: List[GraphNativeDep]) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
     let mut objects: List[Str] = []
 
     if target != "" {
@@ -1521,10 +1468,10 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
     let mut di = 0
     while di < used_deps.len() {
         let name = used_deps.get(di).unwrap()
-        let src = resolve_native_dep_source(name, natives)
+        let src = resolve_native_dep_source(name, winners)
         if src != "" {
             let _ = build_fs.mkdir_p(native_cache_dir())
-            let o_path = vendored_object_path("", name, target)
+            let o_path = native_object_in(native_cache_dir(), name, target)
             let rc = compile_vendored_source(name, src, o_path, debug_mode, release_mode, target, test_build)
             if rc != 0 {
                 return None
@@ -1534,13 +1481,13 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         di = di + 1
     }
 
-    for e in natives {
+    for e in winners {
         if e.dep_type != "vendored" { continue }
         // Registry-managed deps already came in via used_deps above; skip
         // the manifest entry so the same .o isn't compiled and linked twice.
         if used_deps.contains(e.key) { continue }
         if e.path == "" { continue }
-        let o_path = vendored_object_path(e.pkg, e.key, target)
+        let o_path = entry_object_path(e, target)
         let _ = build_fs.mkdir_p(path_dirname(o_path))
         let rc = compile_vendored_source(e.key, e.path, o_path, debug_mode, release_mode, target, test_build)
         if rc != 0 {
@@ -1580,7 +1527,7 @@ fn cross_gc_includes(target: Str) -> Option[List[Str]] ! IO, FS.Write, FS.Read, 
 }
 
 // None when the gc sources cannot be written; the error is printed.
-fn resolve_vendored_includes(used_deps: List[Str], target: Str, natives: List[GraphNativeDep]) -> Option[Str] ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
+fn resolve_vendored_includes(used_deps: List[Str], target: Str, winners: List[GraphNativeDep]) -> Option[Str] ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
     let mut includes = match cross_gc_includes(target) {
         Some(i) => i
         None => return None
@@ -1589,14 +1536,14 @@ fn resolve_vendored_includes(used_deps: List[Str], target: Str, natives: List[Gr
     let mut di = 0
     while di < used_deps.len() {
         let name = used_deps.get(di).unwrap()
-        let src = resolve_native_dep_source(name, natives)
+        let src = resolve_native_dep_source(name, winners)
         if src != "" {
             includes.push("-I{path_dirname(src)}")
         }
         di = di + 1
     }
 
-    for e in natives {
+    for e in winners {
         if e.dep_type != "vendored" { continue }
         if used_deps.contains(e.key) { continue }
         if e.path == "" { continue }
@@ -2043,12 +1990,13 @@ fn report_link_target_failure(link_output: Str, cached_o: Str, snap: Str, includ
     1
 }
 
-fn validate_ffi_native_deps(ffi_libs: List[Str], natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
+fn validate_ffi_native_deps(ffi_libs: List[Str], winners: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
+    let root = package_native_deps(winners, "")
     let mut errors = 0
     let mut i = 0
     while i < ffi_libs.len() {
         let lib = ffi_libs.get(i).unwrap()
-        if !graph_has_native_dep(natives, lib) {
+        if graph_native_dep(root, lib).is_none() {
             diag_error_no_loc("MissingNativeDep", MISSING_NATIVE_DEP, "@ffi references undeclared native dependency \"{lib}\"", "add to blink.toml:\n  [native-dependencies]\n  {lib} = \{ system = true \}")
             errors = errors + 1
         }
@@ -2061,14 +2009,19 @@ fn validate_ffi_native_deps(ffi_libs: List[Str], natives: List[GraphNativeDep]) 
     0
 }
 
-fn validate_cross_target_deps(target: Str, natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
+fn validate_cross_target_deps(target: Str, winners: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
     let mut errors = 0
-    for e in natives {
+    for e in winners {
+        if e.dep_type != "system" || e.link == "dynamic" { continue }
         let name = e.key
-        if e.dep_type == "system" && e.link != "dynamic" {
-            diag_error_no_loc("NativeDepUnavailableCrossTarget", NATIVE_DEP_UNAVAILABLE_CROSS, "native dependency \"{name}\" is system-only but target is {target}", "cross-compilation requires vendored source or static archive\n  provide source: {name} = \{ path = \"vendor/{name}.c\" \}\n  or override linking: {name} = \{ system = true, link = \"dynamic\" \}")
-            errors = errors + 1
+        let fix = "provide source: {name} = \{ path = \"vendor/{name}.c\" \}\n  or override linking: {name} = \{ system = true, link = \"dynamic\" \}"
+        let (of_pkg, help) = if e.pkg == "" {
+            ("", fix)
+        } else {
+            (" of package `{e.pkg}`", "in {path_join(e.dir, "blink.toml")}, {fix}\n  or declare {name} in this project's blink.toml, which takes the place of the package's entry")
         }
+        diag_error_no_loc("NativeDepUnavailableCrossTarget", NATIVE_DEP_UNAVAILABLE_CROSS, "native dependency \"{name}\"{of_pkg} is system-only but target is {target}", "cross-compilation requires vendored source or static archive\n  {help}")
+        errors = errors + 1
     }
     if errors > 0 {
         diag_flush()
@@ -2131,10 +2084,13 @@ fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO, Env.Exit, Env.Rea
 
 // A foreign constant's key is checked whether or not the program has a manifest: with no
 // link flag, nothing later would catch a key that names no dependency.
+// The key is looked up in the manifest of the package whose file declares the constant.
 fn check_foreign_const_libs(foreign: List[ForeignConst], natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
     let mut errors = 0
     for fc in foreign {
-        if fc.lib == "" || is_runtime_lib(fc.lib) || graph_has_native_dep(natives, fc.lib) { continue }
+        if fc.lib == "" || is_runtime_lib(fc.lib) { continue }
+        let own = package_native_deps(natives, package_of_node(fc.decl))
+        if graph_native_dep(own, fc.lib).is_some() { continue }
         report_undeclared_lib(fc)
         errors = errors + 1
     }
@@ -2145,10 +2101,10 @@ fn check_foreign_const_libs(foreign: List[ForeignConst], natives: List[GraphNati
     0
 }
 
-fn validate_build_deps(ffi_libs: List[Str], targets: List[Str], natives: List[GraphNativeDep]) -> Int ! Diag.Report, FS.Read, Process.Spawn, IO {
+fn validate_build_deps(ffi_libs: List[Str], targets: List[Str], winners: List[GraphNativeDep]) -> Int ! Diag.Report, FS.Read, Process.Spawn, IO {
     let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
     if has_toml == 1 && ffi_libs.len() > 0 {
-        let vrc = validate_ffi_native_deps(ffi_libs, natives)
+        let vrc = validate_ffi_native_deps(ffi_libs, winners)
         if vrc != 0 {
             return vrc
         }
@@ -2157,7 +2113,7 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str], natives: List[Gr
     if has_toml == 1 && targets.len() > 0 {
         let first_target = resolve_target_triple(targets.get(0).unwrap())
         if first_target != "" {
-            let crc = validate_cross_target_deps(first_target, natives)
+            let crc = validate_cross_target_deps(first_target, winners)
             if crc != 0 {
                 return crc
             }
@@ -2170,7 +2126,7 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str], natives: List[Gr
 // declarations name must be one that the unit compile finds, so a missing one is E0859 at the
 // `@ffi` line and not GeneratedCDidNotCompile. The test reads only pass or fail; a failed
 // test of all the headers at once is run again for each header to find the missing ones.
-fn check_foreign_headers(headers: List[ForeignHeader], targets: List[Str], used_deps: List[Str], output_path: Str, natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+fn check_foreign_headers(headers: List[ForeignHeader], targets: List[Str], used_deps: List[Str], output_path: Str, winners: List[GraphNativeDep]) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
     if headers.is_empty() { return 0 }
     let mut distinct: List[Str] = []
     for fh in headers {
@@ -2187,7 +2143,7 @@ fn check_foreign_headers(headers: List[ForeignHeader], targets: List[Str], used_
     let aliases = if targets.is_empty() { [""] } else { targets }
     for alias in aliases {
         let target = if alias == "" { "" } else { resolve_target_triple(alias) }
-        let inc_flags = match resolve_vendored_includes(used_deps, target, natives) {
+        let inc_flags = match resolve_vendored_includes(used_deps, target, winners) {
             Some(v) => "{arc_inc} {v}"
             None => {
                 let _ = build_fs.remove_tree(dir)
@@ -2259,7 +2215,7 @@ fn header_probe(dir: Str, name: Str, headers: List[Str], inc_flags: Str, target:
 // constant expression that fits its declared type. A failure is E0855 at the declaration:
 // the program's own compile would only say that a name is undeclared, at a line of C. An
 // error the probe cannot map to a constant is left to that compile.
-fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_deps: List[Str], output_path: Str, natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_deps: List[Str], output_path: Str, winners: List[GraphNativeDep]) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
     if foreign.is_empty() { return 0 }
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" { out_dir = "." }
@@ -2295,7 +2251,7 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
         // -pedantic-errors makes that an error; -w would turn it off again. The program's
         // compile is not pedantic, so the dependency headers come in as system headers,
         // where a C extension that compile accepts is no error.
-        let vendored = match resolve_vendored_includes(used_deps, target, natives) {
+        let vendored = match resolve_vendored_includes(used_deps, target, winners) {
             Some(v) => v
             None => {
                 let _ = build_fs.remove_tree(dir)
@@ -2522,29 +2478,26 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
 
     let source = build_fs.read_or_empty(source_path)
     let has_async = detect_async(source)
-    let natives = match load_graph_native_deps(source_path) {
-        Some(n) => n
-        None => { return 1 }
-    }
+    let winners = graph_native_winners(compiled.natives)
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
     let compiler_archive = compiler_archive_of_unit(c_source)
     // A test binary's main runs the tests, so only a program build reads the entry point.
     let link = test_build || compiled.entry.has_main
 
-    let vrc = validate_build_deps(ffi_libs, targets, natives)
+    let vrc = validate_build_deps(ffi_libs, targets, winners)
     if vrc != 0 {
         return vrc
     }
-    let flrc = check_foreign_const_libs(compiled.foreign, natives)
+    let flrc = check_foreign_const_libs(compiled.foreign, compiled.natives)
     if flrc != 0 {
         return flrc
     }
-    let hrc = check_foreign_headers(compiled.headers, targets, used_deps, output_path, natives)
+    let hrc = check_foreign_headers(compiled.headers, targets, used_deps, output_path, winners)
     if hrc != 0 {
         return hrc
     }
-    let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path, natives)
+    let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path, winners)
     if frc != 0 {
         return frc
     }
@@ -2554,12 +2507,12 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         if targets.len() == 1 {
             target = resolve_target_triple(targets.get(0).unwrap())
         }
-        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs, natives)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build, natives) {
+        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs, winners)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build, winners) {
             Some(o) => o
             None => return 1
         }
-        let inc_flags = match resolve_vendored_includes(used_deps, target, natives) {
+        let inc_flags = match resolve_vendored_includes(used_deps, target, winners) {
             Some(f) => match one_unit_struct_defines(c_path, c_source, target, f, compiler_archive, debug_mode, release_mode, output_path, compiled.mirrors) {
                 Ok(d) => "{f}{d}"
                 Err(rc) => return rc
@@ -2587,7 +2540,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     }
 
     let first_triple = resolve_target_triple(targets.get(0).unwrap())
-    let inc_flags = match resolve_vendored_includes(used_deps, first_triple, natives) {
+    let inc_flags = match resolve_vendored_includes(used_deps, first_triple, winners) {
         Some(f) => f
         None => return 1
     }
@@ -2612,8 +2565,8 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     while i < targets.len() {
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
-        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs, natives)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build, natives) {
+        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs, winners)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build, winners) {
             Some(o) => o
             None => return 1
         }
@@ -2889,6 +2842,8 @@ type CompiledUnits {
     // Made while the checked program is at hand: the C compile that may need it runs later.
     ffi_note: Str
     entry: EntryMain
+    // The [native-dependencies] entries of the package graph the compile loaded.
+    natives: List[GraphNativeDep]
 }
 
 // A build reuses or records units only when the emit would print nothing: no trace but the
@@ -2925,6 +2880,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
         Err(rc) => return Err(rc)
     }
     let foreign = foreign_consts_in(program)
+    let natives = loaded_inputs.native_deps
     let cfg = units_cg_config(debug_mode, test_build, source_path)
     let modules = enumerate_program_modules(program)
     let erc = units_bail_on_diag()
@@ -2948,7 +2904,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
                 let wrc = units_flush_warnings(strict_mode)
                 if wrc != 0 { return Err(wrc) }
                 let prototypes = prototypes_of(program, test_build)?
-                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), prototypes: prototypes, ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
+                return Ok(CompiledUnits { units: r.units, inputs: inputs, shas: Some(r.shas), recordable: true, order: r.order, header_keys: r.header_keys, entry_key: r.entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), prototypes: prototypes, ffi_note: own_ffi_note(program), entry: entry_main_of(program), natives: natives })
             }
             None => {}
         }
@@ -3103,7 +3059,7 @@ fn do_compile_units(source_path: Str, dir: Str, last_dir: Str, debug_mode: Int, 
     let wrc = units_flush_warnings(strict_mode)
     if wrc != 0 { return Err(wrc) }
     let prototypes = prototypes_of(program, test_build)?
-    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), prototypes: prototypes, ffi_note: own_ffi_note(program), entry: entry_main_of(program) })
+    Ok(CompiledUnits { units: out, inputs: inputs, shas: shas, recordable: recordable, order: hs.order.join(","), header_keys: hs.keys, entry_key: entry_key, foreign: foreign, headers: foreign_headers_in(program), mirrors: ffi_struct_mirrors_in(program), prototypes: prototypes, ffi_note: own_ffi_note(program), entry: entry_main_of(program), natives: natives })
 }
 
 // BLINK_EMIT_REUSE_VERIFY=1 makes each per-module build emit the whole program again and fail
@@ -3360,7 +3316,7 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     if shas.is_none() && cg_obj_cache_enabled != 0 && build_objcache.cache_enabled() {
         shas = build_objcache.unit_file_shas(work, resolve_archive_dir())
     }
-    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled.units, compiled.foreign, compiled.headers, compiled.mirrors, compiled.prototypes, compiled.ffi_note, compiled.entry, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
+    let rc = link_units_all_targets(source_path, output_path, work, units_dir, compiled, shas, debug_mode, release_mode, targets, status_mode, unit_jobs, test_build)
     // Written last, and into the directory that replaces units_dir only after this: a build
     // that stops before here leaves the last record beside the files it describes.
     if rc == 0 && compiled.inputs != "" && compiled.recordable {
@@ -3383,13 +3339,13 @@ fn do_build_units(source_path: Str, output_path: Str, debug_mode: Int, release_m
     rc
 }
 
-fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, units: List[emit_record.EmittedUnit], foreign: List[ForeignConst], headers: List[ForeignHeader], mirrors: List[ForeignHeader], prototypes: ForeignPrototypes, ffi_note: Str, entry: EntryMain, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
+fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_dir: Str, compiled: CompiledUnits, shas: Option[Map[Str, Str]], debug_mode: Int, release_mode: Int, targets: List[Str], status_mode: Int, unit_jobs: Int, test_build: Bool) -> Int ! Diag.Report, IO, FS.Write, FS.Read, FS.Delete, Process.Spawn, Env.Exit, Env.Read, Time.Read {
     // The scans below read what the one-unit build reads from its single C file: each unit
     // and each header a unit includes, which is all cc compiles. A marker the scans look
     // for starts a line, so each file starts one.
     let mut c_parts: List[Str] = []
     let mut seen: Map[Str, Bool] = Map()
-    for u in units {
+    for u in compiled.units {
         for f in emit_record.unit_files(u) {
             for h in f.headers {
                 if !seen.contains_key(h) {
@@ -3403,55 +3359,52 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     let c_source = c_parts.join("\n")
     let types_file = "{work}/{c_program_types_header_name()}"
     let types_text = types_header_spelling_text(build_fs.read_or_empty(types_file))
-    // A test binary's main runs the tests, so only a program build reads the entry point.
-    let link = test_build || entry.has_main
+    // A test binary's main runs the tests, so only a program build reads the compiled.entry point.
+    let link = test_build || compiled.entry.has_main
     let has_async = detect_async(build_fs.read_or_empty(source_path))
-    let natives = match load_graph_native_deps(source_path) {
-        Some(n) => n
-        None => { return 1 }
-    }
     let used_deps = detect_native_deps(c_source)
+    let winners = graph_native_winners(compiled.natives)
     let ffi_libs = detect_ffi_libs(c_source)
-    let vrc = validate_build_deps(ffi_libs, targets, natives)
+    let vrc = validate_build_deps(ffi_libs, targets, winners)
     if vrc != 0 {
         return vrc
     }
-    let flrc = check_foreign_const_libs(foreign, natives)
+    let flrc = check_foreign_const_libs(compiled.foreign, compiled.natives)
     if flrc != 0 {
         return flrc
     }
-    let hrc = check_foreign_headers(headers, targets, used_deps, output_path, natives)
+    let hrc = check_foreign_headers(compiled.headers, targets, used_deps, output_path, winners)
     if hrc != 0 {
         return hrc
     }
-    let frc = check_foreign_consts(foreign, targets, used_deps, output_path, natives)
+    let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path, winners)
     if frc != 0 {
         return frc
     }
     if targets.len() <= 1 {
         let target = if targets.len() == 1 { resolve_target_triple(targets.get(0).unwrap()) } else { "" }
-        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs, natives)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build, natives) {
+        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs, winners)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build, winners) {
             Some(o) => o
             None => return 1
         }
-        let inc_flags = match resolve_vendored_includes(used_deps, target, natives) {
-            Some(f) => match ffi_struct_defines(types_file, types_text, "", target, "-I{resolve_archive_dir()} {f}", debug_mode, release_mode, mirrors) {
+        let inc_flags = match resolve_vendored_includes(used_deps, target, winners) {
+            Some(f) => match ffi_struct_defines(types_file, types_text, "", target, "-I{resolve_archive_dir()} {f}", debug_mode, release_mode, compiled.mirrors) {
                 Ok(d) => "{f}{d}"
                 Err(rc) => return rc
             }
             None => return 1
         }
-        let prc = check_foreign_prototypes(prototypes, target, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, output_path)
+        let prc = check_foreign_prototypes(compiled.prototypes, target, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, output_path)
         if prc != 0 {
             return prc
         }
-        let lrc = link_units(output_path, work, units_dir, units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build, ffi_note, link)
+        let lrc = link_units(output_path, work, units_dir, compiled.units, shas, link_flags, obj_files, inc_flags, debug_mode, release_mode, target, unit_jobs, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
         }
         if !link {
-            report_no_entry_build(status_mode, no_entry_help(entry, source_path))
+            report_no_entry_build(status_mode, no_entry_help(compiled.entry, source_path))
             return 0
         }
         if status_mode == BUILD_STATUS_JSON {
@@ -3462,7 +3415,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         return 0
     }
     let first_triple = resolve_target_triple(targets.get(0).unwrap())
-    let inc_flags = match resolve_vendored_includes(used_deps, first_triple, natives) {
+    let inc_flags = match resolve_vendored_includes(used_deps, first_triple, winners) {
         Some(f) => f
         None => return 1
     }
@@ -3470,11 +3423,11 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     let mut target_incs: List[Str] = []
     for alias in targets {
         let triple = resolve_target_triple(alias)
-        let target_inc_flags = match ffi_struct_defines(types_file, types_text, "", triple, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, mirrors) {
+        let target_inc_flags = match ffi_struct_defines(types_file, types_text, "", triple, "-I{resolve_archive_dir()} {inc_flags}", debug_mode, release_mode, compiled.mirrors) {
             Ok(d) => "{inc_flags}{d}"
             Err(rc) => return rc
         }
-        let prc = check_foreign_prototypes(prototypes, triple, "-I{resolve_archive_dir()} {target_inc_flags}", debug_mode, release_mode, output_path)
+        let prc = check_foreign_prototypes(compiled.prototypes, triple, "-I{resolve_archive_dir()} {target_inc_flags}", debug_mode, release_mode, output_path)
         if prc != 0 {
             return prc
         }
@@ -3487,15 +3440,15 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     while i < targets.len() {
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
-        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs, natives)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build, natives) {
+        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs, winners)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build, winners) {
             Some(o) => o
             None => return 1
         }
         let out = "{output_path}-{alias}"
         let _ = fs.delete(out)
         let target_inc_flags = target_incs.get(i).unwrap()
-        let lrc = link_units(out, work, units_dir, units, shas, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, ffi_note, link)
+        let lrc = link_units(out, work, units_dir, compiled.units, shas, link_flags, obj_files, target_inc_flags, debug_mode, release_mode, triple, unit_jobs, test_build, compiled.ffi_note, link)
         if lrc != 0 {
             return lrc
         }
@@ -3514,7 +3467,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         i = i + 1
     }
     if !link {
-        report_no_entry_build(status_mode, no_entry_help(entry, source_path))
+        report_no_entry_build(status_mode, no_entry_help(compiled.entry, source_path))
         return 0
     }
     if status_mode == BUILD_STATUS_JSON {
