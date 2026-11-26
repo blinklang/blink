@@ -11,14 +11,24 @@
 /* Blink holds a pointer to one of these boxes, never the bare sqlite3* or sqlite3_stmt*.
  * Close and finalize clear the field and leave the GC-owned box alive, so every copy of a
  * handle sees the closed state and no shim reaches freed sqlite memory. */
+typedef struct blink_sqlite3_stmt blink_sqlite3_stmt;
+
+/* open lists every statement of the connection that is not finalized yet, so close can
+ * finalize them all (sections/04_effects.md §4.4.10, *Release*). A Stmt can reach a
+ * spawned task, so mu guards db and the list: the sqlite db mutex cannot, as close frees
+ * it. mu lives as long as the box and is never destroyed. */
 typedef struct {
     sqlite3* db;           /* NULL once closed */
+    pthread_mutex_t mu;
+    blink_sqlite3_stmt* open;
 } blink_sqlite3_conn;
 
-typedef struct {
+struct blink_sqlite3_stmt {
     sqlite3_stmt* stmt;    /* NULL once finalized */
     blink_sqlite3_conn* conn;
-} blink_sqlite3_stmt;
+    blink_sqlite3_stmt* prev_open;
+    blink_sqlite3_stmt* next_open;
+};
 
 static inline sqlite3* blink_sqlite3_conn_db(blink_sqlite3_conn* c) {
     return c ? c->db : NULL;
@@ -29,6 +39,15 @@ static inline sqlite3* blink_sqlite3_conn_db(blink_sqlite3_conn* c) {
 static inline sqlite3_stmt* blink_sqlite3_live_stmt(blink_sqlite3_stmt* s) {
     if (!s || !s->stmt || !blink_sqlite3_conn_db(s->conn)) return NULL;
     return s->stmt;
+}
+
+/* Takes s off the open list of c. The caller holds c->mu. */
+static inline void blink_sqlite3_unlink_locked(blink_sqlite3_conn* c, blink_sqlite3_stmt* s) {
+    if (s->prev_open) s->prev_open->next_open = s->next_open;
+    else if (c->open == s) c->open = s->next_open;
+    if (s->next_open) s->next_open->prev_open = s->prev_open;
+    s->prev_open = NULL;
+    s->next_open = NULL;
 }
 
 /* Result struct for blink_sqlite3_query convenience wrapper */
@@ -49,8 +68,11 @@ BLINK_RT_FN blink_sqlite3_conn* blink_sqlite3_open(const char* path) {
         if (db) sqlite3_close(db);
         return NULL;
     }
-    blink_sqlite3_conn* c = (blink_sqlite3_conn*)blink_alloc(sizeof(blink_sqlite3_conn));
+    /* The boxes outlive any `with arena` they were made in, as the handler keeps them. */
+    blink_sqlite3_conn* c = (blink_sqlite3_conn*)blink_alloc_shared(sizeof(blink_sqlite3_conn));
     c->db = db;
+    pthread_mutex_init(&c->mu, NULL);
+    c->open = NULL;
     return c;
 }
 #endif
@@ -129,10 +151,55 @@ BLINK_RT_FN blink_sqlite3_stmt* blink_sqlite3_prepare(blink_sqlite3_conn* c, con
     if (rc != SQLITE_OK) {
         return NULL;
     }
-    blink_sqlite3_stmt* s = (blink_sqlite3_stmt*)blink_alloc(sizeof(blink_sqlite3_stmt));
+    blink_sqlite3_stmt* s = (blink_sqlite3_stmt*)blink_alloc_shared(sizeof(blink_sqlite3_stmt));
     s->stmt = stmt;
     s->conn = c;
+    s->prev_open = NULL;
+    s->next_open = NULL;
+    /* SQL with no statement in it prepares a NULL stmt, which has nothing to finalize. */
+    if (!stmt) return s;
+    pthread_mutex_lock(&c->mu);
+    if (!c->db) {
+        /* A close on another thread ran since the check above; it swept the list already. */
+        pthread_mutex_unlock(&c->mu);
+        sqlite3_finalize(stmt);
+        return NULL;
+    }
+    s->next_open = c->open;
+    if (c->open) c->open->prev_open = s;
+    c->open = s;
+    pthread_mutex_unlock(&c->mu);
     return s;
+}
+#endif
+
+/* The Stmt token of a statement this connection prepared: its owner is the connection. */
+BLINK_RT_FN blink_db_stmt* blink_sqlite3_stmt_token(blink_sqlite3_stmt* s);
+#ifndef BLINK_NATIVE_SHIMS_DECLS_ONLY
+BLINK_RT_FN blink_db_stmt* blink_sqlite3_stmt_token(blink_sqlite3_stmt* s) {
+    return blink_db_stmt_new(s ? (void*)s->conn : NULL, (void*)s, 0);
+}
+#endif
+
+/* The statement behind t when connection c made it, else NULL: the owner check. */
+BLINK_RT_FN blink_sqlite3_stmt* blink_sqlite3_stmt_of(blink_sqlite3_conn* c, blink_db_stmt* t);
+#ifndef BLINK_NATIVE_SHIMS_DECLS_ONLY
+BLINK_RT_FN blink_sqlite3_stmt* blink_sqlite3_stmt_of(blink_sqlite3_conn* c, blink_db_stmt* t) {
+    return (blink_sqlite3_stmt*)blink_db_stmt_impl_for(t, (void*)c);
+}
+#endif
+
+/* The checks of sections/04_effects.md §4.4.10 on a Stmt that reaches connection c, in
+ * order: 1 when c did not make it, 2 when c is closed, 3 when it is finalized, else 0.
+ * Close finalizes every statement, so the closed check comes before the finalized one. */
+BLINK_RT_FN int64_t blink_sqlite3_stmt_check(blink_sqlite3_conn* c, blink_db_stmt* t);
+#ifndef BLINK_NATIVE_SHIMS_DECLS_ONLY
+BLINK_RT_FN int64_t blink_sqlite3_stmt_check(blink_sqlite3_conn* c, blink_db_stmt* t) {
+    blink_sqlite3_stmt* s = blink_sqlite3_stmt_of(c, t);
+    if (!s) return 1;
+    if (!blink_sqlite3_conn_db(c)) return 2;
+    if (!s->stmt) return 3;
+    return 0;
 }
 #endif
 
@@ -194,12 +261,17 @@ BLINK_RT_FN int64_t blink_sqlite3_reset(blink_sqlite3_stmt* s) {
 
 BLINK_RT_FN int64_t blink_sqlite3_finalize(blink_sqlite3_stmt* s);
 #ifndef BLINK_NATIVE_SHIMS_DECLS_ONLY
-/* A second finalize is a no-op. Finalize stays legal after the connection closed: it is
- * what lets sqlite free the zombie database. */
+/* A second finalize is a no-op. The finalize itself runs outside mu: the database stays a
+ * zombie until its last statement goes, so stmt is valid until then. */
 BLINK_RT_FN int64_t blink_sqlite3_finalize(blink_sqlite3_stmt* s) {
-    if (!s || !s->stmt) return SQLITE_OK;
+    if (!s || !s->conn) return SQLITE_OK;
+    blink_sqlite3_conn* c = s->conn;
+    pthread_mutex_lock(&c->mu);
     sqlite3_stmt* stmt = s->stmt;
     s->stmt = NULL;
+    if (stmt) blink_sqlite3_unlink_locked(c, s);
+    pthread_mutex_unlock(&c->mu);
+    if (!stmt) return SQLITE_OK;
     return (int64_t)sqlite3_finalize(stmt);
 }
 #endif
@@ -243,12 +315,23 @@ BLINK_RT_FN int64_t blink_sqlite3_last_insert_rowid(blink_sqlite3_conn* c) {
 
 BLINK_RT_FN int64_t blink_sqlite3_close(blink_sqlite3_conn* c);
 #ifndef BLINK_NATIVE_SHIMS_DECLS_ONLY
-/* A second close is a no-op. close_v2, not close: with a statement still open, close
- * returns SQLITE_BUSY and keeps the database open, which the cleared box would leak. */
+/* A second close is a no-op. Close finalizes every statement still open first, so the
+ * database really closes and its locks go. close_v2 also frees a statement prepared
+ * outside these boxes. */
 BLINK_RT_FN int64_t blink_sqlite3_close(blink_sqlite3_conn* c) {
-    sqlite3* db = blink_sqlite3_conn_db(c);
-    if (!db) return SQLITE_OK;
+    if (!c) return SQLITE_OK;
+    pthread_mutex_lock(&c->mu);
+    sqlite3* db = c->db;
     c->db = NULL;
+    while (db && c->open) {
+        blink_sqlite3_stmt* s = c->open;
+        sqlite3_stmt* stmt = s->stmt;
+        s->stmt = NULL;
+        blink_sqlite3_unlink_locked(c, s);
+        sqlite3_finalize(stmt);
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (!db) return SQLITE_OK;
     return (int64_t)sqlite3_close_v2(db);
 }
 #endif

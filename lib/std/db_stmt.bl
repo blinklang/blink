@@ -1,97 +1,63 @@
+import std.db.{DB}
 import std.db_error.{DBError}
-import std.db_sqlite.{Sqlite3, Sqlite3Stmt, sqlite_bind_int, sqlite_bind_text, sqlite_step,
-    sqlite_column_int, sqlite_column_text, sqlite_reset, sqlite_finalize, sqlite_errmsg,
-    sqlite_is_finalized, sqlite_check_open}
 
 pub let STEP_ROW: Int = 100
 pub let STEP_DONE: Int = 101
 
-pub type Stmt {
-    handle: Sqlite3Stmt
-    db_handle: Sqlite3
-}
+/// A prepared statement: a token that the DB handler makes in `prepare`
+/// (sections/04_effects.md §4.4.10). The handler keeps the real statement, so code reads no
+/// field of a `Stmt`, and every method performs a `DB` operation.
+@runtime("blink_db_stmt")
+pub type Stmt
 
-fn check_rc(db_handle: Sqlite3, rc: Int) -> Result[Void, DBError] {
-    if rc != 0 {
-        return Err(DBError.ExecError(sqlite_errmsg(db_handle)))
-    }
-    Ok(())
-}
-
-// A finalized statement, or one whose connection closed, reports an error and never
-// reaches sqlite.
-fn check_live(stmt: Stmt) -> Result[Void, DBError] {
-    if sqlite_is_finalized(stmt.handle) != 0 {
-        return Err(DBError.ExecError("statement is finalized"))
-    }
-    sqlite_check_open(stmt.db_handle)
-}
-
-// The column reads return no Result, so a dead statement is a panic, not a made-up value.
-fn require_live(stmt: Stmt) {
-    match check_live(stmt) {
-        Ok(_) => {}
-        Err(e) => panic("cannot read a column: {e}")
-    }
-}
+/// `Stmt.mock(id)`: a `Stmt` that a handler makes. No connection made it, so a real
+/// connection answers it with the owner Err.
+@runtime("blink_db_stmt_mock")
+@trusted(audit: "STD-DB-STMT")
+pub fn Stmt_mock(id: Int) -> Stmt
 
 pub trait StmtOps {
-    fn bind_int(self, idx: Int, val: Int) -> Result[Void, DBError]
-    fn bind_text(self, idx: Int, val: Str) -> Result[Void, DBError]
-    fn step(self) -> Result[Int, DBError]
-    fn column_int(self, idx: Int) -> Int
-    fn column_text(self, idx: Int) -> Str
-    fn reset(self) -> Result[Void, DBError]
-    fn finalize(self) -> Result[Void, DBError]
+    fn bind_int(self, idx: Int, val: Int) -> Result[Void, DBError] ! DB.Read
+    fn bind_text(self, idx: Int, val: Str) -> Result[Void, DBError] ! DB.Read
+    fn step(self) -> Result[Int, DBError] ! DB.Write
+    fn column_int(self, idx: Int) -> Int ! DB.Read
+    fn column_text(self, idx: Int) -> Str ! DB.Read
+    fn reset(self) -> Result[Void, DBError] ! DB.Read
+    fn finalize(self) -> Result[Void, DBError] ! DB.Read
 }
 
 impl StmtOps for Stmt {
-    fn bind_int(self, idx: Int, val: Int) -> Result[Void, DBError] {
-        check_live(self)?
-        check_rc(self.db_handle, sqlite_bind_int(self.handle, idx, val))
+    fn bind_int(self, idx: Int, val: Int) -> Result[Void, DBError] ! DB.Read {
+        db.bind_int(self, idx, val)
     }
 
-    fn bind_text(self, idx: Int, val: Str) -> Result[Void, DBError] {
-        check_live(self)?
-        check_rc(self.db_handle, sqlite_bind_text(self.handle, idx, val))
+    fn bind_text(self, idx: Int, val: Str) -> Result[Void, DBError] ! DB.Read {
+        db.bind_text(self, idx, val)
     }
 
-    fn step(self) -> Result[Int, DBError] {
-        check_live(self)?
-        let rc = sqlite_step(self.handle)
-        if rc == STEP_DONE || rc == STEP_ROW {
-            Ok(rc)
-        } else {
-            Err(DBError.ExecError(sqlite_errmsg(self.db_handle)))
-        }
+    fn step(self) -> Result[Int, DBError] ! DB.Write {
+        db.step(self)
     }
 
-    fn column_int(self, idx: Int) -> Int {
-        require_live(self)
-        sqlite_column_int(self.handle, idx)
+    fn column_int(self, idx: Int) -> Int ! DB.Read {
+        db.column_int(self, idx)
     }
 
-    fn column_text(self, idx: Int) -> Str {
-        require_live(self)
-        sqlite_column_text(self.handle, idx)
+    fn column_text(self, idx: Int) -> Str ! DB.Read {
+        db.column_text(self, idx)
     }
 
-    fn reset(self) -> Result[Void, DBError] {
-        check_live(self)?
-        check_rc(self.db_handle, sqlite_reset(self.handle))
+    fn reset(self) -> Result[Void, DBError] ! DB.Read {
+        db.reset(self)
     }
 
-    // A second finalize does nothing, as close does.
-    fn finalize(self) -> Result[Void, DBError] {
-        if sqlite_is_finalized(self.handle) != 0 {
-            return Ok(())
-        }
-        check_rc(self.db_handle, sqlite_finalize(self.handle))
+    fn finalize(self) -> Result[Void, DBError] ! DB.Read {
+        db.finalize(self)
     }
 }
 
 impl Closeable for Stmt {
-    fn close(self) {
-        sqlite_finalize(self.handle)
+    fn close(self) ! DB.Read {
+        let _ = self.finalize()
     }
 }

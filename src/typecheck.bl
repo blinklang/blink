@@ -24678,6 +24678,8 @@ fn tc_effect_spelling_in(name: Str, reader: Str) -> Str {
     // An ident spells as the declared name it carries.
     let root = node_name(ed)
     let rest = name.byte_slice(ident.byte_len(), name.byte_len())
+    // A reserved root (§4.3) takes its bare name in every file; `Arena` is not reserved (§5.2).
+    if reserved_effect_root_of(root) == root { return "{root}{rest}" }
     let emod = node_module(ed)
     // No file imports the program's own file, so only its bare name reaches its effects.
     if reader == "" || emod == reader || tc_module_key_is_main(emod) != 0 { return "{root}{rest}" }
@@ -52382,6 +52384,83 @@ fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, calle
     diag_set_last_fix("add effect", shown)
 }
 
+// Whether `name` is an operation of std's `DB` effect.
+fn tc_er_is_db_op(name: Str) -> Bool {
+    let ed = nr_effect_decl_in_module("std_db", "DB", 0)
+    if ed == -1 { return false }
+    let kids = node_elements(ed)
+    if kids == -1 { return false }
+    let mut ci = 0
+    while ci < sublist_length(kids) {
+        let ops = node_methods(sublist_get(kids, ci))
+        if ops != -1 {
+            let mut oi = 0
+            while oi < sublist_length(ops) {
+                if node_name(sublist_get(ops, oi)) == name { return true }
+                oi = oi + 1
+            }
+        }
+        ci = ci + 1
+    }
+    false
+}
+
+// The DB operation that a method call on `Stmt` of std.db_stmt performs, or "". Each std
+// method of `Stmt` performs the DB operation of its own name (§4.4.10); a method another
+// module declares for `Stmt` performs none.
+fn tc_er_stmt_op(node: Int, decl: Int) -> Str ! TypeCheck.Resolve {
+    if node_kind(node) != NodeKind.MethodCall || tc_decl_module(decl) != "std_db_stmt" { return "" }
+    let name = node_name(decl)
+    if !tc_er_is_db_op(name) { return "" }
+    let t = tc_er_call_receiver(node)
+    if t < 0 { return "" }
+    let td = tc_tid_decl_node(t)
+    if td < 0 || node_name(td) != "Stmt" || node_module(td) != "std_db_stmt" { return "" }
+    name
+}
+
+// Charge a Stmt method call with the row of its DB operation. False when `node` is no such call.
+fn tc_er_charge_stmt_op(program: Int, node: Int, held: List[Str], owner: ErOwner, f: ReachedCall) -> Bool ! TypeCheck.Resolve, Diag.Report {
+    let op = tc_er_stmt_op(node, f.decl)
+    if op == "" { return false }
+    for req in tc_call_row(node, f) { tc_er_require_stmt_op(program, node, held, owner, op, req) }
+    true
+}
+
+// The call as the code wrote it. A label is one line, so a call that spans lines shows its
+// receiver and `(...)` in place of the arguments.
+fn tc_er_stmt_call_written(site: Int, p: WrittenOperand, op: Str) -> Str {
+    if p.text != "" && p.end_line == p.line { return p.text }
+    let obj = node_obj(site)
+    if node_kind(obj) == NodeKind.Ident { return "{node_name(obj)}.{op}(...)" }
+    let recv = tc_written_operand(obj)
+    if recv.text != "" && recv.end_line == recv.line { "{recv.text}.{op}(...)" } else { "Stmt.{op}" }
+}
+
+// The report names the call the code wrote and the DB operation it performs, so a reader sees
+// that a method call needs the row of an effect operation (§4.4.10).
+fn tc_er_require_stmt_op(program: Int, site: Int, held: List[Str], owner: ErOwner, op: Str, req: Str) ! Diag.Report {
+    if tc_er_satisfied(program, held, req) { return }
+    let p = tc_written_operand(site)
+    let written = tc_er_stmt_call_written(site, p, op)
+    // A body with no declared row of its own takes the report every built-in op gets.
+    if owner.collect || owner.root || owner.decl < 0 || has_annotation(owner.decl, "pure") != 0 {
+        tc_er_require_op(program, site, held, owner, written, [req])
+        return
+    }
+    let shown = tc_effect_spelling_at(req, owner.decl)
+    let end_col = if p.end_line == p.line { p.end_col } else { 0 }
+    let declared = tc_er_fn_row(owner.decl)
+    let has = if declared.len() > 0 { "declares `{declared.join("`, `")}`" } else { "declares no effects" }
+    let note = "function `{owner.name}` {has} but is missing `{shown}`"
+    let help = if op == "step" && req == "DB.Write" && tc_er_satisfied(program, held, "DB.Read") {
+        "to read rows, use `db.query` or `db.query_one`, which need only `{tc_effect_spelling_at("DB.Read", owner.decl)}`"
+    } else { "" }
+    diag_error_span_label_at_notes("UndeclaredEffect", UNDECLARED_EFFECT, "undeclared effect", site, p.line, p.col, end_col,
+        "`{written}` performs the DB operation `{op}`, which requires `{shown}`", help, [note])
+    diag_set_last_fix("add effect", shown)
+}
+
 // A built-in op has no declaration to point to, so the report points to the row it misses (§4.4).
 // A `@pure` fn may hold no row at all, so adding the effect is no way out of its report (§4.16.3).
 // A derived body has no declaration of its own, so its effect's module spells for it.
@@ -52684,6 +52763,7 @@ fn tc_er_charge_call(program: Int, node: Int, held: List[Str], owner: ErOwner, f
             tc_er_require(program, node, held, owner, "{node_name(ed)}.{node_name(f.decl)}", tc_er_op_effect(ed, f.decl))
         }
         CallReach.TraitImpl => {
+            if tc_er_charge_stmt_op(program, node, held, owner, f) { return }
             // `Closeable.close(r)` names the trait but runs the impl of a concrete `r`.
             for req in tc_call_row(node, f) { tc_er_require(program, node, held, owner, node_name(f.decl), req) }
         }
@@ -52696,7 +52776,11 @@ fn tc_er_charge_call(program: Int, node: Int, held: List[Str], owner: ErOwner, f
                 if req != "FFI" && !req.starts_with("FFI.") { tc_er_require(program, node, held, owner, shown, req) }
             }
         }
-        CallReach.Fn | CallReach.LetValue | CallReach.Variant => {
+        // A method call on a `Stmt` reaches the impl method of std.db_stmt.
+        CallReach.Fn => {
+            if f.decl >= 0 && !tc_er_charge_stmt_op(program, node, held, owner, f) { tc_er_require_sig_row(program, node, held, owner, f.decl, -1) }
+        }
+        CallReach.LetValue | CallReach.Variant => {
             if f.decl >= 0 { tc_er_require_sig_row(program, node, held, owner, f.decl, -1) }
         }
         CallReach.Value => {

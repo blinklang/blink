@@ -20,6 +20,7 @@ cat "$src/runtime_core.h" \
     "$src/runtime_thread.h" \
     "$src/runtime_process.h" \
     "$src/runtime_test.h" \
+    "$src/runtime_db.h" \
     "$src/runtime_sqlite.h" \
     "$src/runtime_stdio.h" \
     "$src/runtime_term.h" \

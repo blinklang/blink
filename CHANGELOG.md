@@ -2,6 +2,16 @@
 
 Single source of truth for release history. `blink llms` and `blink llms --full` both append this file after the reference text, and every release version is indexed as a topic (e.g. `blink llms --topic v0.36`). **Edit only here** — `llms.md` and `llms-full.md` hold only a `## Recent Changes` stub pointing at this file.
 
+## Changes (unreleased)
+
+### Breaking Changes
+
+- **Each `Stmt` method is a `DB` operation that the handler in scope runs (section 4.4.10).** `s.step()` performs `DB.Write`. `bind_int`, `bind_text`, `column_int`, `column_text`, `reset` and `finalize` perform `DB.Read`, and `with s as t` closes `s` through `finalize`. Before, these calls had no effect row, so `fn reader(s: Stmt) ! DB.Read { let _ = s.step() }` passed `blink check` and could write to the database. It is now E0500 UndeclaredEffect, "`s.step()` performs the DB operation `step`, which requires `DB.Write`". Under `DB.Read` the help says "to read rows, use `db.query` or `db.query_one`, which need only `DB.Read`". Add `DB.Write` to a fn that calls `step`, or read with `db.query`.
+- **A `Stmt` operation needs a `DB` handler in scope.** Call it inside the `with` of a connection or of a `handler DB`. `Stmt` no longer has the `handle` and `db_handle` fields; it is a token that the handler makes in `prepare`.
+- **A handler answers only the `Stmt` values it made.** A `Stmt` from another connection gets `Err(ExecError("statement belongs to another connection"))`. Under a connection that is closed, an operation on a `Stmt` it made gets `Err(ConnectionError("connection is closed"))`, and after `finalize` it gets `Err(ExecError("statement is finalized"))`. In each case `column_int` and `column_text` panic with "cannot read a column: " and the error. `finalize` of a finalized `Stmt` returns `Ok`.
+- **The `with` of a connection finalizes each `Stmt` still open when it exits,** by the end of the block, `return`, `break`, `?` or a panic.
+- **A mock `handler DB` makes a `Stmt` with `Stmt.mock(id)`, a `@pure` fn.** A `handler DB` that gives no clause for a `Stmt` operation forwards it to the enclosing handler. If that is a connection, a `Stmt.mock` value then gets the "statement belongs to another connection" error, so give a clause for each `Stmt` operation the code under test calls.
+
 ## Breaking Changes (v0.61.0)
 
 - **A type parameter that only `Never` values reach is E0301 CannotInferType when nothing else fixes it (section 3.4).** Inference never chooses `Never` for a slot the program left open (section 3.2). Before, `let q = Box { v: panic("x") }` gave `q` the type `Box[Never]`, and `let x = pick(todo(), todo())` gave `x` the type `Never`. Each is now E0301 at the `let`: "cannot infer a type for `q`: it is never given one by an annotation or a later use". When the result does not carry the parameter, as in `count(todo())` for `fn count[T](a: T) -> Int`, the error is at the call: "type parameter `T` of `count` is unbound at this call and nothing supplies it". Write the type: `let q: Box[Int] = Box { v: panic("x") }`, or `count[Int](todo())`. A later use fills the slot too, as for `[]`: `let mut xs = wrap(todo())` then `xs.push(1)`. `let x = todo()` has no type parameter and stays `Never`.

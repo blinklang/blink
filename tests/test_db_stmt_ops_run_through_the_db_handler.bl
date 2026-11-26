@@ -1,0 +1,323 @@
+// Every Stmt method performs a DB operation, and the handler in scope runs it
+// (sections/04_effects.md §4.4.10). A handler answers only the Stmt values it made; any
+// other Stmt gets the owner Err. A connection finalizes each Stmt still open when its with
+// exits, on every exit path.
+
+import std.db
+import std.db_error.{DBError}
+import std.db_row.{Row}
+import std.db_stmt.{Stmt, STEP_ROW, STEP_DONE}
+
+fn is_owner_err[T](r: Result[T, DBError]) -> Bool {
+    match r {
+        Err(DBError.ExecError(msg)) => msg == "statement belongs to another connection"
+        _ => false
+    }
+}
+
+fn scripted_db(log: List[Str]) -> Handler[DB] {
+    handler DB {
+        fn query(_sql: Template[DB]) -> Result[List[Row], DBError] { Ok([]) }
+        fn query_one(_sql: Template[DB]) -> Result[Option[Row], DBError] { Ok(None) }
+        fn prepare(_sql: Template[DB]) -> Result[Stmt, DBError] {
+            log.push("prepare")
+            Ok(Stmt.mock(1))
+        }
+        fn bind_int(_s: Stmt, idx: Int, val: Int) -> Result[Void, DBError] {
+            log.push("bind_int {idx} {val}")
+            Ok(())
+        }
+        fn bind_text(_s: Stmt, idx: Int, val: Str) -> Result[Void, DBError] {
+            log.push("bind_text {idx} {val}")
+            Ok(())
+        }
+        fn column_int(_s: Stmt, idx: Int) -> Int {
+            log.push("column_int {idx}")
+            7
+        }
+        fn column_text(_s: Stmt, idx: Int) -> Str {
+            log.push("column_text {idx}")
+            "ada"
+        }
+        fn reset(_s: Stmt) -> Result[Void, DBError] {
+            log.push("reset")
+            Ok(())
+        }
+        fn finalize(_s: Stmt) -> Result[Void, DBError] {
+            log.push("finalize")
+            Ok(())
+        }
+        fn exec(_sql: Template[DB]) -> Result[Void, DBError] { Ok(()) }
+        fn execute(_sql: Template[DB]) -> Result[Int, DBError] { Ok(1) }
+        fn begin() -> Result[Void, DBError] { Ok(()) }
+        fn commit() -> Result[Void, DBError] { Ok(()) }
+        fn rollback() -> Result[Void, DBError] { Ok(()) }
+        fn step(_s: Stmt) -> Result[Int, DBError] {
+            log.push("step")
+            Ok(STEP_DONE)
+        }
+    }
+}
+
+fn no_step_db() -> Handler[DB] {
+    handler DB {
+        fn query(_sql: Template[DB]) -> Result[List[Row], DBError] { Ok([]) }
+        fn query_one(_sql: Template[DB]) -> Result[Option[Row], DBError] { Ok(None) }
+        fn prepare(_sql: Template[DB]) -> Result[Stmt, DBError] { Ok(Stmt.mock(1)) }
+        fn bind_int(_s: Stmt, _idx: Int, _val: Int) -> Result[Void, DBError] { Ok(()) }
+        fn bind_text(_s: Stmt, _idx: Int, _val: Str) -> Result[Void, DBError] { Ok(()) }
+        fn column_int(_s: Stmt, _idx: Int) -> Int { 7 }
+        fn column_text(_s: Stmt, _idx: Int) -> Str { "ada" }
+        fn reset(_s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn finalize(_s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn exec(_sql: Template[DB]) -> Result[Void, DBError] { Ok(()) }
+        fn execute(_sql: Template[DB]) -> Result[Int, DBError] { Ok(1) }
+        fn begin() -> Result[Void, DBError] { Ok(()) }
+        fn commit() -> Result[Void, DBError] { Ok(()) }
+        fn rollback() -> Result[Void, DBError] { Ok(()) }
+    }
+}
+
+// A file database, so a statement that stays open holds a read lock that a second
+// connection can see.
+fn scratch_db(tag: Str) -> Str ! Env.Read {
+    let pid = env.pid()
+    "/tmp/blink_stmt_ops_{pid}_{tag}.db"
+}
+
+fn seed_two_rows(path: Str) -> Result[Void, DBError] ! FS, Time, Rand {
+    with db.connect(path)? {
+        db.exec("create table t (x int)")?
+        db.exec("insert into t values (1)")?
+        db.exec("insert into t values (2)")?
+    }
+    Ok(())
+}
+
+fn can_write(path: Str) -> Bool ! FS, Time, Rand {
+    match db.connect(path) {
+        Ok(conn) => {
+            with conn {
+                db.exec("insert into t values (3)").is_ok()
+            }
+        }
+        Err(_) => false
+    }
+}
+
+test "a mock handler answers every Stmt operation" {
+    let log: List[Str] = []
+    with scripted_db(log) {
+        let s = db.prepare("select name from users")?
+        s.bind_int(1, 42)?
+        s.bind_text(2, "x")?
+        assert_eq(s.step()?, STEP_DONE)
+        assert_eq(s.column_int(0), 7)
+        assert_eq(s.column_text(1), "ada")
+        s.reset()?
+        s.finalize()?
+    }
+    assert_eq(log, ["prepare", "bind_int 1 42", "bind_text 2 x", "step", "column_int 0", "column_text 1", "reset", "finalize"])
+}
+
+test "Stmt.mock is a pure function" {
+    let s: Stmt = Stmt.mock(9)
+    let log: List[Str] = []
+    with scripted_db(log) {
+        s.finalize()?
+    }
+    assert_eq(log, ["finalize"])
+}
+
+test "with as on a Stmt closes it through the finalize operation of the handler" {
+    let log: List[Str] = []
+    with scripted_db(log) {
+        with db.prepare("select 1")? as s {
+            let _ = s.step()?
+        }
+    }
+    assert_eq(log, ["prepare", "step", "finalize"])
+}
+
+test "finalize, then the close of with as, each go through the handler" {
+    let log: List[Str] = []
+    with scripted_db(log) {
+        with db.prepare("select 1")? as s {
+            s.finalize()?
+            s.finalize()?
+        }
+    }
+    assert_eq(log, ["prepare", "finalize", "finalize", "finalize"])
+}
+
+test "a mock that omits step forwards it to the connection, which refuses the mock's Stmt" {
+    with db.connect(":memory:")? {
+        with no_step_db() {
+            let s = db.prepare("select 1")?
+            match s.step() {
+                Ok(_) => assert(false)
+                Err(e) => assert_eq("{e}", "exec_error: statement belongs to another connection")
+            }
+        }
+    }
+}
+
+test "a real connection refuses a Stmt.mock token with the owner Err" {
+    with db.connect(":memory:")? {
+        let s = Stmt.mock(1)
+        assert(is_owner_err(s.step()))
+        assert(is_owner_err(s.reset()))
+        assert(is_owner_err(s.bind_int(1, 1)))
+        assert(is_owner_err(s.bind_text(1, "a")))
+        assert(is_owner_err(s.finalize()))
+        assert_panics(matching: "statement belongs to another connection") {
+            let _ = s.column_int(0)
+        }
+        assert_panics(matching: "statement belongs to another connection") {
+            let _ = s.column_text(0)
+        }
+    }
+}
+
+test "a Stmt kept past its with is refused by a second connection" {
+    let mut kept: Option[Stmt] = None
+    with db.connect(":memory:")? {
+        kept = Some(db.prepare("select 1")?)
+    }
+    let s = kept.unwrap()
+    with db.connect(":memory:")? {
+        match s.step() {
+            Ok(_) => assert(false)
+            Err(e) => assert_eq("{e}", "exec_error: statement belongs to another connection")
+        }
+        assert(is_owner_err(s.finalize()))
+    }
+}
+
+test "a Stmt of one open connection is refused under another open connection" {
+    with db.connect(":memory:")? {
+        let s = db.prepare("select 1")?
+        with db.connect(":memory:")? {
+            assert(is_owner_err(s.step()))
+            assert_panics(matching: "statement belongs to another connection") {
+                let _ = s.column_int(0)
+            }
+        }
+        assert_eq(s.step()?, STEP_ROW)
+        assert_eq(s.column_int(0), 1)
+    }
+}
+
+test "finalize, the close of with as and the exit of the connection release a Stmt once" {
+    with db.connect(":memory:")? {
+        db.exec("create table t (x int)")?
+        with db.prepare("insert into t values (1)")? as s {
+            assert_eq(s.step()?, STEP_DONE)
+            s.finalize()?
+            s.finalize()?
+        }
+        let rows = db.query("select x from t")?
+        assert_eq(rows.len(), 1)
+    }
+}
+
+test "the exit of a connection finalizes a Stmt that is still open" {
+    let p = scratch_db("sweep")
+    let _ = fs.delete(p)
+    seed_two_rows(p)?
+    with db.connect(p)? {
+        let s = db.prepare("select x from t")?
+        assert_eq(s.step()?, STEP_ROW)
+    }
+    assert(can_write(p))
+    fs.delete(p)?
+}
+
+test "the exit of a connection by panic finalizes a Stmt that is still open" {
+    let p = scratch_db("sweep_panic")
+    let _ = fs.delete(p)
+    seed_two_rows(p)?
+    assert_panics(matching: "stop here") {
+        with db.connect(p).unwrap() {
+            let s = db.prepare("select x from t").unwrap()
+            assert_eq(s.step().unwrap(), STEP_ROW)
+            panic("stop here")
+        }
+    }
+    assert(can_write(p))
+    fs.delete(p)?
+}
+
+test "the exit of a connection by ? finalizes a Stmt that is still open" {
+    let p = scratch_db("sweep_question")
+    let _ = fs.delete(p)
+    seed_two_rows(p)?
+    let r = step_then_fail(p)
+    assert(r.is_err())
+    assert(can_write(p))
+    fs.delete(p)?
+}
+
+fn step_then_fail(p: Str) -> Result[Void, DBError] ! FS, Time, Rand {
+    with db.connect(p)? {
+        let s = db.prepare("select x from t")?
+        let _ = s.step()?
+        db.exec("not sql")?
+    }
+    Ok(())
+}
+
+// sqlite prepares no statement for SQL with no statement in it, and the exit of the
+// connection must still return.
+test "the exit of a connection returns after an exec of empty or comment-only SQL" {
+    with db.connect(":memory:")? {
+        let _ = db.exec("")
+        let _ = db.exec("-- x")
+    }
+    with db.connect(":memory:")? {
+        let _ = db.prepare("")
+        let _ = db.prepare("-- x")
+    }
+}
+
+// Allocations after the arena exits reuse its memory, so they overwrite any part of a
+// Stmt that the arena held.
+fn churn() -> Int {
+    let mut junk: List[Str] = []
+    let mut i = 0
+    while i < 20000 {
+        junk.push("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx{i}")
+        i = i + 1
+    }
+    junk.len()
+}
+
+test "a Stmt prepared inside with arena still works after the arena exits" {
+    with db.connect(":memory:")? {
+        let s = with arena {
+            db.prepare("select 41 + 1").unwrap()
+        }
+        assert_eq(churn(), 20000)
+        assert_eq(s.step()?, STEP_ROW)
+        assert_eq(s.column_int(0), 42)
+        s.finalize()?
+    }
+}
+
+test "the exit of a connection finalizes a Stmt that an arena dropped" {
+    let p = scratch_db("sweep_arena")
+    let _ = fs.delete(p)
+    seed_two_rows(p)?
+    with db.connect(p)? {
+        let n = with arena {
+            let s = db.prepare("select x from t").unwrap()
+            s.step().unwrap()
+        }
+        assert_eq(n, STEP_ROW)
+        assert_eq(churn(), 20000)
+        let s2 = db.prepare("select x from t")?
+        assert_eq(s2.step()?, STEP_ROW)
+    }
+    assert(can_write(p))
+    fs.delete(p)?
+}

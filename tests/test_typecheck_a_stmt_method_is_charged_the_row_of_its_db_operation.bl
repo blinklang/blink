@@ -1,0 +1,120 @@
+// Each Stmt method performs a DB operation, so a call charges the row of that operation
+// (sections/04_effects.md §4.4.10): step is DB.Write, the rest are DB.Read. The error names
+// the method that the code wrote and the operation it performs.
+
+import compile_test_helpers
+
+fn src(body: Str) -> Str {
+    "import std.db_stmt.\{Stmt}\n{body}\nfn main() \{ }\n"
+}
+
+test "step in a fn with no DB row is E0500 naming the method and the operation" {
+    let out = compile_test_helpers.compile_and_capture(src(#"fn sneaky(s: Stmt) ! IO {
+    let _ = s.step()
+}"#), "stmt_step_rowless")
+    compile_test_helpers.expect_error(out, "E0500", "step needs DB.Write")
+    compile_test_helpers.expect_contains(out, "`s.step()` performs the DB operation `step`, which requires `DB.Write`", "the message names the method and the operation")
+    compile_test_helpers.expect_contains(out, "function `sneaky` declares `IO` but is missing `DB.Write`", "the note names the fn and its row")
+    compile_test_helpers.expect_contains(out, "\"fix\":\{\"action\":\"add effect\",\"text\":\"DB.Write\"}", "the fix adds DB.Write")
+    assert(!out.contains("db.query_one"))
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "step in a DB.Read fn is E0500 with a help that points to db.query" {
+    let out = compile_test_helpers.compile_and_capture(src(#"fn reader(s: Stmt) ! DB.Read {
+    let _ = s.step()
+}"#), "stmt_step_read_only")
+    compile_test_helpers.expect_error(out, "E0500", "step needs DB.Write under DB.Read")
+    compile_test_helpers.expect_contains(out, "`s.step()` performs the DB operation `step`, which requires `DB.Write`", "the message names the method")
+    compile_test_helpers.expect_contains(out, "function `reader` declares `DB.Read` but is missing `DB.Write`", "the note names the row")
+    compile_test_helpers.expect_contains(out, "to read rows, use `db.query` or `db.query_one`, which need only `DB.Read`", "the help points to the read calls")
+    assert_eq(compile_test_helpers.count_of(out, "\"code\":\"E0500\""), 1)
+}
+
+test "a read-side Stmt method in a fn with no DB row is E0500 for DB.Read" {
+    let out = compile_test_helpers.compile_and_capture(src(#"fn peek(s: Stmt) -> Int {
+    s.column_int(0)
+}"#), "stmt_column_rowless")
+    compile_test_helpers.expect_error(out, "E0500", "column_int needs DB.Read")
+    compile_test_helpers.expect_contains(out, "`s.column_int(0)` performs the DB operation `column_int`, which requires `DB.Read`", "the message names the read op")
+    assert(!out.contains("db.query_one"))
+}
+
+test "bind, column, reset and finalize need only DB.Read, and step with DB.Write compiles clean" {
+    let out = compile_test_helpers.compile_and_capture(src(#"import std.db_error.{DBError}
+fn bind_user(s: Stmt, id: Int, name: Str) -> Result[Void, DBError] ! DB.Read {
+    s.bind_int(1, id)?
+    s.bind_text(2, name)?
+    s.reset()?
+    let _ = s.column_int(0)
+    let _ = s.column_text(1)
+    s.finalize()
+}
+fn insert_user(s: Stmt) -> Result[Int, DBError] ! DB.Read, DB.Write {
+    bind_user(s, 1, "ada")?
+    s.step()
+}
+fn all(s: Stmt) -> Result[Int, DBError] ! DB {
+    s.step()
+}"#), "stmt_rows_held")
+    compile_test_helpers.expect_compiles_clean(out, "the rows hold what each op needs")
+}
+
+test "with as on a Stmt is charged DB.Read, the row of close" {
+    let out = compile_test_helpers.compile_and_capture(src(#"fn scoped(s: Stmt) {
+    with s as _t { let _ = 0 }
+}"#), "stmt_with_as_rowless")
+    compile_test_helpers.expect_error(out, "E0500", "close needs DB.Read")
+    compile_test_helpers.expect_contains(out, "`Stmt.close`", "the diagnostic names close")
+    compile_test_helpers.expect_contains(out, "`DB.Read`", "the diagnostic names DB.Read")
+}
+
+test "a Stmt call that spans lines is named by its receiver on one line" {
+    let out = compile_test_helpers.compile_and_capture(src(#"fn binder(s: Stmt) ! IO {
+    let _ = s.bind_int(
+        1, 2)
+}"#), "stmt_call_spans_lines")
+    compile_test_helpers.expect_error(out, "E0500", "bind_int needs DB.Read")
+    compile_test_helpers.expect_contains(out, "`s.bind_int(...)` performs the DB operation `bind_int`, which requires `DB.Read`", "the label names the receiver the code wrote, on one line")
+    assert(!out.contains("`Stmt.bind_int`"))
+}
+
+test "a @pure fn that steps a Stmt gets the @pure report, not the DB operation report" {
+    let out = compile_test_helpers.compile_and_capture(src(#"@pure
+fn sneaky(s: Stmt) -> Bool {
+    s.step().is_ok()
+}"#), "stmt_step_in_pure")
+    compile_test_helpers.expect_error(out, "E1307", "a @pure fn may hold no DB row")
+    compile_test_helpers.expect_contains(out, "`@pure` function `sneaky` has the effect `DB.Write`", "the @pure message names the effect")
+    assert(!out.contains("performs the DB operation"))
+    assert(!out.contains("\"action\":\"add effect\""))
+}
+
+test "a @pure fn may make a Stmt with Stmt.mock" {
+    let out = compile_test_helpers.compile_and_capture(src(#"@pure
+fn token(id: Int) -> Stmt {
+    Stmt.mock(id)
+}"#), "stmt_mock_in_pure")
+    compile_test_helpers.expect_compiles_clean(out, "Stmt.mock performs no effect")
+}
+
+test "a method of a user trait named like a DB operation is no DB operation" {
+    let out = compile_test_helpers.compile_and_capture(src(#"effect Walk {
+    effect Go {
+        fn go() -> Int
+    }
+}
+trait Stepper {
+    fn step(self) -> Int ! Walk
+}
+impl Stepper for Stmt {
+    fn step(_self) -> Int ! Walk { walk.go() }
+}
+fn stride(s: Stmt) -> Int ! IO {
+    Stepper.step(s)
+}"#), "stmt_user_trait_step")
+    compile_test_helpers.expect_error(out, "E0500", "step of Stepper needs Walk")
+    compile_test_helpers.expect_contains(out, "needs effect `Walk`", "the report names the user effect")
+    assert(!out.contains("performs the DB operation"))
+    assert(!out.contains("DB.Write"))
+}

@@ -139,6 +139,18 @@ fn sqlite_column_name(stmt: Sqlite3Stmt, idx: Int) -> Str ! FFI {}
 /// Get the last error message from a SQLite database handle.
 pub fn sqlite_errmsg(handle: Sqlite3) -> Str ! FFI {}
 
+@runtime("blink_sqlite3_stmt_token")
+@trusted(audit: "STD-DB-SQLITE")
+fn sqlite_stmt_token(stmt: Sqlite3Stmt) -> Stmt
+
+@runtime("blink_sqlite3_stmt_of")
+@trusted(audit: "STD-DB-SQLITE")
+fn sqlite_stmt_of(handle: Sqlite3, s: Stmt) -> Option[Sqlite3Stmt]
+
+@runtime("blink_sqlite3_stmt_check")
+@trusted(audit: "STD-DB-SQLITE")
+fn sqlite_stmt_check(handle: Sqlite3, s: Stmt) -> Int
+
 @ffi("blink_sqlite3_last_insert_rowid")
 @trusted(audit: "STD-DB-SQLITE")
 fn sqlite_last_insert_rowid(handle: Sqlite3) -> Int ! FFI {}
@@ -304,7 +316,56 @@ fn sqlite_exec_str(handle: Sqlite3, sql: Str) -> Result[Void, DBError] {
 /// Prepare a parameterized statement, returning a Stmt for manual stepping.
 pub fn sqlite_prepare_stmt(db_handle: Sqlite3, sql: Template[DB]) -> Result[Stmt, DBError] {
     let stmt_handle = prepare_and_bind(db_handle, sql)?
-    Ok(Stmt { handle: stmt_handle, db_handle: db_handle })
+    Ok(sqlite_stmt_token(stmt_handle))
+}
+
+// The statement behind s when this connection made it, else the owner Err.
+fn stmt_owned(handle: Sqlite3, s: Stmt) -> Result[Sqlite3Stmt, DBError] {
+    match sqlite_stmt_of(handle, s) {
+        Some(st) => Ok(st)
+        None => Err(DBError.ExecError("statement belongs to another connection"))
+    }
+}
+
+// The checks of sections/04_effects.md §4.4.10, in the order blink_sqlite3_stmt_check
+// makes them.
+fn stmt_live(handle: Sqlite3, s: Stmt) -> Result[Sqlite3Stmt, DBError] {
+    match sqlite_stmt_check(handle, s) {
+        0 => stmt_owned(handle, s)
+        1 => Err(DBError.ExecError("statement belongs to another connection"))
+        2 => Err(DBError.ConnectionError("connection is closed"))
+        _ => Err(DBError.ExecError("statement is finalized"))
+    }
+}
+
+// The column reads return no Result, so a Stmt that fails a check is a panic, not a
+// made-up value.
+fn stmt_live_for_column(handle: Sqlite3, s: Stmt) -> Sqlite3Stmt {
+    match stmt_live(handle, s) {
+        Ok(st) => st
+        Err(e) => panic("cannot read a column: {e}")
+    }
+}
+
+fn stmt_rc(handle: Sqlite3, rc: Int) -> Result[Void, DBError] {
+    if rc != 0 {
+        return Err(DBError.ExecError(sqlite_errmsg(handle)))
+    }
+    Ok(())
+}
+
+fn sqlite_stmt_step(handle: Sqlite3, s: Stmt) -> Result[Int, DBError] {
+    let rc = sqlite_step(stmt_live(handle, s)?)
+    if rc != STEP_DONE && rc != STEP_ROW {
+        stmt_rc(handle, rc)?
+    }
+    Ok(rc)
+}
+
+// A second finalize does nothing and gives Ok, as does the finalize of a Stmt that the
+// exit of the connection already finalized.
+fn sqlite_stmt_finalize(handle: Sqlite3, s: Stmt) -> Result[Void, DBError] {
+    stmt_rc(handle, sqlite_finalize(stmt_owned(handle, s)?))
 }
 
 // --- SQLite effect handler ---
@@ -335,6 +396,30 @@ pub fn sqlite_handler(handle: Sqlite3) -> Handler[DB] {
         }
         fn rollback() -> Result[Void, DBError] {
             sqlite_exec_str(handle, "ROLLBACK")
+        }
+        fn bind_int(s: Stmt, idx: Int, val: Int) -> Result[Void, DBError] {
+            let stmt = stmt_live(handle, s)?
+            stmt_rc(handle, sqlite_bind_int(stmt, idx, val))
+        }
+        fn bind_text(s: Stmt, idx: Int, val: Str) -> Result[Void, DBError] {
+            let stmt = stmt_live(handle, s)?
+            stmt_rc(handle, sqlite_bind_text(stmt, idx, val))
+        }
+        fn column_int(s: Stmt, idx: Int) -> Int {
+            sqlite_column_int(stmt_live_for_column(handle, s), idx)
+        }
+        fn column_text(s: Stmt, idx: Int) -> Str {
+            sqlite_column_text(stmt_live_for_column(handle, s), idx)
+        }
+        fn reset(s: Stmt) -> Result[Void, DBError] {
+            let stmt = stmt_live(handle, s)?
+            stmt_rc(handle, sqlite_reset(stmt))
+        }
+        fn finalize(s: Stmt) -> Result[Void, DBError] {
+            sqlite_stmt_finalize(handle, s)
+        }
+        fn step(s: Stmt) -> Result[Int, DBError] {
+            sqlite_stmt_step(handle, s)
         }
     }
 }
