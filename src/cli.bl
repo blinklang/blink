@@ -18,7 +18,7 @@ import std.errno.{Errno}
 import std.process.{ChildEnd, ChildLimits, LimitKind, ProcessError, ProcessOp}
 import std.time.{Duration}
 import pkg.audit.{audit_load_baseline, audit_check, audit_report}
-import pkg.lockfile.{lockfile_load}
+import pkg.lockfile.{lockfile_load, lock_pkg_names, lock_pkg_sources}
 import pkg.manifest.{
     manifest_clear, manifest_load, manifest_has_dep, manifest_blink_version,
     manifest_name, manifest_print_warnings, manifest_test_timeout,
@@ -51,6 +51,7 @@ import compiler.{
     loaded_inputs, import_map_nodes, embedded_get_source,
     collect_imports, collect_root_imports, inject_prelude, merge_programs,
     set_strict_struct_layout, tune_compiler_gc, apply_manifest_lints, quiet_manifest_lib,
+    lock_source_dir, manifest_path_for_src_root,
 }
 import cg.{Codegen, CgConfig, HeaderPreamble, ProgramFacts, generate, generate_archive_header, generate_types_header, generate_module_headers_from, generate_module_headers_with, header_preamble, generate_module_object_with, generate_module_chunks_with, program_facts, enumerate_program_modules, archive_unit_modules, module_instance_names, entry_unit_facts}
 import build_unit_headers.{HeaderIndex, index_headers, unit_declarations, splice_declarations}
@@ -93,7 +94,7 @@ import diagnostics.{
     diag_count, diag_warn_count, diag_ice_count, diag_flush, diag_mark_flushed, diag_reset, diag_entry_count,
     diag_source_file, diag_file_for_node, diag_error_no_loc, diag_ice, diag_ice_at, diag_format, diag_explain, diag_set_abort_status_line,
     embedded_inner_key, diag_entry_text, diag_normalize_path, diag_usage_error_text, diag_register_source, json_escape,
-    MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE,
+    MISSING_NATIVE_DEP, NATIVE_DEP_UNAVAILABLE_CROSS, INCOMPATIBLE_STDLIB_ARCHIVE, MODULE_NOT_FOUND,
     TEST_RESULT_LOST, TEST_BINARY_DID_NOT_RUN, TEST_BUILD_ENDED_WITHOUT_DIAGNOSTIC, GENERATED_C_DID_NOT_COMPILE,
     LINK_FAILED, NATIVE_DEPENDENCY_BUILD_FAILED, diag_panic_exit, diag_passed_check, PASSES_CHECK_NOTE,
 }
@@ -335,14 +336,105 @@ fn try_pkg_config(lib: Str) -> Option[Str] ! Process.Spawn {
     }
 }
 
-fn resolve_ffi_link_flags(lib: Str, target: Str) -> Str ! Process.Spawn {
-    let dep_type = manifest_native_dep_type(lib)
+// A [native-dependencies] entry of the package graph a build links: the root manifest's, or
+// that of a blink.lock package. Its `path` is read from the dir of the package that declares
+// it. pkg is "" for the root.
+type GraphNativeDep {
+    pkg: Str
+    key: Str
+    dep_type: Str
+    path: Str
+    link: Str
+}
+
+// A manifest `path` names a file relative to the dir of the package that declares it.
+fn rebase_path(dir: Str, path: Str) -> Str {
+    if path == "" || dir == "" || dir == "." || path.starts_with("/") { path } else { path_join(dir, path) }
+}
+
+fn loaded_native_entries(pkg: Str, dir: Str) -> List[GraphNativeDep] {
+    let mut out: List[GraphNativeDep] = []
+    let count = manifest_native_dep_count()
+    let mut i = 0
+    while i < count {
+        let key = manifest_native_dep_name_at(i)
+        let path = rebase_path(dir, manifest_native_dep_path(key))
+        out.push(GraphNativeDep { pkg: pkg, key: key, dep_type: manifest_native_dep_type(key), path: path, link: manifest_native_dep_link(key) })
+        i = i + 1
+    }
+    out
+}
+
+// The native dependencies of the project that holds source_path and of each package of its
+// blink.lock. The root's come from the manifest the compile loaded.
+// Loading another manifest replaces the manifest state, so the root manifest is loaded again
+// at the end. A dependency's manifest that does not load stops the build: its native
+// dependencies are inputs of the build.
+fn load_graph_native_deps(source_path: Str) -> Option[List[GraphNativeDep]] ! Diag.Report, IO, FS.Read, Env.Read {
+    let root_manifest = manifest_path_for_src_root(find_src_root(source_path))
+    if !build_fs.path_exists(root_manifest) {
+        return Some(loaded_native_entries("", ""))
+    }
+    let project_dir = path_dirname(root_manifest)
+    let mut entries = loaded_native_entries("", project_dir)
+    let lock = path_join(project_dir, "blink.lock")
+    if !build_fs.path_exists(lock) || lockfile_load(lock) != 0 {
+        manifest_clear()
+        let _ = manifest_load(root_manifest)
+        return Some(entries)
+    }
+    let names = lock_pkg_names
+    let sources = lock_pkg_sources
+    let mut failed = ""
+    let mut i = 0
+    while i < names.len() && failed == "" {
+        let name = names.get(i).unwrap()
+        let dir = rebase_path(project_dir, lock_source_dir(sources.get(i).unwrap()))
+        i = i + 1
+        let manifest = if dir == "" { "" } else { path_join(dir, "blink.toml") }
+        if manifest == "" || !build_fs.path_exists(manifest) { continue }
+        manifest_clear()
+        if manifest_load(manifest) != 0 {
+            failed = manifest
+            continue
+        }
+        for e in loaded_native_entries(name, dir) {
+            entries.push(e)
+        }
+    }
+    manifest_clear()
+    let _ = manifest_load(root_manifest)
+    if failed != "" {
+        // The same report as the compile's for a blink.toml that does not load.
+        diag_error_no_loc("ModuleNotFound", MODULE_NOT_FOUND, "cannot load {failed}", "")
+        diag_flush()
+        return None
+    }
+    Some(entries)
+}
+
+// The first entry of the graph with this key, the root's before a dependency's.
+fn graph_native_dep(natives: List[GraphNativeDep], key: Str) -> Option[GraphNativeDep] {
+    for e in natives {
+        if e.key == key { return Some(e) }
+    }
+    None
+}
+
+fn graph_has_native_dep(natives: List[GraphNativeDep], key: Str) -> Bool {
+    graph_native_dep(natives, key).is_some()
+}
+
+fn resolve_ffi_link_flags(lib: Str, target: Str, natives: List[GraphNativeDep]) -> Str ! Process.Spawn {
+    let (dep_type, dep_link) = match graph_native_dep(natives, lib) {
+        Some(e) => (e.dep_type, e.link)
+        None => ("", "")
+    }
 
     if dep_type == "vendored" {
         return ""
     }
 
-    let dep_link = manifest_native_dep_link(lib)
     if dep_link == "dynamic" {
         return "-l{lib}"
     }
@@ -391,7 +483,7 @@ fn resolve_gc_include() -> Option[Str] ! IO, FS.Write, FS.Read, FS.Delete, Env.R
     Some("{base}/include")
 }
 
-fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs: List[Str]) -> Str ! FS.Read, Env.Read, Process.Spawn {
+fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs: List[Str], natives: List[GraphNativeDep]) -> Str ! FS.Read, Env.Read, Process.Spawn {
     let mut flags = "-lm"
     if target == "" {
         flags = "{flags} -lgc"
@@ -411,11 +503,11 @@ fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs:
         // the system dev package (e.g. the Docker image after the SQLite peel).
         // The dynamic `-l` is the right thing only for a `{ system = true }`
         // manifest override, where resolve_native_dep_source returns "".
-        if resolve_native_dep_source(dep_name) != "" {
+        if resolve_native_dep_source(dep_name, natives) != "" {
             di = di + 1
             continue
         }
-        let dep_flags = resolve_ffi_link_flags(dep_name, target)
+        let dep_flags = resolve_ffi_link_flags(dep_name, target, natives)
         if dep_flags != "" {
             flags = "{flags} {dep_flags}"
         }
@@ -424,7 +516,7 @@ fn build_link_flags(target: Str, has_async: Int, used_deps: List[Str], ffi_libs:
     let mut i = 0
     while i < ffi_libs.len() {
         let lib = ffi_libs.get(i).unwrap()
-        let lib_flags = resolve_ffi_link_flags(lib, target)
+        let lib_flags = resolve_ffi_link_flags(lib, target, natives)
         if lib_flags != "" {
             flags = "{flags} {lib_flags}"
         }
@@ -1337,9 +1429,16 @@ fn compile_vendored_source(name: Str, c_path: Str, o_path: Str, debug_mode: Int,
 // custom build), (2) installed sidecar at `<install_root>/share/blink/native/<name>/`,
 // (3) dev-tree `<install_root>/lib/native/<name>/`. Returns "" if no source can be
 // located, leaving the caller to error out.
-fn resolve_native_dep_source(name: Str) -> Str ! FS.Read, Env.Read {
-    let dep_type = manifest_native_dep_type(name)
-    let dep_path = manifest_native_dep_path(name)
+fn resolve_native_dep_source(name: Str, natives: List[GraphNativeDep]) -> Str ! FS.Read, Env.Read {
+    let mut dep_type = ""
+    let mut dep_path = ""
+    for e in natives {
+        if e.pkg == "" && e.key == name {
+            dep_type = e.dep_type
+            dep_path = e.path
+            break
+        }
+    }
     if dep_type == "vendored" && dep_path != "" {
         return dep_path
     }
@@ -1369,14 +1468,17 @@ fn resolve_native_dep_source(name: Str) -> Str ! FS.Read, Env.Read {
 }
 
 // The object a native dep compiles to in the native cache; a cross build keys it by target.
-fn vendored_object_path(name: Str, target: Str) -> Str {
-    if target == "" { "{native_cache_dir()}/{name}.o" } else { "{native_cache_dir()}/{name}-{target}.o" }
+// A dependency's entry has a dir of its package's own, so two packages that use one key never
+// share an object.
+fn vendored_object_path(pkg: Str, name: Str, target: Str) -> Str {
+    let dir = if pkg == "" { native_cache_dir() } else { "{native_cache_dir()}/deps/{pkg}" }
+    if target == "" { "{dir}/{name}.o" } else { "{dir}/{name}-{target}.o" }
 }
 
 // The objects of the native deps a build links. None when the build stops, with the error
 // printed: in a test build, when a dep did not compile; in any build, when the gc sources
 // cannot be written. Any other build links the objects that did compile.
-fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str, test_build: Bool) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
+fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode: Int, target: Str, test_build: Bool, natives: List[GraphNativeDep]) -> Option[List[Str]] ! IO, FS.Write, FS.Read, Process.Spawn, FS.Delete, Env.Exit, Env.Read {
     let mut objects: List[Str] = []
 
     if target != "" {
@@ -1419,10 +1521,10 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
     let mut di = 0
     while di < used_deps.len() {
         let name = used_deps.get(di).unwrap()
-        let src = resolve_native_dep_source(name)
+        let src = resolve_native_dep_source(name, natives)
         if src != "" {
             let _ = build_fs.mkdir_p(native_cache_dir())
-            let o_path = vendored_object_path(name, target)
+            let o_path = vendored_object_path("", name, target)
             let rc = compile_vendored_source(name, src, o_path, debug_mode, release_mode, target, test_build)
             if rc != 0 {
                 return None
@@ -1432,20 +1534,15 @@ fn resolve_vendored_objects(used_deps: List[Str], debug_mode: Int, release_mode:
         di = di + 1
     }
 
-    let count = manifest_native_dep_count()
-    let mut i = 0
-    while i < count {
-        let name = manifest_native_dep_name_at(i)
-        i = i + 1
-        if manifest_native_dep_type(name) != "vendored" { continue }
+    for e in natives {
+        if e.dep_type != "vendored" { continue }
         // Registry-managed deps already came in via used_deps above; skip
         // the manifest entry so the same .o isn't compiled and linked twice.
-        if used_deps.contains(name) { continue }
-        let dep_path = manifest_native_dep_path(name)
-        if dep_path == "" { continue }
-        let _ = build_fs.mkdir_p(native_cache_dir())
-        let o_path = vendored_object_path(name, target)
-        let rc = compile_vendored_source(name, dep_path, o_path, debug_mode, release_mode, target, test_build)
+        if used_deps.contains(e.key) { continue }
+        if e.path == "" { continue }
+        let o_path = vendored_object_path(e.pkg, e.key, target)
+        let _ = build_fs.mkdir_p(path_dirname(o_path))
+        let rc = compile_vendored_source(e.key, e.path, o_path, debug_mode, release_mode, target, test_build)
         if rc != 0 {
             return None
         }
@@ -1483,7 +1580,7 @@ fn cross_gc_includes(target: Str) -> Option[List[Str]] ! IO, FS.Write, FS.Read, 
 }
 
 // None when the gc sources cannot be written; the error is printed.
-fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Option[Str] ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
+fn resolve_vendored_includes(used_deps: List[Str], target: Str, natives: List[GraphNativeDep]) -> Option[Str] ! IO, FS.Read, FS.Write, FS.Delete, Env.Read {
     let mut includes = match cross_gc_includes(target) {
         Some(i) => i
         None => return None
@@ -1492,23 +1589,18 @@ fn resolve_vendored_includes(used_deps: List[Str], target: Str) -> Option[Str] !
     let mut di = 0
     while di < used_deps.len() {
         let name = used_deps.get(di).unwrap()
-        let src = resolve_native_dep_source(name)
+        let src = resolve_native_dep_source(name, natives)
         if src != "" {
             includes.push("-I{path_dirname(src)}")
         }
         di = di + 1
     }
 
-    let count = manifest_native_dep_count()
-    let mut i = 0
-    while i < count {
-        let name = manifest_native_dep_name_at(i)
-        i = i + 1
-        if manifest_native_dep_type(name) != "vendored" { continue }
-        if used_deps.contains(name) { continue }
-        let dep_path = manifest_native_dep_path(name)
-        if dep_path == "" { continue }
-        includes.push("-I{path_dirname(dep_path)}")
+    for e in natives {
+        if e.dep_type != "vendored" { continue }
+        if used_deps.contains(e.key) { continue }
+        if e.path == "" { continue }
+        includes.push("-I{path_dirname(e.path)}")
     }
 
     if includes.len() == 0 {
@@ -1951,12 +2043,12 @@ fn report_link_target_failure(link_output: Str, cached_o: Str, snap: Str, includ
     1
 }
 
-fn validate_ffi_native_deps(ffi_libs: List[Str]) -> Int ! Diag.Report, IO {
+fn validate_ffi_native_deps(ffi_libs: List[Str], natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
     let mut errors = 0
     let mut i = 0
     while i < ffi_libs.len() {
         let lib = ffi_libs.get(i).unwrap()
-        if manifest_has_native_dep(lib) == 0 {
+        if !graph_has_native_dep(natives, lib) {
             diag_error_no_loc("MissingNativeDep", MISSING_NATIVE_DEP, "@ffi references undeclared native dependency \"{lib}\"", "add to blink.toml:\n  [native-dependencies]\n  {lib} = \{ system = true \}")
             errors = errors + 1
         }
@@ -1969,19 +2061,14 @@ fn validate_ffi_native_deps(ffi_libs: List[Str]) -> Int ! Diag.Report, IO {
     0
 }
 
-fn validate_cross_target_deps(target: Str) -> Int ! Diag.Report, IO {
+fn validate_cross_target_deps(target: Str, natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
     let mut errors = 0
-    let count = manifest_native_dep_count()
-    let mut i = 0
-    while i < count {
-        let name = manifest_native_dep_name_at(i)
-        let dep_type = manifest_native_dep_type(name)
-        let dep_link = manifest_native_dep_link(name)
-        if dep_type == "system" && dep_link != "dynamic" {
+    for e in natives {
+        let name = e.key
+        if e.dep_type == "system" && e.link != "dynamic" {
             diag_error_no_loc("NativeDepUnavailableCrossTarget", NATIVE_DEP_UNAVAILABLE_CROSS, "native dependency \"{name}\" is system-only but target is {target}", "cross-compilation requires vendored source or static archive\n  provide source: {name} = \{ path = \"vendor/{name}.c\" \}\n  or override linking: {name} = \{ system = true, link = \"dynamic\" \}")
             errors = errors + 1
         }
-        i = i + 1
     }
     if errors > 0 {
         diag_flush()
@@ -2044,10 +2131,10 @@ fn stamp_blink_version() ! Diag.Report, FS.Write, FS.Read, IO, Env.Exit, Env.Rea
 
 // A foreign constant's key is checked whether or not the program has a manifest: with no
 // link flag, nothing later would catch a key that names no dependency.
-fn check_foreign_const_libs(foreign: List[ForeignConst]) -> Int ! Diag.Report, IO {
+fn check_foreign_const_libs(foreign: List[ForeignConst], natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO {
     let mut errors = 0
     for fc in foreign {
-        if fc.lib == "" || is_runtime_lib(fc.lib) || manifest_has_native_dep(fc.lib) != 0 { continue }
+        if fc.lib == "" || is_runtime_lib(fc.lib) || graph_has_native_dep(natives, fc.lib) { continue }
         report_undeclared_lib(fc)
         errors = errors + 1
     }
@@ -2058,10 +2145,10 @@ fn check_foreign_const_libs(foreign: List[ForeignConst]) -> Int ! Diag.Report, I
     0
 }
 
-fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Report, FS.Read, Process.Spawn, IO {
+fn validate_build_deps(ffi_libs: List[Str], targets: List[Str], natives: List[GraphNativeDep]) -> Int ! Diag.Report, FS.Read, Process.Spawn, IO {
     let has_toml = if resolve_manifest_path() != "" { 1 } else { 0 }
     if has_toml == 1 && ffi_libs.len() > 0 {
-        let vrc = validate_ffi_native_deps(ffi_libs)
+        let vrc = validate_ffi_native_deps(ffi_libs, natives)
         if vrc != 0 {
             return vrc
         }
@@ -2070,7 +2157,7 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
     if has_toml == 1 && targets.len() > 0 {
         let first_target = resolve_target_triple(targets.get(0).unwrap())
         if first_target != "" {
-            let crc = validate_cross_target_deps(first_target)
+            let crc = validate_cross_target_deps(first_target, natives)
             if crc != 0 {
                 return crc
             }
@@ -2083,7 +2170,7 @@ fn validate_build_deps(ffi_libs: List[Str], targets: List[Str]) -> Int ! Diag.Re
 // declarations name must be one that the unit compile finds, so a missing one is E0859 at the
 // `@ffi` line and not GeneratedCDidNotCompile. The test reads only pass or fail; a failed
 // test of all the headers at once is run again for each header to find the missing ones.
-fn check_foreign_headers(headers: List[ForeignHeader], targets: List[Str], used_deps: List[Str], output_path: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+fn check_foreign_headers(headers: List[ForeignHeader], targets: List[Str], used_deps: List[Str], output_path: Str, natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
     if headers.is_empty() { return 0 }
     let mut distinct: List[Str] = []
     for fh in headers {
@@ -2100,7 +2187,7 @@ fn check_foreign_headers(headers: List[ForeignHeader], targets: List[Str], used_
     let aliases = if targets.is_empty() { [""] } else { targets }
     for alias in aliases {
         let target = if alias == "" { "" } else { resolve_target_triple(alias) }
-        let inc_flags = match resolve_vendored_includes(used_deps, target) {
+        let inc_flags = match resolve_vendored_includes(used_deps, target, natives) {
             Some(v) => "{arc_inc} {v}"
             None => {
                 let _ = build_fs.remove_tree(dir)
@@ -2172,7 +2259,7 @@ fn header_probe(dir: Str, name: Str, headers: List[Str], inc_flags: Str, target:
 // constant expression that fits its declared type. A failure is E0855 at the declaration:
 // the program's own compile would only say that a name is undeclared, at a line of C. An
 // error the probe cannot map to a constant is left to that compile.
-fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_deps: List[Str], output_path: Str) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
+fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_deps: List[Str], output_path: Str, natives: List[GraphNativeDep]) -> Int ! Diag.Report, IO, FS.Read, FS.Write, FS.Delete, Process.Spawn, Env.Read {
     if foreign.is_empty() { return 0 }
     let mut out_dir = path_dirname(output_path)
     if out_dir == "" { out_dir = "." }
@@ -2208,7 +2295,7 @@ fn check_foreign_consts(foreign: List[ForeignConst], targets: List[Str], used_de
         // -pedantic-errors makes that an error; -w would turn it off again. The program's
         // compile is not pedantic, so the dependency headers come in as system headers,
         // where a C extension that compile accepts is no error.
-        let vendored = match resolve_vendored_includes(used_deps, target) {
+        let vendored = match resolve_vendored_includes(used_deps, target, natives) {
             Some(v) => v
             None => {
                 let _ = build_fs.remove_tree(dir)
@@ -2435,25 +2522,29 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
 
     let source = build_fs.read_or_empty(source_path)
     let has_async = detect_async(source)
+    let natives = match load_graph_native_deps(source_path) {
+        Some(n) => n
+        None => { return 1 }
+    }
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
     let compiler_archive = compiler_archive_of_unit(c_source)
     // A test binary's main runs the tests, so only a program build reads the entry point.
     let link = test_build || compiled.entry.has_main
 
-    let vrc = validate_build_deps(ffi_libs, targets)
+    let vrc = validate_build_deps(ffi_libs, targets, natives)
     if vrc != 0 {
         return vrc
     }
-    let flrc = check_foreign_const_libs(compiled.foreign)
+    let flrc = check_foreign_const_libs(compiled.foreign, natives)
     if flrc != 0 {
         return flrc
     }
-    let hrc = check_foreign_headers(compiled.headers, targets, used_deps, output_path)
+    let hrc = check_foreign_headers(compiled.headers, targets, used_deps, output_path, natives)
     if hrc != 0 {
         return hrc
     }
-    let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path)
+    let frc = check_foreign_consts(compiled.foreign, targets, used_deps, output_path, natives)
     if frc != 0 {
         return frc
     }
@@ -2463,12 +2554,12 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
         if targets.len() == 1 {
             target = resolve_target_triple(targets.get(0).unwrap())
         }
-        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build) {
+        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs, natives)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build, natives) {
             Some(o) => o
             None => return 1
         }
-        let inc_flags = match resolve_vendored_includes(used_deps, target) {
+        let inc_flags = match resolve_vendored_includes(used_deps, target, natives) {
             Some(f) => match one_unit_struct_defines(c_path, c_source, target, f, compiler_archive, debug_mode, release_mode, output_path, compiled.mirrors) {
                 Ok(d) => "{f}{d}"
                 Err(rc) => return rc
@@ -2496,7 +2587,7 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     }
 
     let first_triple = resolve_target_triple(targets.get(0).unwrap())
-    let inc_flags = match resolve_vendored_includes(used_deps, first_triple) {
+    let inc_flags = match resolve_vendored_includes(used_deps, first_triple, natives) {
         Some(f) => f
         None => return 1
     }
@@ -2521,8 +2612,8 @@ fn do_build(source_path: Str, output_path: Str, c_path: Str, debug_mode: Int, re
     while i < targets.len() {
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
-        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build) {
+        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs, natives)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build, natives) {
             Some(o) => o
             None => return 1
         }
@@ -3315,32 +3406,36 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     // A test binary's main runs the tests, so only a program build reads the entry point.
     let link = test_build || entry.has_main
     let has_async = detect_async(build_fs.read_or_empty(source_path))
+    let natives = match load_graph_native_deps(source_path) {
+        Some(n) => n
+        None => { return 1 }
+    }
     let used_deps = detect_native_deps(c_source)
     let ffi_libs = detect_ffi_libs(c_source)
-    let vrc = validate_build_deps(ffi_libs, targets)
+    let vrc = validate_build_deps(ffi_libs, targets, natives)
     if vrc != 0 {
         return vrc
     }
-    let flrc = check_foreign_const_libs(foreign)
+    let flrc = check_foreign_const_libs(foreign, natives)
     if flrc != 0 {
         return flrc
     }
-    let hrc = check_foreign_headers(headers, targets, used_deps, output_path)
+    let hrc = check_foreign_headers(headers, targets, used_deps, output_path, natives)
     if hrc != 0 {
         return hrc
     }
-    let frc = check_foreign_consts(foreign, targets, used_deps, output_path)
+    let frc = check_foreign_consts(foreign, targets, used_deps, output_path, natives)
     if frc != 0 {
         return frc
     }
     if targets.len() <= 1 {
         let target = if targets.len() == 1 { resolve_target_triple(targets.get(0).unwrap()) } else { "" }
-        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build) {
+        let link_flags = build_link_flags(target, has_async, used_deps, ffi_libs, natives)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, target, test_build, natives) {
             Some(o) => o
             None => return 1
         }
-        let inc_flags = match resolve_vendored_includes(used_deps, target) {
+        let inc_flags = match resolve_vendored_includes(used_deps, target, natives) {
             Some(f) => match ffi_struct_defines(types_file, types_text, "", target, "-I{resolve_archive_dir()} {f}", debug_mode, release_mode, mirrors) {
                 Ok(d) => "{f}{d}"
                 Err(rc) => return rc
@@ -3367,7 +3462,7 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
         return 0
     }
     let first_triple = resolve_target_triple(targets.get(0).unwrap())
-    let inc_flags = match resolve_vendored_includes(used_deps, first_triple) {
+    let inc_flags = match resolve_vendored_includes(used_deps, first_triple, natives) {
         Some(f) => f
         None => return 1
     }
@@ -3392,8 +3487,8 @@ fn link_units_all_targets(source_path: Str, output_path: Str, work: Str, units_d
     while i < targets.len() {
         let alias = targets.get(i).unwrap()
         let triple = resolve_target_triple(alias)
-        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs)
-        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build) {
+        let link_flags = build_link_flags(triple, has_async, used_deps, ffi_libs, natives)
+        let obj_files = match resolve_vendored_objects(used_deps, debug_mode, release_mode, triple, test_build, natives) {
             Some(o) => o
             None => return 1
         }

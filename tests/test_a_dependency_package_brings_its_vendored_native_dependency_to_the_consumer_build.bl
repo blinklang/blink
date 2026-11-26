@@ -1,0 +1,105 @@
+// A package's [native-dependencies] go with the package (§9.1.2). When another package
+// depends on it, the consumer's build compiles and links each vendored source the dependency
+// declares, with the source's dir on the include path, and resolves each `path` from the
+// dir of the package that declares it, not from the consumer's.
+import std.process.{ProcessResult}
+
+fn sh(cmd: Str) -> ProcessResult ! Process.Spawn {
+    process.run("sh", ["-c", cmd]).unwrap()
+}
+
+fn pkg_manifest(name: Str, deps: Str, native: Str) -> Str {
+    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n{deps}{native}"
+}
+
+let NATIVE = "\n[native-dependencies]\naddc = \{ type = \"vendored\", path = \"vendor/addc.c\" \}\n"
+
+// The library package `addlib`, with a vendored C source that adds two longs.
+fn write_lib(dir: Str, ffi_args: Str, extra: Str) ! FS.Write, Process.Spawn {
+    let _ = sh("mkdir -p {dir}/src {dir}/vendor")
+    fs.write("{dir}/blink.toml", pkg_manifest("addlib", "", NATIVE)).unwrap()
+    fs.write("{dir}/audits.toml", "[ADD-1]\nclaim = \"two longs in, long out\"\n").unwrap()
+    fs.write("{dir}/vendor/addc.h", "#define ADDC_BASE 40\nlong addc_add(long a, long b);\n").unwrap()
+    fs.write("{dir}/vendor/addc.c", "#include \"addc.h\"\nlong addc_add(long a, long b) \{ return a + b; \}\n").unwrap()
+    fs.write("{dir}/src/addlib.bl", "@ffi({ffi_args})\n@trusted(audit: \"ADD-1\")\nfn raw_add(a: Int, b: Int) -> Int ! ()\n\npub fn add(a: Int, b: Int) -> Int \{ raw_add(a, b) \}\n{extra}").unwrap()
+}
+
+fn write_app(dir: Str, dep_name: Str, dep_rel: Str, main_src: Str) ! FS.Write, Process.Spawn {
+    let _ = sh("mkdir -p {dir}/src")
+    fs.write("{dir}/blink.toml", pkg_manifest("app", "\n[dependencies]\n{dep_name} = \{ path = \"{dep_rel}\" \}\n", "")).unwrap()
+    fs.write("{dir}/src/main.bl", main_src).unwrap()
+}
+
+// Builds app/src/main.bl in app/ and runs the program. Answers the build's result and the
+// program's output.
+fn build_app(root: Str) -> (ProcessResult, Str) ! Process.Spawn {
+    let r = sh("B=$(pwd)/build/blink; cd {root}/app && timeout 300 $B build src/main.bl -o {root}/out")
+    let ran = if r.success() { sh("{root}/out").out } else { "" }
+    (r, ran)
+}
+
+let ADD_MAIN = "import addlib\n\nfn main() \{\n    io.println(\"\{addlib.add(2, 3)}\")\n}\n"
+
+fn new_root() -> Str ! Process.Spawn {
+    sh("mktemp -d /tmp/blink_dep_native.XXXXXX").out.trim()
+}
+
+test "a binding with a header in a dependency builds and links its vendored source" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let (r, ran) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "5\n")
+}
+
+test "a binding with no header in a dependency links its vendored source" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\"", "")
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let (r, ran) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "5\n")
+}
+
+test "a vendored path resolves from its own package in a transitive dependency" {
+    let root = new_root()
+    write_lib("{root}/deps/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    let mid = "{root}/mid"
+    let _ = sh("mkdir -p {mid}/src")
+    fs.write("{mid}/blink.toml", pkg_manifest("mid", "\n[dependencies]\naddlib = \{ path = \"../deps/lib\" \}\n", "")).unwrap()
+    fs.write("{mid}/src/mid.bl", "import addlib\n\npub fn add3(a: Int, b: Int, c: Int) -> Int \{ addlib.add(addlib.add(a, b), c) \}\n").unwrap()
+    write_app("{root}/app", "mid", "../mid", "import mid\n\nfn main() \{\n    io.println(\"\{mid.add3(1, 2, 3)}\")\n}\n")
+    let (r, ran) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "6\n")
+}
+
+test "a foreign constant of a dependency names a key that the dependency declares" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "\n@ffi(\"addc\", \"ADDC_BASE\", header: \"addc.h\")\npub let BASE: Int\n")
+    write_app("{root}/app", "addlib", "../lib", "import addlib\n\nfn main() \{\n    io.println(\"\{addlib.add(addlib.BASE, 2)}\")\n}\n")
+    let (r, ran) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r.success(), "got: {r.out}{r.err_out}")
+    assert_eq(ran, "42\n")
+}
+
+test "an edit to a dependency's vendored source reaches the next build" {
+    let root = new_root()
+    write_lib("{root}/lib", "\"addc\", \"addc_add\", header: \"addc.h\"", "")
+    write_app("{root}/app", "addlib", "../lib", ADD_MAIN)
+    let (r1, ran1) = build_app(root)
+    // mtime has a coarse grain on some file systems; the edit must read as newer.
+    let _ = sh("sleep 1")
+    fs.write("{root}/lib/vendor/addc.c", "#include \"addc.h\"\nlong addc_add(long a, long b) \{ return a + b + 100; \}\n").unwrap()
+    let (r2, ran2) = build_app(root)
+    let _ = sh("rm -rf {root}")
+    assert(r1.success(), "got: {r1.out}{r1.err_out}")
+    assert_eq(ran1, "5\n")
+    assert(r2.success(), "got: {r2.out}{r2.err_out}")
+    assert_eq(ran2, "105\n")
+}

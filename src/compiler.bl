@@ -656,7 +656,7 @@ fn note_config_text(path: Str, text: Str) -> Str {
 // Given a src_root like "examples/with_deps/mathlib/src/", return the path
 // of the sibling blink.toml. Falls back to cwd "blink.toml" for loose files
 // (src_root == "").
-fn manifest_path_for_src_root(src_root: Str) -> Str {
+pub fn manifest_path_for_src_root(src_root: Str) -> Str {
     if src_root == "" {
         return "blink.toml"
     }
@@ -769,6 +769,46 @@ fn compiler_get_home() -> Str ! Env.Read {
     env.var("HOME") ?? ""
 }
 
+// The dir a blink.lock package's source names: a path source as the lock spells it, relative
+// to the project root, or a git source's checkout in the cache. "" for any other source.
+pub fn lock_source_dir(source: Str) -> Str ! Env.Read {
+    let mut base_dir = ""
+    if source.starts_with("path:") {
+        base_dir = source.byte_slice(5, source.byte_len())
+    } else if source.starts_with("git:") {
+        let home = compiler_get_home()
+        let mut url_part = source.byte_slice(4, source.byte_len())
+        // Strip #commit suffix
+        let mut hash_pos = -1
+        let mut i = 0
+        while i < url_part.byte_len() {
+            if url_part.byte_at(i) == 35 { // '#'
+                hash_pos = i
+            }
+            i = i + 1
+        }
+        let mut commit_hash = ""
+        if hash_pos > 0 {
+            commit_hash = url_part.byte_slice(hash_pos + 1, url_part.byte_len())
+            url_part = url_part.byte_slice(0, hash_pos)
+        }
+        // Convert URL to cache dir name (replace non-alphanumeric with _)
+        let mut cache_name = ""
+        i = 0
+        while i < url_part.byte_len() {
+            let ch = url_part.byte_at(i)
+            if (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57) { // 'a'..'z', 'A'..'Z', '0'..'9'
+                cache_name = cache_name.concat(url_part.byte_slice(i, i + 1))
+            } else {
+                cache_name = cache_name.concat("_")
+            }
+            i = i + 1
+        }
+        base_dir = path_join(home, path_join(".blink/cache/git", path_join(cache_name, commit_hash)))
+    }
+    base_dir
+}
+
 fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag.Report, FS.Read, Env.Read {
     if lockfile_pkg_count() == 0 {
         return None
@@ -854,43 +894,7 @@ fn resolve_from_lockfile(dotted_path: Str, _src_root: Str) -> Option[Str] ! Diag
 
     // Found a matching package — resolve to its source path
     let pkg_idx = lockfile_find_pkg(pkg_name)
-    let source = lock_pkg_sources.get(pkg_idx).unwrap()
-
-    let mut base_dir = ""
-    if source.starts_with("path:") {
-        base_dir = source.byte_slice(5, source.byte_len())
-    } else if source.starts_with("git:") {
-        let home = compiler_get_home()
-        let mut url_part = source.byte_slice(4, source.byte_len())
-        // Strip #commit suffix
-        let mut hash_pos = -1
-        let mut i = 0
-        while i < url_part.byte_len() {
-            if url_part.byte_at(i) == 35 { // '#'
-                hash_pos = i
-            }
-            i = i + 1
-        }
-        let mut commit_hash = ""
-        if hash_pos > 0 {
-            commit_hash = url_part.byte_slice(hash_pos + 1, url_part.byte_len())
-            url_part = url_part.byte_slice(0, hash_pos)
-        }
-        // Convert URL to cache dir name (replace non-alphanumeric with _)
-        let mut cache_name = ""
-        i = 0
-        while i < url_part.byte_len() {
-            let ch = url_part.byte_at(i)
-            if (ch >= 97 && ch <= 122) || (ch >= 65 && ch <= 90) || (ch >= 48 && ch <= 57) { // 'a'..'z', 'A'..'Z', '0'..'9'
-                cache_name = cache_name.concat(url_part.byte_slice(i, i + 1))
-            } else {
-                cache_name = cache_name.concat("_")
-            }
-            i = i + 1
-        }
-        base_dir = path_join(home, path_join(".blink/cache/git", path_join(cache_name, commit_hash)))
-    }
-
+    let base_dir = lock_source_dir(lock_pkg_sources.get(pkg_idx).unwrap())
     if base_dir == "" {
         return None
     }
