@@ -5724,17 +5724,33 @@ The same rule holds in a type position. A bare row after a function type whose r
 
 When the body of a declaration performs an effect that only the returned function type declares, or the reverse, the ordinary `UndeclaredEffect` check fires. If the return type of that declaration is a function type, the error has a `note:` that says which function owns the row that is written.
 
-The effect annotation on a function type is part of the type identity. `fn(Int) -> Int` and `fn(Int) -> Int ! IO` are different types — the compiler rejects passing an effectful callback where a pure one is expected:
+The effect annotation on a function type is part of the type. `fn(Int) -> Int` and `fn(Int) -> Int ! IO` are different types, and the compiler rejects an effectful callback where a pure one is expected:
+
+```blink
+fn apply(f: fn(Int) -> Int, x: Int) -> Int {
+    f(x)
+}
+
+fn main() ! IO.Log {
+    let logger = fn(n: Int) -> Int ! IO.Log {
+        io.log("got {n}")
+        n
+    }
+    apply(logger, 42)                 // ERROR E0574
+}
+```
 
 ```
 error[EffectMismatchInFnType]: effect mismatch in function type
- --> app.bl:5:12
-  |
-5 |     apply(logger, 42)
-  |           ^^^^^^ expected pure `fn(Int) -> Int`, found `fn(Int) -> Int ! IO.Log`
-  |
-  = note: `apply` requires a pure callback
-  = fix: use a HOF that accepts effectful callbacks, or remove effects from the callback
+  --> app.bl:10:11
+   |
+10 |     apply(logger, 42)
+   |           ^^^^^^ expected pure `fn(Int) -> Int`, found `fn(Int) -> Int ! IO.Log`
+   |
+   = note: `apply` requires a pure callback
+   = note: `logger` declares `IO.Log` at 6:38
+   = help: to let `apply` take an effectful callback, write `fn apply(f: fn(Int) -> Int ! _, x: Int) -> Int ! _` (§4.15.2)
+   = help: or remove `IO.Log` from the callback
 ```
 
 The reverse is safe: a pure callback satisfies an effectful parameter (pure is a subtype of effectful — a function that *can* do IO doesn't *have to*):
@@ -5748,6 +5764,106 @@ fn for_each(items: List[T], f: fn(T) -> () ! IO.Log) ! IO.Log {
 
 // OK: pure fn passed where effectful fn expected
 for_each(names, fn(name) { let _ = name.len() })
+```
+
+**When a function value fits a function type.** A value of type `fn(A) -> B ! R1` fits where `fn(A2) -> B2 ! R2` is expected when `A2` fits `A`, `B` fits `B2`, and each effect of `R1` is in `R2`. A sub-effect is in its parent (`IO.Log` is in `IO`), and a `_` in `R2` takes any row. The rule holds at each depth. In a parameter position it runs the other way, because the value calls what it receives:
+
+```blink
+fn run_pure(cb: fn() -> Int) -> Int {
+    cb()
+}
+
+fn run_any(cb: fn() -> Int ! IO.Log) -> Int ! IO.Log {
+    cb()
+}
+
+fn main() {
+    let a: fn(fn() -> Int) -> Int ! IO.Log = run_any         // OK: `run_any` takes a pure callback too
+    let s: fn(fn() -> Int ! IO.Log) -> Int = run_pure        // ERROR E0574
+}
+```
+
+```
+error[EffectMismatchInFnType]: effect mismatch in function type
+  --> app.bl:11:46
+   |
+11 |     let s: fn(fn() -> Int ! IO.Log) -> Int = run_pure
+   |                                              ^^^^^^^^ parameter 1: expected `fn() -> Int ! IO.Log`, found pure `fn() -> Int`
+   |
+   = note: `run_pure` calls its callback as pure, and through `s` it would get one that does `IO.Log`
+   = help: give `s` a pure callback type, `fn(fn() -> Int) -> Int`, or let `run_pure` take an effectful callback (§4.15.2)
+```
+
+`EffectMismatchInFnType` (E0574) fires when the two function types have the same parameter and return types and only a row does not fit. If a parameter or return type also differs, `TypeError` (E0300) fires alone. One site gets one of the two errors, never both. E0574 is an error, so `@allow` does not apply to it, and it has no machine-applicable fix: the writer chooses between a wider slot and a callback with fewer effects.
+
+It fires at each place where a value meets a declared type: the sites of `InsufficientHandlerCoverage` (E0563, §4.7.1), and each element of a list or map literal that has a declared element type. A `let` with no type takes the full row of its value, so it never fires there:
+
+```blink
+fn main() ! IO.Log {
+    let f = fn() -> Int {
+        io.log("x")
+        1
+    }                                // OK: `f` is `fn() -> Int ! IO.Log`
+    let g: fn() -> Int = f            // ERROR E0574: annotated `let`
+}
+```
+
+When the value is a fn literal with an inferred row, the error points at the literal, and a `note:` names the first operation in its body that adds an effect the slot lacks:
+
+```blink
+fn apply(f: fn(Int) -> Int, x: Int) -> Int {
+    f(x)
+}
+
+fn main() ! IO.Log {
+    apply(fn(n) {
+        io.log("got {n}")
+        n
+    }, 42)                            // ERROR E0574
+}
+```
+
+```
+error[EffectMismatchInFnType]: effect mismatch in function type
+ --> app.bl:6:11
+  |
+6 |     apply(fn(n) {
+  |           ^^^^^^^ expected pure `fn(Int) -> Int`, found `fn(Int) -> Int ! IO.Log`
+  |
+  = note: `io.log` at 7:9 adds `IO.Log`
+  = note: `apply` requires a pure callback
+  = help: to let `apply` take an effectful callback, write `fn apply(f: fn(Int) -> Int ! _, x: Int) -> Int ! _` (§4.15.2)
+  = help: or remove `IO.Log` from the callback
+```
+
+**A function type inside a type argument.** In a type argument (`List`, `Map`, `Option`, `Result`, a tuple), the row of a function type must match the expected row exactly. Each element of a list or map literal fits on its own, by the rule above. A row slot `T[! R]` follows §4.15.5.
+
+```blink
+fn pure_f() -> Int {
+    1
+}
+
+fn eff_f() -> Int ! IO.Log {
+    io.log("eff")
+    2
+}
+
+fn main() ! IO.Log {
+    let ps: List[fn() -> Int] = [pure_f]
+    let fs: List[fn() -> Int ! IO.Log] = [pure_f, eff_f]   // OK: each element fits
+    let es: List[fn() -> Int ! IO.Log] = ps                // ERROR E0574
+}
+```
+
+```
+error[EffectMismatchInFnType]: effect mismatch in function type
+  --> app.bl:13:42
+   |
+13 |     let es: List[fn() -> Int ! IO.Log] = ps
+   |                                          ^^ expected `List[fn() -> Int ! IO.Log]`, found `List[fn() -> Int]`
+   |
+   = note: rows inside a type argument must match
+   = help: give `ps` the type `List[fn() -> Int ! IO.Log]`
 ```
 
 #### 4.15.2 Wildcard Effect Forwarding
@@ -6139,7 +6255,7 @@ test "map with mock DB" {
 
 **Closures (§2.8):** Closures used as effectful callbacks follow the same capture rules. Effect annotations on the closure type describe what the closure *body* does, not what it captures.
 
-**A closure is charged at its call.** Making a closure charges nothing (§2.20). Its row stays on its type (§4.15.1). A call of the closure charges the row at that call, under the handlers in force there (§4.7), and a pass to a `! _` parameter charges it at that call (§4.15.2 rule 5). A closure that nothing calls is never charged. This holds for `UndeclaredEffect` (E0500) in every fn and for `UnhandledEffect` (E0539) at a root. No call is hidden, because the row travels with the value through a parameter, a field, a list element and a return type. A slot whose type is pure takes no effectful closure (`EffectMismatchInFnType`, §4.15.1).
+**A closure is charged at its call.** Making a closure charges nothing (§2.20). Its row stays on its type (§4.15.1). A call of the closure charges the row at that call, under the handlers in force there (§4.7), and a pass to a `! _` parameter charges it at that call (§4.15.2 rule 5). A closure that nothing calls is never charged. This holds for `UndeclaredEffect` (E0500) in every fn and for `UnhandledEffect` (E0539) at a root. No call is hidden, because the row travels with the value through a parameter, a field, a list element and a return type. A slot whose type is pure takes no effectful closure (`EffectMismatchInFnType`, E0574, §4.15.1).
 
 ```blink
 effect Counter {
