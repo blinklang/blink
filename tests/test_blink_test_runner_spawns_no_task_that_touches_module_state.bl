@@ -1,0 +1,34 @@
+// A task that `blink test` spawns runs beside the main task, so it must not touch a module
+// `let mut` (SpawnTouchesModuleState, sections/04_effects.md §4.16.6). The check reports each
+// such spawn on the trace channel `blink.state_spawn` until it turns into an error, so this
+// file reads that channel over the CLI source. build/blinkc is the compiler under test: the
+// corpus links it to the gen1 build of this tree.
+
+import std.fs
+import std.process
+
+fn spawn_trace(path: Str) -> Str ! Process.Spawn {
+    process.run("sh", ["-c", "env BLINK_TRACE_CHANNELS=blink.state_spawn build/blinkc {path} /dev/null 2>&1; echo exit=$?"]).unwrap().out
+}
+
+// Without this row, a compiler that has no such channel would pass the next one.
+test "the spawn check traces a spawned task that writes module state" {
+    let path = "build/runner_spawn_probe.bl"
+    fs.write(path, #"let mut hits = 0
+
+fn hit() { hits = hits + 1 }
+
+fn main() {
+    async.scope { async.spawn(fn() { hit() }) }
+}
+"#).unwrap()
+    let out = spawn_trace(path)
+    let _ = fs.delete(path)
+    assert(out.contains("[trace:blink.state_spawn]") && out.contains("writes hits"), "the channel printed no line for the probe:\n{out}")
+}
+
+test "the blink test runner spawns no task that touches module state" {
+    let out = spawn_trace("src/cli.bl")
+    assert(!out.contains("[trace:blink.state_spawn]"), "a spawned task touches module state:\n{out}")
+    assert(out.contains("exit=0"), "src/cli.bl does not compile:\n{out}")
+}
