@@ -3309,7 +3309,71 @@ fn insert_user(s: Stmt, id: Int, name: Str) -> Result[Void, DBError] ! DB.Read, 
 }
 ```
 
-**A `Stmt` is a token that the handler makes.** A `Stmt` has no field that code can read. The handler of `DB` makes it in `prepare` and keeps the real statement. `Stmt.mock(id)` is a pure function of `std.db`. It has no effect row and takes an `Int` key. "mock" means that a handler made the `Stmt`. It does not mean that the `Stmt` is for tests only. There is no getter that reads the key back. A handler that wraps a real driver can make `Stmt` values too.
+**A `Stmt` is a token that the handler makes.** A `Stmt` has no field that code can read. The handler of `DB` makes it in `prepare` and keeps the real statement. `Stmt.new()` in `std.db` makes a token. It is the only way to make one:
+
+```blink
+pub fn Stmt.new() -> Stmt ! State
+```
+
+Each call of `Stmt.new()` gives a new token, and that token is not `==` to any other token. A driver and a mock make tokens in the same way, so a token does not show which handler made it. Each handler keeps its own record of the tokens that it made, usually a `Map[Stmt, ...]` that the handler captures (§4.7.2 shows a driver). A token that is not in this record is a token that the handler did not make. There is no getter that reads a value back from a token.
+
+**Why `Stmt.new()` has `State` in its row.** A call with an empty row is pure, so a compiler may reuse, merge, move or delete it (§4.16.3; §3.6 *Hash Contract and Seeding*; §9.1 *What `! ()` Claims on an `@ffi` Decl*). With an empty row, two calls of `Stmt.new()` could give the same token. `State` stops this, and it has no run-time cost (§4.16.1). `Map.new()` needs no row: code sees that a map is new through the writes to it, but code sees that a token is new only through `==`. A private fn that calls `Stmt.new()` gets `State` in its effective row with no change to its signature. A `pub fn` writes `State` in its row (E0552). `main` and each test block hold `State`, so a test can call `Stmt.new()` as written. A driver puts `State` in the clause row of its handler for the same reason: its `prepare` clause calls `Stmt.new()`.
+
+```blink
+fn two_tokens() -> (Stmt, Stmt) {     // private: the effective row gets `State`
+    (Stmt.new(), Stmt.new())
+}
+
+pub fn one_token() -> Stmt ! State {  // pub: the row names `State`
+    Stmt.new()
+}
+
+test "two calls give two tokens" {
+    let (a, b) = two_tokens()
+    assert(a != b)
+    assert(a == a)
+}
+```
+
+A `pub fn` that calls `Stmt.new()` and does not write `State` is `UndeclaredModuleState` (E0552). The note names the call and says why its row has `State`:
+
+```
+error[UndeclaredModuleState]: `fresh` touches module state but does not declare `State`
+ --> src/fake.bl:3:8
+  |
+3 | pub fn fresh() -> Stmt {
+  |        ^^^^^ a public function declares `State` in its row
+  |
+  = note: calls `Stmt.new` at src/fake.bl:4:5; each call makes a new token, so its row has `State`
+  = help: add `State` to the row: `pub fn fresh() -> Stmt ! State`
+```
+
+**`Eq` and `Hash`.** A token holds a hidden serial that the runtime fills in. `==` and `Hash` compare this serial as a value. Copies of one token are equal. Two tokens from two calls of `Stmt.new()` are never equal. A `Hash` of a token is stable for the life of the program, so a token is a good key for a `Map`. Code cannot read the serial.
+
+**`Debug` shows `Stmt(fresh)`.** Every token prints the same text:
+
+```blink
+// Stmt(fresh)    the Debug text of every Stmt
+```
+
+The text holds no serial. It is not a format: code must not parse it or compare it. Two tokens that are not equal print the same text, so only `==` tells two tokens apart. `Debug` lets `assert_eq` take a `Stmt` (§2.20 *Built-in Assertions*), and it lets `@derive(Debug)` work on a type that holds one:
+
+```blink
+@derive(Eq, Debug)
+type Prepared {
+    stmt: Stmt
+    sql: Str
+}
+
+test "a copy of a token is equal to it" {
+    let a = Stmt.new()
+    let b = a
+    assert_eq(a, b)
+    assert_ne(a, Stmt.new())
+    assert_eq(Prepared { stmt: a, sql: "SELECT 1" }, Prepared { stmt: b, sql: "SELECT 1" })
+    // when an assertion fails, each token prints as Stmt(fresh)
+}
+```
 
 An operation on a `Stmt` has three failure cases. An operation that returns a `Result` gives a defined `Err` in each case, and does not panic:
 
@@ -3321,7 +3385,7 @@ The `column_*` operations return no `Result`. In each of the three cases above, 
 
 The first case is also the result when a program keeps a `Stmt` past the `with` of one connection and uses it under the handler of a second connection. §4.7.2 (*Scoped effect handlers*) shows this with the connections of a driver package.
 
-**Release.** `s.finalize()` frees the statement at once. A second `finalize` does nothing and gives `Ok(())`. `finalize` also clears the record that the handler keeps of the `Stmt`. When the `with` of a driver's connection exits, the driver finalizes every `Stmt` that is still open. That holds when the `with` exits by `?`, by `return`, by `break`, and by panic. The exit does not finalize a `Stmt` again that `finalize` freed.
+**Release.** `s.finalize()` frees the statement at once. A second `finalize` does nothing and gives `Ok(())`. `finalize` keeps the `Stmt` in the record of the handler and marks it as finalized. A later operation on it then gets the third Err above, not the first. When the `with` of a driver's connection exits, the driver finalizes every `Stmt` that is still open. That holds when the `with` exits by `?`, by `return`, by `break`, and by panic. The exit does not finalize a `Stmt` again that `finalize` freed.
 
 `Stmt` is `Closeable` (§3.6, §5.5). Its `close` performs the `finalize` operation through the handler. It never calls the driver directly, so `with ... as` works under a mock handler:
 
@@ -3355,14 +3419,15 @@ fn finalize_twice() -> Result[Void, DBError] ! DB {
 }
 ```
 
-**Mock handlers.** A mock `DB` handler makes a `Stmt` in its `prepare` clause with `Stmt.mock`. Its other clauses see every `Stmt` operation:
+**Mock handlers.** A mock `DB` handler makes its tokens with `Stmt.new()` in the fn that builds the handler, before the `handler` expression. Its `prepare` clause returns one of them, and its other clauses see every `Stmt` operation. The builder fn has `State` in its row, and the clause row of the handler stays empty:
 
 ```blink
-fn scripted_db() -> Handler[DB] {
+fn scripted_db() -> Handler[DB] ! State {
+    let s1 = Stmt.new()
     handler DB {
         fn query(sql: Template[DB]) -> Result[List[Row], DBError] { Ok([]) }
         fn query_one(sql: Template[DB]) -> Result[Option[Row], DBError] { Ok(None) }
-        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] { Ok(Stmt.mock(1)) }
+        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] { Ok(s1) }
         fn bind_int(s: Stmt, idx: Int, val: Int) -> Result[Void, DBError] { Ok(()) }
         fn bind_text(s: Stmt, idx: Int, val: Str) -> Result[Void, DBError] { Ok(()) }
         fn column_int(s: Stmt, idx: Int) -> Int { 7 }
@@ -3387,18 +3452,43 @@ test "a mock answers every Stmt op" {
 }
 ```
 
-The mock has an empty clause row, so the `with` is charged no `FS`, `Time` or `Rand`.
+The mock has an empty clause row, so the `with` is charged no `FS`, `Time` or `Rand`. A test block holds `State`, so the call of `scripted_db()` needs no change to the test.
+
+**`Stmt.new()` inside a clause.** A clause that calls `Stmt.new()` puts `State` in the clause row. The type of the handler is then `Handler[DB ! State]`, not `Handler[DB]`. A driver does this on purpose (§4.7.2). A mock that declares `Handler[DB]` gets the type mismatch of §4.7.1 (*The clause row*):
+
+```blink
+fn counting_db() -> Handler[DB] {
+    handler DB {
+        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] { Ok(Stmt.new()) }
+        // the other clauses as in scripted_db
+    }
+}
+```
+
+```
+error[TypeError]: mismatched types
+ --> db.bl:1:21
+  |
+1 | fn counting_db() -> Handler[DB] {
+  |                     ^^^^^^^^^^^ expected `Handler[DB]`, found `Handler[DB ! State]`
+  |
+  = note: the operations of this handler perform `State` outside the handler
+  = fix: write the row in the declared type: `Handler[DB ! State]`
+```
+
+To keep the clause row empty, make the tokens before the `handler` expression, as `scripted_db` does.
 
 **A handler that omits a `Stmt` operation.** The `Stmt` operations are primitive operations of `DB`. A `DB` handler that leaves one out compiles. This is the forward case of §4.7.1 (*Completeness and auto-delegation*), with no exception. The omitted operation goes to the enclosing handler of `DB`, and the forward performs `DB` outside the handler. So the clause row of the handler has `DB`, and its type is `Handler[DB ! DB]`, not `Handler[DB]`.
 
 The enclosing handler did not make the `Stmt`. It answers with the first Err above. A mock that omits `step`, run under the connection of a driver, gives this:
 
 ```blink
-fn no_step_db() -> Handler[DB ! DB] {
+fn no_step_db() -> Handler[DB ! DB] ! State {
+    let s1 = Stmt.new()
     handler DB {
         fn query(sql: Template[DB]) -> Result[List[Row], DBError] { Ok([]) }
         fn query_one(sql: Template[DB]) -> Result[Option[Row], DBError] { Ok(None) }
-        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] { Ok(Stmt.mock(1)) }
+        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] { Ok(s1) }
         fn bind_int(s: Stmt, idx: Int, val: Int) -> Result[Void, DBError] { Ok(()) }
         fn bind_text(s: Stmt, idx: Int, val: Str) -> Result[Void, DBError] { Ok(()) }
         fn column_int(s: Stmt, idx: Int) -> Int { 7 }
@@ -3427,7 +3517,7 @@ fn run() -> Result[Void, DBError] ! DB, IO {
 }
 ```
 
-The text of the Err names the owner check of the enclosing handler. It does not name the omitted operation. For a mock, the cause is the omission. A mock author who sees this Err writes the missing clause. A mock that forwards on purpose writes `default.step(s)`, and the forward is then explicit (§4.7.1). A `Stmt` that the mock made with `Stmt.mock` can never succeed at the forward, because no outer handler made it.
+The text of the Err names the owner check of the enclosing handler. It does not name the omitted operation. For a mock, the cause is the omission. A mock author who sees this Err writes the missing clause. A mock that forwards on purpose writes `default.step(s)`, and the forward is then explicit (§4.7.1). A `Stmt` that the mock made with `Stmt.new()` can never succeed at the forward. It is in no record of an outer handler, so the outer handler gives the first Err above.
 
 `DB` is not marked `@handle_all`, so an omitted operation of `DB` gives no `PartialHandler` warning (W0545). An effect that is marked gives W0545 that names each omitted operation (§4.7.1). A driver or mock that must stay complete lists all of the operations above.
 
@@ -4751,9 +4841,9 @@ pub type Connection {
 }
 
 impl Scoped for Connection {
-    type Context = Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]
+    type Context = Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, State)]
 
-    fn enter(self) -> Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)] {
+    fn enter(self) -> Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, State)] {
         sqlite_handler(self.handle)
     }
 
@@ -4768,7 +4858,9 @@ pub fn connect(path: Str) -> Result[Connection, DBError] ! FS.Read, FS.Write, FS
 }
 ```
 
-A program adds the package to blink.toml and imports it. The package `org/name` is imported as `import org.name` (§8.9.7). The `with` discharges `DB`. The enclosing fn declares the clause row that the package declares:
+The clause row ends in `State`, because the `prepare` clause of the handler calls `Stmt.new()` (§4.4.10).
+
+A program adds the package to blink.toml and imports it. The package `org/name` is imported as `import org.name` (§8.9.7). The `with` discharges `DB`. The enclosing fn declares the clause row that the package declares. `setup` is private, so its effective row gets `State` with no change to its signature (§4.16.1). A `pub fn` that holds the `with` writes `State` in its row too (E0552):
 
 ```blink
 // blink.toml  [dependencies]  blinklang/sqlite = "0.1"
@@ -4786,7 +4878,50 @@ fn setup() -> Result[Void, DBError]
 
 A driver package exports `connect`, and `connect` returns `Result[Connection, DBError]`, where `Connection` implements `Scoped` with a `Context` of `Handler[DB ! R]`. This is a convention for driver packages, not a rule the compiler checks. (Panel vote: 6-0. See [Database Driver Package rationale](../decisions/db-driver-package.md).)
 
-The handler of a driver's connection owns the `Stmt` values that it makes (§4.4.10). When the `with` exits, the driver finalizes every `Stmt` that is still open. A `Stmt` kept past its `with` and used under the handler of a second connection gives `Err(ExecError("statement belongs to another connection"))`:
+The handler of a driver's connection owns the `Stmt` values that it makes (§4.4.10). It keeps them in a map that the handler captures. `prepare` makes a token with `Stmt.new()` and adds it to the map. `finalize` keeps the token in the map and marks it as finalized. Each other clause looks up its token first. This part of `sqlite_handler` shows `prepare`, `step` and `finalize`. `sqlite_prepare`, `sqlite_step` and `sqlite_finalize` are private functions of the package:
+
+```blink
+type Entry {
+    Open(raw: RawStmt)
+    Finalized
+}
+
+fn sqlite_handler(handle: Sqlite3)
+    -> Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, State)] {
+    let mut stmts: Map[Stmt, Entry] = Map.new()
+    handler DB {
+        fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] {
+            let raw = sqlite_prepare(handle, sql)?
+            let s = Stmt.new()
+            stmts.insert(s, Entry.Open(raw))
+            Ok(s)
+        }
+        fn step(s: Stmt) -> Result[Int, DBError] {
+            match stmts.get(s) {
+                Some(Open(raw)) => sqlite_step(handle, raw)
+                Some(Finalized) => Err(ExecError("statement is finalized"))
+                None => Err(ExecError("statement belongs to another connection"))
+            }
+        }
+        fn finalize(s: Stmt) -> Result[Void, DBError] {
+            match stmts.get(s) {
+                Some(Open(raw)) => {
+                    sqlite_finalize(raw)
+                    stmts.insert(s, Entry.Finalized)
+                    Ok(())
+                }
+                Some(Finalized) => Ok(())    // a second finalize does nothing
+                None => Err(ExecError("statement belongs to another connection"))
+            }
+        }
+        // the other operations of DB look up the token in the same way
+    }
+}
+```
+
+A token from a mock, or from the handler of another connection, is not in `stmts`, so the driver gives the first Err of §4.4.10. A finalized token stays in `stmts`, so a later operation on it gives `Err(ExecError("statement is finalized"))`.
+
+When the `with` exits, the driver finalizes every `Stmt` that is still open. A `Stmt` kept past its `with` and used under the handler of a second connection gives `Err(ExecError("statement belongs to another connection"))`:
 
 ```blink
 import std.db
@@ -6603,7 +6738,7 @@ pub fn last_size_ok() -> Int ! State { lib_last_size() }
 - each `pub` method,
 - each method in a trait `impl`.
 
-A boundary function whose body touches module state, and whose row does not name `State`, is `UndeclaredModuleState` (E0552). This is also the code when the only cause is a call to a function that declares `State`; E0500 does not fire for `State`. The diagnostic has one `note:` line for each binding the function touches. The note names the binding, says whether it is read or written, and gives the location of the access. When the access is in a callee, the note also names the call. The fix adds `State` to the row, and it is machine-applicable (§8.6).
+A boundary function whose body touches module state, and whose row does not name `State`, is `UndeclaredModuleState` (E0552). This is also the code when the only cause is a call to a function that declares `State`; E0500 does not fire for `State`. The diagnostic has one `note:` line for each binding the function touches. The note names the binding, says whether it is read or written, and gives the location of the access. When the access is in a callee, the note also names the call. When `State` comes from a call that touches no binding, such as a call of `Stmt.new()` (§4.4.10) or of a `! State` `@ffi` decl, the note names that call and says why its row has `State`. The fix adds `State` to the row, and it is machine-applicable (§8.6).
 
 ```blink
 let mut count = 0
