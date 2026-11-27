@@ -177,7 +177,7 @@ BLINK_RT_FN blink_sqlite3_stmt* blink_sqlite3_prepare(blink_sqlite3_conn* c, con
 BLINK_RT_FN blink_db_stmt* blink_sqlite3_stmt_token(blink_sqlite3_stmt* s);
 #ifndef BLINK_NATIVE_SHIMS_DECLS_ONLY
 BLINK_RT_FN blink_db_stmt* blink_sqlite3_stmt_token(blink_sqlite3_stmt* s) {
-    return blink_db_stmt_new(s ? (void*)s->conn : NULL, (void*)s, 0);
+    return blink_db_stmt_new(s ? (void*)s->conn : NULL, (void*)s);
 }
 #endif
 

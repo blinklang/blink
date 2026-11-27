@@ -674,6 +674,16 @@ stmt.finalize()                 // free statement (DB.Read); a second finalize d
 // The connection's `with` finalizes every open Stmt when it exits, also on panic.
 // A Stmt used under a handler that did not make it: Err(ExecError("statement belongs to another connection")).
 // A mock DB handler that omits a Stmt op forwards it to the outer handler and gets that Err (§4.4.10).
+Stmt.new()                      // -> Stmt ! State: a new token, == only to its copies; Eq, Hash, Debug "Stmt(fresh)"
+// A mock makes its tokens before the handler, so its clause row stays empty:
+//   fn mock_db() -> Handler[DB] ! State {
+//       let s1 = Stmt.new()
+//       handler DB { fn prepare(_sql: Template[DB]) -> Result[Stmt, DBError] { Ok(s1) } ... }
+//   }
+// Write `! State` on each fn that calls Stmt.new(), also a private one: the compiler does not
+// add State for you yet. Do not call Stmt.new() inside a clause yet: the spec form
+// Handler[DB ! State] (§4.7.2) is not built, so make the tokens up front as above.
+// Not built yet: a Stmt as a Map key, and a Stmt field in a @derive(Debug) type.
 
 // Transactions (effect: DB.Write) — via BlockHandler
 with db.transaction() {         // scoped: auto-commit on success, auto-rollback on error

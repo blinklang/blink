@@ -1,0 +1,203 @@
+// `Stmt.new()` is the one way to make a statement token (sections/04_effects.md §4.4.10).
+// Each call gives a token that is `==` only to its copies. Eq and Hash compare a hidden serial.
+// Debug prints `Stmt(fresh)` for every token. The row is `State`, so no compiler may merge
+// two calls into one token.
+
+import compile_test_helpers
+import std.db
+import std.db_error.{DBError}
+import std.db_row.{Row}
+import std.db_stmt.{Stmt, STEP_DONE}
+
+// These assert and print nothing: the file has a `test.failing` row, so the corpus reads its
+// --test-json report from stdout.
+fn has(out: Str, needle: Str, label: Str) {
+    assert(out.contains(needle), "{label}: want `{needle}` in:\n{out}")
+}
+
+fn clean(out: Str, label: Str) {
+    assert(!out.contains("\"severity\":\"error\""), "{label}: want a clean compile, got:\n{out}")
+}
+
+fn two_tokens() -> (Stmt, Stmt) ! State {
+    (Stmt.new(), Stmt.new())
+}
+
+@derive(Eq)
+type Prepared {
+    stmt: Stmt
+    sql: Str
+}
+
+// A mock that makes its tokens before the handler expression, so the clauses make none.
+// Each clause finds which statement it got with `==`.
+fn two_stmt_db() -> Handler[DB] ! State {
+    let s1 = Stmt.new()
+    let s2 = Stmt.new()
+    let mut handed: List[Stmt] = []
+    handler DB {
+        fn query(_sql: Template[DB]) -> Result[List[Row], DBError] { Ok([]) }
+        fn query_one(_sql: Template[DB]) -> Result[Option[Row], DBError] { Ok(None) }
+        fn prepare(_sql: Template[DB]) -> Result[Stmt, DBError] {
+            let s = if handed.is_empty() { s1 } else { s2 }
+            handed.push(s)
+            Ok(s)
+        }
+        fn bind_int(_s: Stmt, _idx: Int, _val: Int) -> Result[Void, DBError] { Ok(()) }
+        fn bind_text(_s: Stmt, _idx: Int, _val: Str) -> Result[Void, DBError] { Ok(()) }
+        fn column_int(s: Stmt, _idx: Int) -> Int {
+            if s == s1 { 1 } else if s == s2 { 2 } else { 0 }
+        }
+        fn column_text(_s: Stmt, _idx: Int) -> Str { "" }
+        fn reset(_s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn finalize(_s: Stmt) -> Result[Void, DBError] { Ok(()) }
+        fn exec(_sql: Template[DB]) -> Result[Void, DBError] { Ok(()) }
+        fn execute(_sql: Template[DB]) -> Result[Int, DBError] { Ok(1) }
+        fn begin() -> Result[Void, DBError] { Ok(()) }
+        fn commit() -> Result[Void, DBError] { Ok(()) }
+        fn rollback() -> Result[Void, DBError] { Ok(()) }
+        fn step(_s: Stmt) -> Result[Int, DBError] { Ok(STEP_DONE) }
+    }
+}
+
+test "two calls of Stmt.new give two tokens, and a copy is equal" {
+    let (a, b) = two_tokens()
+    assert(a != b)
+    assert(a == a)
+    let c = a
+    assert(c == a)
+    assert(c != b)
+}
+
+test "assert_eq and assert_ne take a Stmt" {
+    let a = Stmt.new()
+    let b = a
+    assert_eq(a, b)
+    assert_ne(a, Stmt.new())
+}
+
+test "a struct that holds a Stmt derives Eq" {
+    let a = Stmt.new()
+    let b = a
+    assert(Prepared { stmt: a, sql: "SELECT 1" } == Prepared { stmt: b, sql: "SELECT 1" })
+    assert(Prepared { stmt: a, sql: "SELECT 1" } != Prepared { stmt: Stmt.new(), sql: "SELECT 1" })
+}
+
+// Two runs with two seeds: a hash differs between processes and is not the serial, which is
+// 1 for the first token of a run.
+fn hash_program() -> Str {
+    #"import std.db_stmt.{Stmt}
+
+fn main() {
+    let a = Stmt.new()
+    let b = a
+    io.println("copy={a.hash() == b.hash()} other={a.hash() != Stmt.new().hash()} h={a.hash()}")
+}
+"#
+}
+
+test "a token hash is equal for copies, is not the serial, and has the process seed" {
+    let r1 = compile_test_helpers.run_via_cli(hash_program(), "stmt_hash_seed", "")
+    let d1 = "{r1.out}{r1.err_out}"
+    assert_eq(r1.exit_code, 0, d1)
+    has(r1.out, "copy=true other=true", "copies hash equal and two tokens hash apart")
+    assert(!r1.out.contains("h=1\n"), d1)
+    let r2 = compile_test_helpers.run_via_cli(hash_program(), "stmt_hash_seed", "")
+    let d2 = "{r2.out}{r2.err_out}"
+    assert_eq(r2.exit_code, 0, d2)
+    assert(r1.out != r2.out, "the hash of the first token must change with the process seed:\n{d1}{d2}")
+}
+
+test "every token prints Stmt(fresh) and no serial" {
+    let (a, b) = two_tokens()
+    assert_eq(a.debug(), "Stmt(fresh)")
+    assert_eq(b.debug(), "Stmt(fresh)")
+}
+
+test.failing(
+    "a struct that holds a Stmt derives Debug, and the field prints Stmt(fresh)",
+    reason: "a derived Debug counts only a derived Debug on a field type, not the written impl on Stmt",
+) {
+    let r = compile_test_helpers.run_via_cli(#"import std.db_stmt.{Stmt}
+@derive(Debug)
+type Prepared {
+    stmt: Stmt
+    sql: Str
+}
+fn main() {
+    io.println(Prepared { stmt: Stmt.new(), sql: "x" }.debug())
+}
+"#, "stmt_field_derive_debug", "")
+    assert_eq(r.exit_code, 0, "{r.out}{r.err_out}")
+    assert(r.out.contains("Stmt(fresh)"), "{r.out}{r.err_out}")
+}
+
+test.failing(
+    "a token is a Map key",
+    reason: "a Map key counts only a derived Hash and Eq, not the written impls on Stmt",
+) {
+    let r = compile_test_helpers.run_via_cli(#"import std.db_stmt.{Stmt}
+fn main() {
+    let a = Stmt.new()
+    let b = Stmt.new()
+    let mut m: Map[Stmt, Int] = Map.new()
+    m.insert(a, 1)
+    m.insert(b, 2)
+    io.println("{m.get(a) == Some(1)} {m.get(b) == Some(2)} {m.get(Stmt.new()) == None}")
+}
+"#, "stmt_map_key", "")
+    assert_eq(r.exit_code, 0, "{r.out}{r.err_out}")
+    assert(r.out.contains("true true true"), "{r.out}{r.err_out}")
+}
+
+test "a mock tells its two statements apart with ==" {
+    with two_stmt_db() {
+        let first = db.prepare("select 1")?
+        let second = db.prepare("select 2")?
+        assert_eq(first.column_int(0), 1)
+        assert_eq(second.column_int(0), 2)
+        assert_eq(Stmt.new().column_int(0), 0)
+    }
+}
+
+fn o2_program() -> Str {
+    #"import std.db_stmt.{Stmt}
+
+fn make() -> Stmt ! State {
+    Stmt.new()
+}
+
+fn main() {
+    let a = make()
+    let b = make()
+    io.println("distinct={a != b} {Stmt.new() != Stmt.new()}")
+}
+"#
+}
+
+test "two calls of Stmt.new are not equal under -O2" {
+    let r = compile_test_helpers.run_via_cli(o2_program(), "stmt_new_o2", "--release")
+    let diag = "{r.out}{r.err_out}"
+    assert_eq(r.exit_code, 0, diag)
+    assert(r.out.contains("distinct=true true"), diag)
+}
+
+test "a pub fn that writes State may call Stmt.new" {
+    let out = compile_test_helpers.compile_and_capture(#"import std.db_stmt.{Stmt}
+pub fn one_token() -> Stmt ! State {
+    Stmt.new()
+}
+fn main() { }
+"#, "stmt_new_pub_state")
+    clean(out, "a pub fn with State calls Stmt.new")
+}
+
+test "Stmt.mock is removed" {
+    let out = compile_test_helpers.compile_and_capture(#"import std.db_stmt.{Stmt}
+fn main() {
+    let _ = Stmt.mock(1)
+}
+"#, "stmt_mock_removed")
+    has(out, "\"code\":\"E0505\"", "a call of Stmt.mock is UnresolvedMethod")
+    has(out, "no member `mock` on type `Stmt`", "the message names mock on Stmt")
+}
