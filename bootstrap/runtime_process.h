@@ -358,7 +358,9 @@ static void blink_child_close_pair(int fds[2]) {
 }
 
 static blink_child_box* blink_child_box_new(const char* cmd) {
-    blink_child_box* b = (blink_child_box*)blink_alloc(sizeof(blink_child_box));
+    /* The box's address is the Child's identity, so it must not be reused while a copy of
+       the Child lives: it outlives any `with arena` it was made in. */
+    blink_child_box* b = (blink_child_box*)blink_alloc_shared(sizeof(blink_child_box));
     pthread_mutex_init(&b->mu, NULL);
     b->cmd = cmd;
     b->handle = -1;
@@ -2064,6 +2066,19 @@ BLINK_RT_FN int64_t blink_child_exec(const char* cmd, const blink_list* args) {
     fflush(stderr);
     execvp(cmd, argv);
     return errno;
+}
+#endif
+
+/* Every copy of a Child holds the same box, so the box's address is the Child's identity
+   (sections/04_effects.md §4.4.8). The collector does not move a box, so the hash stays
+   stable for the life of the Child. It is mixed with the process hash seed like an Int key,
+   so it differs between processes (sections/03_types.md §3.6). */
+BLINK_RT_FN int64_t blink_child_box_same(blink_child_box* a, blink_child_box* b);
+BLINK_RT_FN uint64_t blink_child_box_hash(blink_child_box* box);
+#ifndef BLINK_RUNTIME_DECLS_ONLY
+BLINK_RT_FN int64_t blink_child_box_same(blink_child_box* a, blink_child_box* b) { return a == b; }
+BLINK_RT_FN uint64_t blink_child_box_hash(blink_child_box* box) {
+    return blink_kops_mix_u64(blink_map_seed ^ (uint64_t)(uintptr_t)box);
 }
 #endif
 

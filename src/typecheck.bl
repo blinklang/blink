@@ -16532,9 +16532,17 @@ fn tc_hash_role_words(role: HashRole) -> HashRoleWords {
 }
 
 // Why a key type has no Hash: a Float, a user type with neither a derive nor a written impl, a
-// builtin with no impl, a derived Hash that fails at this instance's arguments, or a written
-// impl whose bounds fail there.
-type HashRefusal { FloatKey, NoDerive, NoImpl, Instance, WrittenInstance }
+// builtin with no impl, a derived Hash that fails at this instance's arguments, a written
+// impl whose bounds fail there, or a handle with no impl (one the program declares, or one
+// the standard library declares).
+type HashRefusal { FloatKey, NoDerive, NoImpl, Instance, WrittenInstance, Handle, StdHandle }
+
+// A declared type with no Hash. A handle has no fields to derive one from, and only the
+// module that declares it may write one, so its fix is not the derive.
+fn tc_no_hash_refusal(decl: Int) -> HashRefusal {
+    if decl < 0 || !ffi_opaque_type_set.contains_key(tc_resolve(tc_decl_tid(decl))) { return HashRefusal.NoDerive }
+    if tc_decl_in_std(decl) { HashRefusal.StdHandle } else { HashRefusal.Handle }
+}
 
 // A type that states Hash and still lacks it at an instance: its derive or its written impl
 // does not hold at the arguments.
@@ -16567,7 +16575,7 @@ fn tc_judge_pending_keys() ! Diag.Report {
     for p in pending {
         nr_current_module = p.module
         if !tc_decl_states_hash(p.decl) {
-            tc_report_unhashable(p.role, HashRefusal.NoDerive, p.shown, p.name, p.node)
+            tc_report_unhashable(p.role, tc_no_hash_refusal(p.decl), p.shown, p.name, p.node)
         } else if p.tid != -1 {
             tc_refuse_unhashable_instance(p.tid, p.node, p.role)
         }
@@ -16595,6 +16603,8 @@ fn tc_report_unhashable(role: HashRole, why: HashRefusal, shown: Str, name: Str,
         HashRefusal.NoImpl => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — {tc_type_name_shown(name)} has no Hash implementation and cannot gain one (containers, ranges, Bytes, StringBuilder, and fn types cannot be {w.plural})", node, "use a hashable scalar (Int/sized-int/Bool/Char/Str), a tuple of hashable types, or a struct/enum with Hash and Eq as the {w.noun} instead")
         HashRefusal.Instance => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — a derived Hash holds only where each type argument its fields use is Hash", node, "use type arguments that are Hash, or derive Hash on the argument types")
         HashRefusal.WrittenInstance => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — the written Hash impl holds only where its bounds hold", node, "use type arguments that meet the bounds of the Hash impl")
+        HashRefusal.Handle => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — a handle type has no fields, so @derive cannot give it Hash", node, "write `impl Hash` and `impl Eq` for `{tc_type_name_shown(name)}`")
+        HashRefusal.StdHandle => diag_error_at("MapKeyNotHashable", MAP_KEY_NOT_HASHABLE, "{w.title} type `{shown}` does not implement Hash — the standard library gives this handle no Hash, and a program cannot give it one", node, "use a value the handle stands for, such as an Int id, as the {w.noun} instead")
     }
 }
 
@@ -16869,7 +16879,7 @@ fn validate_keyed_ann(key_ann: Int, key_tid: Option[Int], role: HashRole) ! Diag
             }
             return
         }
-        tc_report_unhashable(role, HashRefusal.NoDerive, decl_name, key_name, key_ann)
+        tc_report_unhashable(role, tc_no_hash_refusal(decl), decl_name, key_name, key_ann)
         return
     }
     // Deny-by-default: is_primitive_type enumerates every concrete builtin name the
@@ -16957,7 +16967,7 @@ fn tc_refuse_unhashable_tid_in(tid0: Int, role: HashRole, node: Int, visiting: L
             tc_defer_key(node, role, shown, bname, tid, decl)
             return
         }
-        let why = if tc_decl_states_hash(decl) { tc_instance_hash_refusal(decl) } else { HashRefusal.NoDerive }
+        let why = if tc_decl_states_hash(decl) { tc_instance_hash_refusal(decl) } else { tc_no_hash_refusal(decl) }
         tc_report_unhashable(role, why, shown, bname, node)
         return
     }

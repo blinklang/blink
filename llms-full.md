@@ -683,7 +683,7 @@ Stmt.new()                      // -> Stmt ! State: a new token, == only to its 
 // Write `! State` on each fn that calls Stmt.new(), also a private one: the compiler does not
 // add State for you yet. Do not call Stmt.new() inside a clause yet: the spec form
 // Handler[DB ! State] (§4.7.2) is not built, so make the tokens up front as above.
-// Not built yet: a Stmt as a Map key, and a Stmt field in a @derive(Debug) type.
+// Not built yet: a Stmt field in a @derive(Debug) type.
 
 // Transactions (effect: DB.Write) — via BlockHandler
 with db.transaction() {         // scoped: auto-commit on success, auto-rollback on error
@@ -1064,7 +1064,7 @@ displays as `exit 3`, `signal SIGSEGV` or `limit timeout`.
 
 ## Process Child
 
-`Child` is opaque, has no methods, and implements `Eq`, `Hash` and `Debug`. A handler
+`Child` is opaque and implements `Eq`, `Hash` and `Debug`, with no other methods: copies of one child are `==`, two spawns never are, and a `Child` keys a `Map` or a `Set`. A handler
 makes one with `Child.mock(id)` ("made by a handler", not "test only"; not built yet: a call is E0505 UnresolvedMethod at check). No getter reads
 the key or the pid. A real `Child` prints as `Child(pid 4211)`, and `Child(pid 4211, ended)`
 after a wait reaped it. That text changes from run to run: never parse or compare it.

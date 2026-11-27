@@ -1,0 +1,110 @@
+// A Child implements Eq and Hash (sections/04_effects.md §4.4.8): copies of one Child are
+// equal, two spawns never are, and the hash is stable for the life of the Child, so a Child
+// keys a Map or a Set.
+
+import compile_test_helpers
+import std.process.{Child, ProcessError}
+
+fn two_children() -> Result[(Child, Child), ProcessError] ! Process.Spawn {
+    let a = process.spawn("true", [])?
+    let b = process.spawn("true", [])?
+    Ok((a, b))
+}
+
+test "a copy of a Child is equal to it, and two spawns are not equal" {
+    let (a, b) = two_children()?
+    let copy = a
+    assert(a == copy)
+    assert(a != b)
+    let _ = process.wait(a)?
+    let _ = process.wait(b)?
+    assert(a == copy)
+}
+
+test "a Child keys a Map, and a copy finds the entry" {
+    let (a, b) = two_children()?
+    let mut m: Map[Child, Int] = Map.new()
+    m.insert(a, 1)
+    m.insert(b, 2)
+    let copy = a
+    assert_eq(m.get(copy), Some(1))
+    assert_eq(m.get(b), Some(2))
+    assert_eq(m.len(), 2)
+    let _ = process.wait(a)?
+    let _ = process.wait(b)?
+}
+
+test "copies of a Child are one Set element" {
+    let (a, b) = two_children()?
+    let mut s: Set[Child] = Set.new()
+    s.insert(a)
+    s.insert(a)
+    s.insert(b)
+    assert_eq(s.len(), 2)
+    assert(s.contains(a))
+    let _ = process.wait(a)?
+    let _ = process.wait(b)?
+}
+
+// A table of running children lives in a struct field and passes through signatures.
+type Children {
+    by_child: Map[Child, Int]
+}
+
+fn tag_count(m: Map[Child, Int]) -> Int {
+    m.len()
+}
+
+fn one_child(c: Child) -> Set[Child] {
+    let mut s: Set[Child] = Set.new()
+    s.insert(c)
+    s
+}
+
+test "a Child keys a Map in a fn parameter, a return type and a struct field" {
+    let (a, b) = two_children()?
+    let mut t = Children { by_child: Map.new() }
+    t.by_child.insert(a, 1)
+    t.by_child.insert(b, 2)
+    assert_eq(tag_count(t.by_child), 2)
+    assert(one_child(a).contains(a))
+    assert(!one_child(a).contains(b))
+    let _ = process.wait(a)?
+    let _ = process.wait(b)?
+}
+
+fn spawn_into(m: Map[Child, Int], args: List[Str]) ! Process.Spawn {
+    m.insert(process.spawn("true", args).unwrap(), 1)
+}
+
+// A later arena reuses the memory of an earlier one, so a Child made in an arena must not be
+// equal to a later Child made at the same place.
+test "a Child made in an arena is not equal to a later spawn in another arena" {
+    let args: List[Str] = []
+    let mut m: Map[Child, Int] = Map.new()
+    with arena {
+        spawn_into(m, args)
+    }
+    let hit = with arena {
+        let later = process.spawn("true", args).unwrap()
+        m.contains_key(later)
+    }
+    assert_eq(m.len(), 1)
+    assert(!hit)
+}
+
+test "a program cannot write its own impl Hash for Child" {
+    let r = compile_test_helpers.run_via_cli(#"import std.process.{Child}
+impl Hash for Child {
+    fn hash(_self) -> U64 { 1 }
+}
+fn main() ! Process.Spawn {
+    let mut s: Set[Child] = Set.new()
+    s.insert(process.spawn("true", []).unwrap())
+    io.println("n={s.len()}")
+}
+"#, "child_user_hash", "")
+    let all = "{r.out}{r.err_out}"
+    assert(r.exit_code != 0, all)
+    assert(all.contains("OrphanImpl") || all.contains("OverlappingImpls"), all)
+}
