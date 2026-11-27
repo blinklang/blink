@@ -631,8 +631,9 @@ In the structured output (§6.5), this fix carries two edits: the call rewrite a
 | `term.isatty(1)` | `is_tty()` in `std.term` (§4.4.11) | `IO.Print` | yes: `Int` becomes `Bool` |
 | `term.isatty(2)` | `is_stderr_tty()` in `std.term` (§4.4.11) | `IO.Log` | yes: `Int` becomes `Bool` |
 | `fs.errno()` | no call: read `e.errno.code` in the `Err(e)` of the `fs` op that failed (§4.4.5) | none | yes: the code is a field of the error, not a call |
-| `db_connect(path)`, `sqlite_connect(path)` in `std.db_sqlite` | `with db.connect(path)? { }` (§4.7.2 *Scoped effect handlers*) | `DB` | yes: the result becomes `Result[Connection, DBError]` |
-| `sqlite_handler(handle)` in `std.db_sqlite` | `with db.connect(path)? { }` | `DB` | yes: the argument is a path, and the result becomes `Result[Connection, DBError]` |
+| `db_connect(path)`, `sqlite_connect(path)` in `std.db_sqlite` | `with sqlite.connect(path)? { }` from the package `blinklang/sqlite`, with `import blinklang.sqlite` (§4.7.2 *Scoped effect handlers*) | the row that the package declares; the `with` discharges `DB` | yes: the result becomes `Result[Connection, DBError]`, and the call becomes a `with` block |
+| `sqlite_handler(handle)` in `std.db_sqlite` | `with sqlite.connect(path)? { }` from the package `blinklang/sqlite`, with `import blinklang.sqlite` | the row that the package declares; the `with` discharges `DB` | yes: the argument is a path, and the result becomes `Result[Connection, DBError]` |
+| `db.connect(path)` in `std.db` | `with sqlite.connect(path)? { }` from the package `blinklang/sqlite`, with `import blinklang.sqlite` | the row that the package declares; the `with` discharges `DB` | yes: `db.connect` becomes `sqlite.connect`, a function of a package that blink.toml must list, and `Connection` becomes the type of that package |
 
 ```
 error[UndefinedFunction]: undefined function `read_file`
@@ -646,7 +647,7 @@ error[UndefinedFunction]: undefined function `read_file`
   = help: `fs.read` needs `FS.Read` in the effect row and returns `Result[Str, FsError]`
 ```
 
-In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg`, `sqlite_handler`, `unix_socket_accept_timeout`, `net.connect`, `term.isatty`, `tcp_accept`, `listener_accept` and the `tcp_` functions that take an `Int` file descriptor change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).) For `unix_socket_accept_timeout`, the `Int` file descriptor becomes the `UnixListener` that is the receiver, and a check of the result for `-1` becomes a `match` on `Ok(None)`. The help of that fix says so: `-1` after the wait ran out is now `Ok(None)`, so that case needs no `Err` arm.
+In the structured output (§6.5), the fix carries two edits: the call rewrite and the addition of the effect to the enclosing row. Both are machine-applicable when the replacement takes the same arguments. The rows for `db_connect`, `sqlite_connect`, `sqlite_handler` and `db.connect` are the exception: they have no fix at all (*Rows for the database driver*, below). The rewrites for `time_ms`, `file_exists`, `is_dir`, `file_mtime`, `arg_count`, `get_arg`, `unix_socket_accept_timeout`, `net.connect`, `term.isatty`, `tcp_accept`, `listener_accept` and the `tcp_` functions that take an `Int` file descriptor change the shape of the code, so for these names the fix is a suggestion and only the row edit is machine-applicable. (Panel vote on the `io`, `std.db_sqlite` and handle-operation rows and the fourth column: 6-0. See [Duplicate APIs rationale](../decisions/duplicate-apis.md).) For `unix_socket_accept_timeout`, the `Int` file descriptor becomes the `UnixListener` that is the receiver, and a check of the result for `-1` becomes a `match` on `Ok(None)`. The help of that fix says so: `-1` after the wait ran out is now `Ok(None)`, so that case needs no `Err` arm.
 
 **Names under `term`, `fs` and `net`.** `term` is not a handle. `std.term` is a module (§4.4.11). A call `term.width()` fails in one of two ways, and the table applies to both. If the file has `import std.term`, then `term` is a module with no `width`, and the error is E0505. If the file has no such import, then `term` is not in scope, and the error is E0506. The compiler looks in the table when either lookup fails, so both errors carry the same fix line. If the file does not already bring in the replacement, the fix adds its import. A file that declares its own `term` still compiles and calls that name. The `term.isatty` rows are keyed on the literal argument: `term.isatty(1)` and `term.isatty(2)` have the rows above, and any other argument, such as `term.isatty(0)`, has no row and no fix. The `term.width()` and `term.height()` fixes are machine-applicable: they rewrite the call, add the import when it is missing, and add `IO.Print` to the row. The `term.isatty` fix is a suggestion, because `Int` becomes `Bool`, and a test such as `== 1` must change.
 
@@ -752,6 +753,43 @@ error[UndefinedFunction]: undefined function `tcp_read`
   = note: a socket is a value, not a file descriptor number: `tcp_connect` gives a `TcpStream`, and `TcpListener.accept` gives a `TcpConn`
   = fix: stream.read(10)
   = help: `TcpStream.read` needs `Net.Connect`; `TcpConn.read` needs `Net.Listen` (§4.4.6)
+```
+
+**Rows for the database driver.** `std.db` holds the `DB` interface and no driver. The SQLite driver is the package `blinklang/sqlite`, and a program imports it as `import blinklang.sqlite` (§8.9.7 maps `org/name` to `import org.name`). The rows for `db_connect`, `sqlite_connect`, `sqlite_handler` and `db.connect` give a help line and no fix, whatever blink.toml holds. In the structured output the `fixes` list is empty (`"fixes": []`). Each rewrite changes the shape of the code: a call becomes a `with` block, and `sqlite_handler` takes a path where it took a handle. The fix adds no dependency to blink.toml and no effect to the row. The help line names the command that adds the package, the import and the call, ready to copy. (Panel vote: 6-0. See [Database Driver Package rationale](../decisions/db-driver-package.md).)
+
+A call to `db.connect` is E0505, as for any member that a module does not declare:
+
+```blink
+import std.db
+
+fn open_app() -> Result[Int, DBError] {
+    with db.connect("app.db")? {
+        count_users()
+    }
+}
+```
+
+```
+error[UnresolvedMethod]: no member `connect` on module `db`
+ --> app.bl:4:13
+  |
+4 |     with db.connect("app.db")? {
+  |             ^^^^^^^ `db` has no function `connect`
+  |
+  = note: `std.db` holds the DB interface and no driver
+  = help: the SQLite driver is the package `blinklang/sqlite`: run `blink add blinklang/sqlite`, then `import blinklang.sqlite` and `with sqlite.connect(path)? { }`
+```
+
+An import of a removed driver module, `import std.db_sqlite` or `import std.db_stmt`, is E1200 with the same help line:
+
+```
+error[ModuleNotFound]: module not found: std.db_sqlite
+ --> app.bl:1:8
+  |
+1 | import std.db_sqlite
+  |        ^^^^^^^^^^^^^ no module `std.db_sqlite`
+  |
+  = help: the SQLite driver is the package `blinklang/sqlite`: run `blink add blinklang/sqlite`, then `import blinklang.sqlite` and `with sqlite.connect(path)? { }`
 ```
 
 **Rows for methods of `Child`.** The E0505 help for a handle op finds `child.wait()` by its name, so no row lists it. The help cannot find `child.kill(sig)` or `child.send_signal(sig)`, because the op is named `signal`. Rows keyed by the receiver type `Child` cover them (§3.2 *Removed methods*). The released `kill` method used the signal `0` to mean `SIGKILL`. A literal `0` argument to `kill` becomes `SIGKILL`, and a literal argument other than `0` stays as it is. A `kill` argument that is not a literal gets a suggestion, not a machine-applicable fix, because the argument can be `0`. (Panel vote: 6-0. See [One Call Form for Handle Operations rationale](../decisions/handle-op-call-form.md).)
@@ -3201,7 +3239,7 @@ effect DB {
 
 `step` is `DB.Write` because a prepared statement can write, and the type `Stmt` does not say whether it does. Code that only reads rows uses `db.query` and `db.query_one`, which need only `DB.Read`. `! DB` grants all of the rows above. There is one `Stmt` type.
 
-The row of a foreign call that a driver makes, such as `sqlite_step`, is not charged to the caller of the method. It is part of the clause row of the handler, and the `with` that installs the handler charges it (§4.7.1, *The clause row*; §9.1, *Foreign Rows Inside a Built-in Effect's Handler*). A method call outside the `with` that made the `Stmt` is a `DB` operation like any other. It needs its row in the signature, and it needs a handler of `DB` in scope.
+The row of a foreign call that a driver makes, such as the `@ffi` binding that steps a statement, is not charged to the caller of the method. It is part of the clause row of the handler, and the `with` that installs the handler charges it (§4.7.1, *The clause row*; §9.1, *Foreign Rows Inside a Built-in Effect's Handler*). A method call outside the `with` that made the `Stmt` is a `DB` operation like any other. It needs its row in the signature, and it needs a handler of `DB` in scope.
 
 A fn with no `DB` row cannot run SQL through a `Stmt`, also when the caller passes the `Stmt` in:
 
@@ -3281,28 +3319,9 @@ An operation on a `Stmt` has three failure cases. An operation that returns a `R
 
 The `column_*` operations return no `Result`. In each of the three cases above, a `column_*` call panics.
 
-The first case is also the result when a program keeps a `Stmt` past its `with` and uses it under the handler of a second connection:
+The first case is also the result when a program keeps a `Stmt` past the `with` of one connection and uses it under the handler of a second connection. §4.7.2 (*Scoped effect handlers*) shows this with the connections of a driver package.
 
-```blink
-fn late(a: Str, b: Str) -> Result[Void, DBError] ! FS, Time, Rand, IO {
-    let mut kept: Option[Stmt] = None
-    with db.connect(a)? {
-        kept = Some(db.prepare("SELECT 1")?)
-    }
-    with db.connect(b)? {
-        match kept {
-            Some(s) => match s.step() {
-                Ok(_) => {}
-                Err(e) => io.println("{e}")    // prints: exec_error: statement belongs to another connection
-            }
-            None => {}
-        }
-    }
-    Ok(())
-}
-```
-
-**Release.** `s.finalize()` frees the statement at once. A second `finalize` does nothing and gives `Ok(())`. `finalize` also clears the record that the handler keeps of the `Stmt`. When the `with` of the connection exits, the handler finalizes every `Stmt` that is still open. That holds when the `with` exits by `?`, by `return`, by `break`, and by panic. The exit does not finalize a `Stmt` again that `finalize` freed.
+**Release.** `s.finalize()` frees the statement at once. A second `finalize` does nothing and gives `Ok(())`. `finalize` also clears the record that the handler keeps of the `Stmt`. When the `with` of a driver's connection exits, the driver finalizes every `Stmt` that is still open. That holds when the `with` exits by `?`, by `return`, by `break`, and by panic. The exit does not finalize a `Stmt` again that `finalize` freed.
 
 `Stmt` is `Closeable` (§3.6, §5.5). Its `close` performs the `finalize` operation through the handler. It never calls the driver directly, so `with ... as` works under a mock handler:
 
@@ -3314,28 +3333,24 @@ impl Closeable for Stmt {
 }
 ```
 
-`with db.prepare(sql)? as s { }` finalizes `s` at the end of the block on every exit path. The `with` is charged `DB.Read`, the row of `close` (§5.5). The call of `prepare` needs that row already. The binding `s` follows E0601 and E0602 like any other `Closeable` binding. The `with ... as` close and an explicit `finalize` can both run. The second one does nothing:
+`with db.prepare(sql)? as s { }` finalizes `s` at the end of the block on every exit path. The `with` is charged `DB.Read`, the row of `close` (§5.5). The call of `prepare` needs that row already. The binding `s` follows E0601 and E0602 like any other `Closeable` binding. The `with ... as` close and an explicit `finalize` can both run. The second one does nothing. These functions run under the `DB` handler that their caller installs:
 
 ```blink
-fn add_all(p: Str, xs: List[Int]) -> Result[Void, DBError] ! FS, Time, Rand {
-    with db.connect(p)? {
-        for x in xs {
-            with db.prepare("INSERT INTO t VALUES ({x})")? as s {
-                s.step()?
-            }    // s is finalized here, before the next pass
-        }
-    }    // the handler finalizes any Stmt still open here
+fn add_all(xs: List[Int]) -> Result[Void, DBError] ! DB {
+    for x in xs {
+        with db.prepare("INSERT INTO t VALUES ({x})")? as s {
+            s.step()?
+        }    // s is finalized here, before the next pass
+    }
     Ok(())
 }
 
-fn finalize_twice(p: Str) -> Result[Void, DBError] ! FS, Time, Rand {
-    with db.connect(p)? {
-        with db.prepare("INSERT INTO t VALUES (1)")? as s {
-            s.step()?
-            s.finalize()?
-            s.finalize()?    // does nothing: Ok(())
-        }    // the close does nothing too
-    }
+fn finalize_twice() -> Result[Void, DBError] ! DB {
+    with db.prepare("INSERT INTO t VALUES (1)")? as s {
+        s.step()?
+        s.finalize()?
+        s.finalize()?    // does nothing: Ok(())
+    }    // the close does nothing too
     Ok(())
 }
 ```
@@ -3376,7 +3391,7 @@ The mock has an empty clause row, so the `with` is charged no `FS`, `Time` or `R
 
 **A handler that omits a `Stmt` operation.** The `Stmt` operations are primitive operations of `DB`. A `DB` handler that leaves one out compiles. This is the forward case of §4.7.1 (*Completeness and auto-delegation*), with no exception. The omitted operation goes to the enclosing handler of `DB`, and the forward performs `DB` outside the handler. So the clause row of the handler has `DB`, and its type is `Handler[DB ! DB]`, not `Handler[DB]`.
 
-The enclosing handler did not make the `Stmt`. It answers with the first Err above. A mock that omits `step`, under a real connection, gives this:
+The enclosing handler did not make the `Stmt`. It answers with the first Err above. A mock that omits `step`, run under the connection of a driver, gives this:
 
 ```blink
 fn no_step_db() -> Handler[DB ! DB] {
@@ -3399,14 +3414,13 @@ fn no_step_db() -> Handler[DB ! DB] {
     }
 }
 
-fn run() -> Result[Void, DBError] ! FS, Time, Rand, IO {
-    with db.connect("app.db")? {
-        with no_step_db() {
-            let s = db.prepare("SELECT 1")?
-            match s.step() {
-                Ok(_) => io.println("stepped")
-                Err(e) => io.println("{e}")    // prints: exec_error: statement belongs to another connection
-            }
+// the caller installs a driver's connection; `no_step_db()` forwards `step` to it
+fn run() -> Result[Void, DBError] ! DB, IO {
+    with no_step_db() {
+        let s = db.prepare("SELECT 1")?
+        match s.step() {
+            Ok(_) => io.println("stepped")
+            Err(e) => io.println("{e}")    // prints: exec_error: statement belongs to another connection
         }
     }
     Ok(())
@@ -3695,28 +3709,24 @@ fn run_with_postgres(config: DBConfig) ! Net.Connect, IO.Log {
     }
 }
 
-fn run_with_sqlite(path: Str) -> Result[(), DBError]
-    ! FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, IO.Log {
-    with db.connect(path)? {
-        start_server()  // same code, SQLite backend
+fn run_in_memory(fixtures: Fixtures) ! IO.Log {
+    with mock_db(fixtures) {
+        start_server()  // same code, in-memory backend
     }
-    Ok(())
 }
 
 fn main() {
     let config = load_config()
     match config.db_backend {
         "postgres" => run_with_postgres(config.pg_config)
-        "sqlite" => if run_with_sqlite(config.sqlite_path).is_err() {
-            io.eprintln("cannot open {config.sqlite_path}")
-        }
+        "memory" => run_in_memory(config.fixtures)
     }
 }
 ```
 
 No interfaces, no factory patterns, no service locators. The handler is the injection point. The code inside the `with` block is agnostic to the concrete implementation.
 
-A `with` discharges `DB`, and it charges the clause row of the handler to the enclosing code (§4.7.1, *The clause row*). `run_with_postgres` therefore declares what the Postgres driver touches, and `run_with_sqlite` declares what the SQLite driver touches. Neither declares `DB`.
+A `with` discharges `DB`, and it charges the clause row of the handler to the enclosing code (§4.7.1, *The clause row*). `run_with_postgres` therefore declares what the Postgres driver touches, and `run_in_memory` declares what the mock touches. Neither declares `DB`. A driver from a package works the same way: §4.7.2 (*Scoped effect handlers*) shows the SQLite driver `blinklang/sqlite`.
 
 #### Sandboxing: restricting capabilities
 
@@ -3994,8 +4004,8 @@ with mock_db(fixtures), db.transaction() {
     // mock_db provides DB handler, transaction is a scoped value
 }
 
-with db.connect("app.db")?, db.transaction() {
-    // db.connect installs the DB handler; db.transaction() uses it
+with pg_connect(url)?, db.transaction() {
+    // pg_connect(url)? installs the DB handler; db.transaction() uses it
 }
 ```
 
@@ -4099,12 +4109,13 @@ error[UndeclaredEffect]: undeclared effect
    |                 +++++++++
 ```
 
-**The note and the help.** When the effect comes from a foreign call that the handler's operation bodies make, the note traces the missing effect to that binding and the audit key that assumes its row (§4.5, *Proven and assumed rows*). The help for a handler body names the clause row, written as a `Handler` type, and does not name the fn that builds the handler. The fix line prints the whole missing row on one line, ready to paste. On a fn's `!` list the row is bare. Inside a `Handler` type, a row of two or more effects is in parentheses (§4.15.1). The example installs the standard SQLite driver. Its clause row is `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`, because the driver calls into `libsqlite3`, which opens files, takes locks, waits on a busy lock and may call `random()`:
+**The note and the help.** When the effect comes from a foreign call that the handler's operation bodies make, the note traces the missing effect to that binding and the audit key that assumes its row (§4.5, *Proven and assumed rows*). The help for a handler body names the clause row, written as a `Handler` type, and does not name the fn that builds the handler. The fix line prints the whole missing row on one line, ready to paste. On a fn's `!` list the row is bare. Inside a `Handler` type, a row of two or more effects is in parentheses (§4.15.1). In the example, the program's own module `store` is a driver over a C database library. Its clause row is `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`, because the C library opens files, takes locks, waits on a busy lock and may call `random()`:
 
 ```blink
 import std.db
+import store
 
-fn count_users(conn: db.Connection) -> Result[Int, DBError] ! FS.Read, FS.Write {
+fn count_users(conn: store.Connection) -> Result[Int, DBError] ! FS.Read, FS.Write {
     with conn {                  // error: `conn` performs `FS.Delete, Time.Read, Time.Sleep, Rand`
         db.query_one(t"SELECT count(*) FROM users")
     }
@@ -4113,18 +4124,18 @@ fn count_users(conn: db.Connection) -> Result[Int, DBError] ! FS.Read, FS.Write 
 
 ```
 error[UndeclaredEffect]: undeclared effect
- --> users.bl:4:10
+ --> users.bl:5:10
   |
-4 |     with conn {
-  |          ^^^^ handler `std.db.Connection` performs `FS.Delete, Time.Read, Time.Sleep, Rand` outside the handler
+5 |     with conn {
+  |          ^^^^ handler `store.Connection` performs `FS.Delete, Time.Read, Time.Sleep, Rand` outside the handler
   |
-  = note: `FS.Delete` comes from `std.db_sqlite.sqlite_open`, a foreign call whose row is assumed under audit `STD-DB-SQLITE`
+  = note: `FS.Delete` comes from `store.raw_open`, a foreign call whose row is assumed under audit `STORE-001`
   = note: function `count_users` declares `FS.Read, FS.Write`
-  = help: the clause row of `std.db.Connection` is `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`
+  = help: the clause row of `store.Connection` is `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`
   = fix: write the whole row on the fn: `! FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand`
 ```
 
-`! FS, Time.Read, Time.Sleep, Rand` is a legal superset and also satisfies the `with`. Std writes the leaves, and the fix line does the same. `with db.connect(p)? { }` is charged the same row. A test under `with mock_db(...)` is charged no `FS`, because the mock handler has an empty clause row.
+`! FS, Time.Read, Time.Sleep, Rand` is a legal superset and also satisfies the `with`. The fix line writes the leaves. `with store.connect(p)? { }` is charged the same row. A test under `with mock_db(...)` is charged no `FS`, because the mock handler has an empty clause row.
 
 A handler for another driver follows the same rule. A libpq driver talks to a server, so its clause row is `Net.Connect`:
 
@@ -4729,9 +4740,12 @@ A type that writes both `impl Closeable` and `impl Scoped` has two overlapping i
 
 #### Scoped effect handlers
 
-A `Scoped` type whose `Context` is `Handler[E]` is a **scoped effect handler**. The `with` block installs the handler that `enter()` returns, for the block body only. This joins an effect handler and a cleanup in one `with` item. In this example, `sqlite_open` returns `Result[Sqlite3, DBError]`, with `Err(ConnectionError(..))` when the open fails:
+A `Scoped` type whose `Context` is `Handler[E]` is a **scoped effect handler**. The `with` block installs the handler that `enter()` returns, for the block body only. This joins an effect handler and a cleanup in one `with` item.
+
+A database driver is a scoped effect handler for `DB`. `std.db` holds the `DB` interface and no driver; a driver comes from a package. The SQLite driver is the package `blinklang/sqlite`. The example below is part of that package. `sqlite_open`, `sqlite_handler` and `sqlite_close` are private functions of the package. The `@ffi` bindings under them declare their rows (§9.1, *Foreign Rows Inside a Built-in Effect's Handler*). `sqlite_open` returns `Result[Sqlite3, DBError]`, with `Err(ConnectionError(..))` when the open fails:
 
 ```blink
+// the package blinklang/sqlite
 pub type Connection {
     handle: Sqlite3
 }
@@ -4752,10 +4766,48 @@ pub fn connect(path: Str) -> Result[Connection, DBError] ! FS.Read, FS.Write, FS
     let handle = sqlite_open(path)?
     Ok(Connection { handle: handle })
 }
+```
 
-// Usage: the `with` discharges `DB`; the enclosing code declares the clause row
-with db.connect(":memory:")? {
-    db.exec(t"CREATE TABLE users (name TEXT)")?
+A program adds the package to blink.toml and imports it. The package `org/name` is imported as `import org.name` (§8.9.7). The `with` discharges `DB`. The enclosing fn declares the clause row that the package declares:
+
+```blink
+// blink.toml  [dependencies]  blinklang/sqlite = "0.1"
+import std.db
+import blinklang.sqlite
+
+fn setup() -> Result[Void, DBError]
+    ! FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand {
+    with sqlite.connect(":memory:")? {
+        db.exec(t"CREATE TABLE users (name TEXT)")?
+    }
+    Ok(())
+}
+```
+
+A driver package exports `connect`, and `connect` returns `Result[Connection, DBError]`, where `Connection` implements `Scoped` with a `Context` of `Handler[DB ! R]`. This is a convention for driver packages, not a rule the compiler checks. (Panel vote: 6-0. See [Database Driver Package rationale](../decisions/db-driver-package.md).)
+
+The handler of a driver's connection owns the `Stmt` values that it makes (§4.4.10). When the `with` exits, the driver finalizes every `Stmt` that is still open. A `Stmt` kept past its `with` and used under the handler of a second connection gives `Err(ExecError("statement belongs to another connection"))`:
+
+```blink
+import std.db
+import blinklang.sqlite
+
+fn late(a: Str, b: Str) -> Result[Void, DBError]
+    ! FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, IO {
+    let mut kept: Option[Stmt] = None
+    with sqlite.connect(a)? {
+        kept = Some(db.prepare("SELECT 1")?)
+    }    // the driver finalizes the Stmt here
+    with sqlite.connect(b)? {
+        match kept {
+            Some(s) => match s.step() {
+                Ok(_) => {}
+                Err(e) => io.println("{e}")    // prints: exec_error: statement belongs to another connection
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 ```
 
@@ -4783,13 +4835,13 @@ The rule applies only when `T.Context` normalizes to `Handler[E]` with a concret
 
 **Binding.** `with expr as name { }` installs the handler and binds `name` to the same `Handler[E]` value. `name` follows the scoping rules in *Interaction with async* below.
 
-**Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Build it in the `with` item, as `connect` does above. Entering the same value in two `with` blocks runs `exit()` twice; W0611 (§5.5) warns about it.
+**Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Build it in the `with` item, as `sqlite.connect` does above. Entering the same value in two `with` blocks runs `exit()` twice; W0611 (§5.5) warns about it.
 
 A second `exit()` on a value whose resource is already released should do nothing, or should fail with a defined error. The stdlib's native handles do this: after `close`, a call on the handle returns an error such as `Err(ConnectionError("connection is closed"))`, not a use-after-free. This is guidance for user impls, not a rule the compiler checks. `std.testing`'s `Cleanup` runs its action on each `exit()`, so a second entry runs the action a second time.
 
 The clause row of the handler is part of `Context`. `Handler[DB]` here would claim that the driver performs nothing outside the handler, which is false for a driver that opens files. `":memory:"` does not change this: the row is a bound on every path of the driver, not a prediction for one call (§9.1, *Foreign Rows Inside a Built-in Effect's Handler*).
 
-A failed acquisition uses `?` on the item: `with db.connect(p)? { }`. The `?` fires before the scope is entered, so a failed open needs no cleanup.
+A failed acquisition uses `?` on the item: `with sqlite.connect(p)? { }`. The `?` fires before the scope is entered, so a failed open needs no cleanup.
 
 #### `exit()` constraints
 
@@ -5287,7 +5339,7 @@ Only the declaration changes. Functions can then narrow their rows to `! Store.R
 
 **Standard library handlers:**
 
-The standard library ships default handlers for built-in effects (real filesystem, real network, real database drivers). `State` is the exception: it has no handler, and the roots hold it (§4.16.1). `main` and each test block hold the built-in effects, so neither needs a `with` for one (§4.6, §2.20). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible. A user-defined effect that reaches `main` or a test block with no `with` that discharges it is `UnhandledEffect` (E0539, §4.6 *Unhandled user effects*). No operation answers a default value: an operation that finds no handler at run time panics (§4.7.1 *Completeness and auto-delegation*).
+The standard library ships default handlers for built-in effects (real filesystem, real network). It ships no database driver: a driver for `DB` comes from a package (§4.7.2). `State` is the exception: it has no handler, and the roots hold it (§4.16.1). `main` and each test block hold the built-in effects, so neither needs a `with` for one (§4.6, §2.20). User-defined effects have no default handler -- you must provide one. This is intentional: the compiler forces you to explicitly wire up your domain effects, making the architecture visible. A user-defined effect that reaches `main` or a test block with no `with` that discharges it is `UnhandledEffect` (E0539, §4.6 *Unhandled user effects*). No operation answers a default value: an operation that finds no handler at run time panics (§4.7.1 *Completeness and auto-delegation*).
 
 ```blink
 fn main() {

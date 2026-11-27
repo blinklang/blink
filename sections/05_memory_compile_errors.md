@@ -240,7 +240,7 @@ Desugars to:
 
 `as name` only binds a name. `with expr { body }` runs the same steps, and the compiler discards the value. The call `name.close()` is charged like any call of an impl-chosen row (§4.15.3). The compiler inserts it on **every catchable unwind**: normal completion, `?` propagation, `return`, assertion failure, and `skip()` in test blocks. The catchable-unwind set is closed and runtime-defined — see §4.7.2 for the exhaustive enumeration and the soundness fence around future user-level panic recovery. Uncaught panics (process-terminating divergence) bypass `close()` entirely.
 
-This rule is uniform with `Scoped.exit()` (§4.7.2): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with db.connect()? as conn { assert(...) }` block releases `conn` on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.7.2).
+This rule is uniform with `Scoped.exit()` (§4.7.2): both run on every structured catchable exit, and both bypass on uncaught divergence. A `with db.transaction() { assert(...) }` block rolls the transaction back on assertion failure inside a test block, because a failed assertion is a catchable unwind (§4.7.2).
 
 #### Multiple resources
 
@@ -280,13 +280,13 @@ For a `Scoped` type that is not `Closeable`, the help names the `with` form that
 warning[ScopedValueWithoutWith]: `Scoped` value used without `with`
  --> app.bl:3:9
   |
-3 |     let conn = db.connect("app.db")?
-  |         ^^^^ `Connection` implements `Scoped`, but `conn` never goes into a `with`
+3 |     let tx = db.transaction()
+  |         ^^ the value of `db.transaction()` implements `Scoped`, but `tx` never goes into a `with`
   |
   = help: use it as a `with` item so that `exit()` runs:
   |
-3 |     with db.connect("app.db")? {
-4 |         // db.* calls here use this connection
+3 |     with db.transaction() {
+4 |         // db.* calls here run in this transaction
 5 |     }
 ```
 
@@ -300,22 +300,22 @@ The diagnostic lists the `with` fix first. It lists the `@allow` fix second, and
 
 **W0611 `ScopedValueEnteredTwice`: scoped value that goes into more than one `with`**
 
-A scoped value must reach exactly one `with` item. W0611 counts the `with` items that one execution path takes the value into, and fires when the count is two or more. Items on paths that exclude each other (`if`/`else` branches, `match` arms) count once. A `with` in a loop body that enters a value built outside the loop counts as two, unless every path through the body after that `with` leaves the loop. A copy of a scoped value is the same value: `let copy = conn` followed by `with copy` enters `conn`. Its state was fixed when it was built, so a second `exit()` releases it again. It uses the same flow analysis as W0610, and it has the same limit: it does not follow a value into a function it is passed to. No W0611 is not a proof that a value goes into one `with` only, and W0611 is not a safety check: a type that wraps a foreign handle should make a second `exit()` safe (§4.7.2).
+A scoped value must reach exactly one `with` item. W0611 counts the `with` items that one execution path takes the value into, and fires when the count is two or more. Items on paths that exclude each other (`if`/`else` branches, `match` arms) count once. A `with` in a loop body that enters a value built outside the loop counts as two, unless every path through the body after that `with` leaves the loop. A copy of a scoped value is the same value: `let copy = tx` followed by `with copy` enters `tx`. Its state was fixed when it was built, so a second `exit()` releases it again. It uses the same flow analysis as W0610, and it has the same limit: it does not follow a value into a function it is passed to. No W0611 is not a proof that a value goes into one `with` only, and W0611 is not a safety check: a type that wraps a foreign handle should make a second `exit()` safe (§4.7.2).
 
 ```
 warning[ScopedValueEnteredTwice]: `Scoped` value goes into more than one `with`
  --> app.bl:4:14
   |
-2 |     let conn = db.connect("app.db")?
-  |         ---- `conn` is built once here
+2 |     let tx = db.transaction()
+  |         -- `tx` is built once here
 3 |     for job in jobs {
-4 |         with conn {
-  |              ^^^^ `conn` goes into this `with` on each pass of the loop
+4 |         with tx {
+  |              ^^ `tx` goes into this `with` on each pass of the loop
   |
-  = note: `exit()` runs at the end of each `with`, on the same `conn`
+  = note: `exit()` runs at the end of each `with`, on the same `tx`
   = help: build a new value in each `with` item:
   |
-4 |         with db.connect("app.db")? {
+4 |         with db.transaction() {
   |
   = note: if running `exit()` more than once is intended, add `@allow(ScopedValueEnteredTwice)`
   = note: upgrade to error in blink.toml: [lints] W0611 = "error"

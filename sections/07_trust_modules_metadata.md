@@ -903,9 +903,9 @@ The `State` row in these decls follows the rule of *Hidden C State — Which Row
 
 #### Foreign Rows Inside a Built-in Effect's Handler
 
-A handler for a built-in interface effect (`DB`, `Crypto`) can call foreign code. The standard SQLite driver is one example: the handler for `DB` calls `libsqlite3`. The row of such a binding names **what the foreign code touches**. It never names the effect that the handler implements. §4.3 divides the built-in effects into interface effects, which only a handler implements, and world effects, which the host does.
+A handler for a built-in interface effect (`DB`, `Crypto`) can call foreign code. A database driver is one example: its handler for `DB` calls a C library. The row of such a binding names **what the foreign code touches**. It never names the effect that the handler implements. §4.3 divides the built-in effects into interface effects, which only a handler implements, and world effects, which the host does.
 
-`DB` never appears in a foreign row. A foreign call does not run through a handler (§4.5, *Proven and assumed rows*), so it cannot discharge `DB`. A binding with `! DB` puts `DB` in the clause row of the handler that calls it. The type is then `Handler[DB ! DB]`: a handler that forwards to the outer handler and never discharges `DB`. `! ()` on every binding is also wrong. `libsqlite3` writes the database file, and a later call reads it through no argument (*What `! ()` Claims*).
+`DB` never appears in a foreign row. A foreign call does not run through a handler (§4.5, *Proven and assumed rows*), so it cannot discharge `DB`. A binding with `! DB` puts `DB` in the clause row of the handler that calls it. The type is then `Handler[DB ! DB]`: a handler that forwards to the outer handler and never discharges `DB`. `! ()` on every binding is also wrong. A C database library writes the database file, and a later call reads it through no argument (*What `! ()` Claims*).
 
 ```blink
 // wrong: `DB` is what the handler implements, not what the C library touches
@@ -944,20 +944,55 @@ error[UndeclaredEffect]: undeclared effect
 
 **A user driver.** A libpq driver is `Handler[DB ! Net.Connect]` (§4.7.1, *The clause row*). `with pg_connect(url)? { }` discharges `DB` and charges `Net.Connect` to the enclosing code. An enclosing fn that does not declare `Net.Connect` gets E0500 at the `with`.
 
-**The standard SQLite driver.** `std.db` installs a handler of type `Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]`. These are the rows of its bindings:
+**The rule for every driver.** `with <handler> { }` discharges `DB` and charges the declared row of the handler to the enclosing code. For a scoped effect handler, that row is the `R` of its `Context`, `Handler[DB ! R]`, plus the rows of `enter` and `exit` (§4.7.2). The bindings of a driver declare their rows under the rules of this section, and each `@trusted(audit: K)` key resolves against the `audits.toml` of the package that holds the binding (*Audit Records*). A driver from a package and a driver in the program follow the same rule. No driver has an exemption. A missing leaf is E0500 at the `with` (§4.7.1). A test under `with mock_db(...)` is charged no `FS`, because a mock handler performs nothing outside the handler. The `Stmt` operations are `DB` operations that the handler runs (§4.4.10), so the clause row covers the bindings that run a statement, and the `with` charges it. (Panel vote: 6-0. See [Database Driver Package rationale](../decisions/db-driver-package.md).)
 
-| Binding | Row |
-|---|---|
-| open (`sqlite_open`), `sqlite_close`, `sqlite_reset`, `sqlite_finalize` | `FS.Read, FS.Write, FS.Delete` |
-| `sqlite_prepare` | `FS.Read, FS.Write, FS.Delete` |
-| `sqlite_exec_raw`, `sqlite_execute_raw`, `sqlite_query_raw`, `sqlite_step` | `FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand` |
-| `bind_*`, `errmsg`, `last_insert_rowid`, `is_closed`, `is_finalized`, `column_*`, `result_*`, `result_free` | `! ()` |
+In this example, a package `pg` holds the libpq driver. Its bindings declare `Net.Connect`, the `Context` of its `Connection` repeats that row, and the `with` charges it:
 
-The open call can create or open the database file. A later call on the handle can write that file or delete the journal, so `sqlite_close`, `sqlite_reset` and `sqlite_finalize` take the row of the call that made the handle (*fd-Table and Process-Control Calls — Which Row*). `sqlite_prepare` takes the full `FS` row because taking the schema read lock can roll back a hot journal that a crash in another process left. That writes the database file and deletes the journal. The four SQL-running calls add `Time.Read`, `Time.Sleep` and `Rand`. `PRAGMA busy_timeout = N`, sent through `sqlite_exec_raw`, installs a busy handler, and a locked `sqlite_step` then sleeps. WAL mode also sleeps on contention with no busy handler. SQL text can call `random()` and `randomblob()`.
+```blink
+// src/pg.bl in the package pg
+@ffi.opaque(header: "libpq-fe.h", name: "PGconn")
+type PgConn
 
-The rule has an end. The row of a binding that runs SQL covers every behavior that SQL text can reach. A row gets shorter only when the shim provably removes a behavior, for example by replacing `random` and `randomblob`, and the audit record of the binding says so (*Audit Records*).
+@ffi("pq", "PQconnectdb")
+@trusted(audit: "PG-001")
+fn pq_connectdb(url: Str) -> PgConn ! Net.Connect
 
-The pub helpers of `std.db` that call these bindings declare the row. `with db.connect(p)? { }` discharges `DB` and charges the row to the enclosing code. A missing leaf is E0500 at the `with` (§4.7.1). A test under `with mock_db(...)` is charged no `FS`, because a mock handler performs nothing outside the handler. The `Stmt` operations are `DB` operations that the handler runs (§4.4.10), so the clause row covers `sqlite_step` and the other statement bindings, and the `with` charges it.
+@ffi("pq", "PQfinish")
+@trusted(audit: "PG-001")
+fn pq_finish(conn: PgConn) ! Net.Connect
+
+pub type Connection {
+    conn: PgConn
+}
+
+impl Scoped for Connection {
+    type Context = Handler[DB ! Net.Connect]
+
+    fn enter(self) -> Handler[DB ! Net.Connect] {
+        pq_handler(self.conn)    // its operations call libpq bindings, each `! Net.Connect`
+    }
+
+    fn exit(self, ok: Bool) ! Net.Connect {
+        pq_finish(self.conn)
+    }
+}
+
+pub fn connect(url: Str) -> Result[Connection, DBError] ! Net.Connect { ... }
+```
+
+```blink
+// the program
+import std.db
+import pg
+
+fn count(url: Str) -> Result[Int, DBError] ! Net.Connect {
+    with pg.connect(url)? {    // discharges `DB`, charges `Net.Connect`
+        count_users()
+    }
+}
+```
+
+If `count` declares no `Net.Connect`, the `with` is E0500, and the note names a binding of `pg` and the key `PG-001` (§4.7.1, *The note and the help*). A row of a binding that runs SQL covers every behavior that SQL text can reach. A row gets shorter only when the C code provably removes a behavior, and the audit record of the binding says so (*Audit Records*).
 
 `blink audit` prints the clause row of each handler and the key that assumes its bindings (*`blink audit` — FFI Inventory*).
 
@@ -989,18 +1024,24 @@ pub fn read_some(fd: I32, buf: Ptr[U8], n: U64) -> I64 ! FS.Read {
 
 A handler for `FS` replaces `fs.stat` for every std function that stats a path, because std reaches `stat` only through the operation. A handler reaches the real `stat` as `default.stat(p)` (§4.7.1). User code does not call the default body of a built-in effect operation, so it cannot reach the foreign call except through the operation.
 
-**A second exemption: the standard SQLite driver.** `std.db`, `std.db_sqlite` and `std.db_stmt` call the SQLite bindings directly. `libsqlite3` makes its own system calls, so its file I/O cannot go through `fs.*` operations. These calls are **not** under the exemption for an fd that already exists: SQL can open new files (`ATTACH`, `VACUUM INTO`, the journal, temp files for sorts). What a program can rely on:
+**An `FS` handler does not see the I/O of foreign code.** A foreign call does not run through a handler (§4.5, *Proven and assumed rows*). A C library that makes its own system calls does its file I/O outside `fs.*`, so no handler for `FS` sees it. A database driver is one example. Its calls are not under the exemption for an fd that already exists, because SQL can open new files (`ATTACH`, `VACUUM INTO`, the journal, temp files for sorts). What a program can rely on:
 
-- The file I/O of the SQLite driver does not go through `fs.*` operations, so a handler for `FS` does not see it.
+- The file I/O of a foreign call does not go through `fs.*` operations, so a handler for `FS` does not see it.
 - `":memory:"` still charges the row. The row bounds every path of the driver.
 - The `with` still charges the row to the enclosing code (*Foreign Rows Inside a Built-in Effect's Handler*).
 
+The SQLite driver is the package `blinklang/sqlite` (§4.7.2). An `FS` mock does not cover it:
+
 ```blink
+// blink.toml  [dependencies]  blinklang/sqlite = "0.1"
+import std.db
+import blinklang.sqlite
+
 fn mock_fs() -> Handler[FS] { ... }   // a user handler that serves files from a map
 
-test "an FS mock does not cover the SQLite driver" {
+test "an FS mock does not cover a driver's foreign I/O" {
     with mock_fs() {
-        with db.connect("app.db")? {   // touches the real disk
+        with sqlite.connect("app.db")? {   // touches the real disk
             db.exec(t"CREATE TABLE t (x INT)")?
         }
     }
@@ -1009,7 +1050,7 @@ test "an FS mock does not cover the SQLite driver" {
 
 To test code that uses `DB` without touching the disk, install a handler for `DB` (`with mock_db(...)`). A handler for `FS` is the wrong tool.
 
-The `std.libc` wrappers are the other place where std calls C directly. They stay one call into C, and no handler intercepts them (§9.1.3.3).
+The `std.libc` wrappers also call C directly. They stay one call into C, and no handler intercepts them (§9.1.3.3).
 
 **The row names the effect of the resource.** `getentropy` fills a buffer with random bytes, so its binding is `! Rand`, not `! IO`. `stat` reads file metadata, so `c_fs_stat` and the readers of stat data that take no argument are `! FS.Read`.
 
@@ -2151,7 +2192,7 @@ FFI Summary: 7 bindings across 3 modules
     curl_easy_perform effects: Net, IO   audit: NET-007  OK
 
 Handlers whose clause row comes from assumed bindings:
-  std.db.Connection  Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]  assumed via STD-DB-SQLITE
+  db.sqlite.Connection  Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand)]  assumed via DB-003, DB-004, DB-005
 
 Audit coverage: 6/7 (85.7%)
 Unaudited: net/curl.bl:curl_easy_init
@@ -2861,11 +2902,11 @@ This section specifies how native C dependencies are declared, resolved, and lin
 
 Native C dependencies fall into two categories:
 
-**Compiler-managed** dependencies back language-defined effect domains. The `db.*` operations (backed by sqlite3) and `net.*` operations (backed by POSIX sockets) are language primitives — they participate in the effect system, have compiler-known semantics, and are defined by the language, not imported from C headers. The compiler is responsible for providing these dependencies on all supported targets. Users never declare them in `blink.toml`.
+**Compiler-managed** dependencies back language-defined effect domains. The `net.*` operations (backed by POSIX sockets) are language primitives — they participate in the effect system, have compiler-known semantics, and are defined by the language, not imported from C headers. The compiler is responsible for providing these dependencies on all supported targets. Users never declare them in `blink.toml`. `DB` is an interface effect (§4.3): `std.db` holds no driver, so it has no native dependency. A driver comes from a package, and the package declares the native dependencies of its `@ffi` bindings (§4.7.2).
 
 **User-managed** dependencies are C libraries bound via `@ffi`. The user is responsible for declaring how to resolve them. The compiler cannot know what arbitrary C libraries a project needs.
 
-The boundary is crisp: if the API is behind a Blink effect handle (`db.*`, `net.*`, `io.*`), the compiler manages its native deps. If it's raw `@ffi`, the user manages it, except for the runtime libraries `c` and `m`, which every program links (*Runtime libraries*, below).
+The boundary is crisp: if the API is the default handler of a built-in effect (`net.*`, `io.*`), the compiler manages its native deps. If it's raw `@ffi`, the user manages it, also when a package uses the `@ffi` binding in a handler for an interface effect such as `DB`, except for the runtime libraries `c` and `m`, which every program links (*Runtime libraries*, below).
 
 #### `[native-dependencies]` in `blink.toml`
 
@@ -3085,7 +3126,7 @@ error[E0821]: native dependency unavailable for cross-target
 
 **CPU baseline.** A build for a target triple, host or cross, uses the CPU baseline of that triple (§9.1, *CPU Baseline and Accelerated Code*).
 
-**Compiler-managed deps** follow the same strategy automatically: the toolchain bundles its own dependencies (for example, sqlite3) and builds them from source during cross-compilation, or dynamically links on the host. Users never interact with this.
+**Compiler-managed deps** follow the same strategy automatically: the toolchain provides its own dependencies for each target, from system headers or system libraries. Users never interact with this.
 
 #### Compiler-Managed Dependency List
 
@@ -3093,7 +3134,6 @@ The following native C dependencies are compiler-managed. This list is exhaustiv
 
 | Module | C Dependency | Strategy |
 |--------|-------------|----------|
-| `db.*` | sqlite3 | Bundled with the toolchain |
 | `net.*` | POSIX sockets | System headers (no library linkage) |
 | runtime | libc, libm (`@ffi` names: `c`, `m`) | System (always available) |
 | `async.*` | pthreads | System (`-pthread` flag) |
@@ -3105,7 +3145,6 @@ The following native C dependencies are compiler-managed. This list is exhaustiv
 ```
 Native Dependencies:
   compiler-managed:
-    sqlite3           bundled (3.45.0)    OK
     pthreads          system              OK
   user-managed:
     sodium            vendored            vendor/sodium.c    OK
@@ -5623,7 +5662,7 @@ The following modules ship with the compiler as part of the standard library. Ef
 | `std.json` | JSON codec — `parse`, `stringify`, `decode[T]`, `encode[T]`, `pretty`. Completes `@derive(Serialize)` |
 | `std.http` | HTTP client convenience: builder patterns, retry, redirects, connection pooling |
 | `std.http.server` | HTTP server: routing, middleware, error handling |
-| `std.db` | Database effect API: `DB.Read`, `DB.Write`, `Template[DB]`, SQLite driver |
+| `std.db` | Database effect API: `DB.Read`, `DB.Write`, `Template[DB]`, `Row`, `DBError`, `Stmt`. No driver: the SQLite driver is the package `blinklang/sqlite` (§4.7.2) |
 | `std.term` | Terminal styling, ANSI colors, TTY detection, cursor control |
 
 #### Stdlib Errors
