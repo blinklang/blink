@@ -3385,7 +3385,7 @@ The `column_*` operations return no `Result`. In each of the three cases above, 
 
 The first case is also the result when a program keeps a `Stmt` past the `with` of one connection and uses it under the handler of a second connection. §4.7.2 (*Scoped effect handlers*) shows this with the connections of a driver package.
 
-**Release.** `s.finalize()` frees the statement at once. A second `finalize` does nothing and gives `Ok(())`. `finalize` keeps the `Stmt` in the record of the handler and marks it as finalized. A later operation on it then gets the third Err above, not the first. When the `with` of a driver's connection exits, the driver finalizes every `Stmt` that is still open. That holds when the `with` exits by `?`, by `return`, by `break`, and by panic. The exit does not finalize a `Stmt` again that `finalize` freed.
+**Release.** `s.finalize()` frees the statement at once. A second `finalize` does nothing and gives `Ok(())`. `finalize` keeps the `Stmt` in the record of the handler and marks it as finalized. A later operation on it then gets the third Err above, not the first. When the `with` of a driver's connection exits, the driver finalizes every `Stmt` that is still open. That holds when the `with` exits by `?`, by `return`, by `break`, and by a panic that a catch frame catches (`assert_panics`, or a case of `for_each`). An uncaught panic skips `exit()` (§4.7.2, *`exit()` constraints*): the process ends, and the OS gets the memory back. The exit does not finalize a `Stmt` again that `finalize` freed, or that an earlier exit finalized.
 
 `Stmt` is `Closeable` (§3.6, §5.5). Its `close` performs the `finalize` operation through the handler. It never calls the driver directly, so `with ... as` works under a mock handler:
 
@@ -4836,25 +4836,46 @@ A database driver is a scoped effect handler for `DB`. `std.db` holds the `DB` i
 
 ```blink
 // the package blinklang/sqlite
+type Entry {
+    Open(raw: RawStmt)
+    Finalized
+}
+
 pub type Connection {
     handle: Sqlite3
+    stmts: Map[Stmt, Entry]
+    closed: List[Bool]    // empty while the connection is open; one entry after exit closes it
 }
 
 impl Scoped for Connection {
     type Context = Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, State)]
 
     fn enter(self) -> Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, State)] {
-        sqlite_handler(self.handle)
+        sqlite_handler(self.handle, self.stmts, self.closed)
     }
 
     fn exit(self, ok: Bool) ! FS.Read, FS.Write, FS.Delete {
-        sqlite_close(self.handle)
+        let mut stmts = self.stmts    // a second name for the same cell
+        for (s, e) in stmts.entries() {
+            match e {
+                Open(raw) => {
+                    sqlite_finalize(raw)
+                    stmts.insert(s, Entry.Finalized)
+                }
+                Finalized => {}
+            }
+        }
+        if self.closed.is_empty() {
+            sqlite_close(self.handle)
+            let mut closed = self.closed
+            closed.push(true)
+        }
     }
 }
 
 pub fn connect(path: Str) -> Result[Connection, DBError] ! FS.Read, FS.Write, FS.Delete {
     let handle = sqlite_open(path)?
-    Ok(Connection { handle: handle })
+    Ok(Connection { handle: handle, stmts: Map.new(), closed: List.new() })
 }
 ```
 
@@ -4878,25 +4899,25 @@ fn setup() -> Result[Void, DBError]
 
 A driver package exports `connect`, and `connect` returns `Result[Connection, DBError]`, where `Connection` implements `Scoped` with a `Context` of `Handler[DB ! R]`. This is a convention for driver packages, not a rule the compiler checks. (Panel vote: 6-0. See [Database Driver Package rationale](../decisions/db-driver-package.md).)
 
-The handler of a driver's connection owns the `Stmt` values that it makes (§4.4.10). It keeps them in a map that the handler captures. `prepare` makes a token with `Stmt.new()` and adds it to the map. `finalize` keeps the token in the map and marks it as finalized. Each other clause looks up its token first. This part of `sqlite_handler` shows `prepare`, `step` and `finalize`. `sqlite_prepare`, `sqlite_step` and `sqlite_finalize` are private functions of the package:
+The handler of a driver's connection owns the `Stmt` values that it makes (§4.4.10). It keeps them in a map. `connect` makes the map, `Connection` holds it, and `enter` gives it to the handler. `prepare` makes a token with `Stmt.new()` and adds it to the map. `finalize` keeps the token in the map and marks it as finalized. `prepare` and `step` first check that the connection is open. `step` and `finalize` then look up their token. This part of `sqlite_handler` shows `prepare`, `step` and `finalize`. `sqlite_prepare`, `sqlite_step` and `sqlite_finalize` are private functions of the package:
 
 ```blink
-type Entry {
-    Open(raw: RawStmt)
-    Finalized
+fn check_open(closed: List[Bool]) -> Result[Void, DBError] {
+    if closed.is_empty() { Ok(()) } else { Err(ConnectionError("connection is closed")) }
 }
 
-fn sqlite_handler(handle: Sqlite3)
+fn sqlite_handler(handle: Sqlite3, mut stmts: Map[Stmt, Entry], closed: List[Bool])
     -> Handler[DB ! (FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, State)] {
-    let mut stmts: Map[Stmt, Entry] = Map.new()
     handler DB {
         fn prepare(sql: Template[DB]) -> Result[Stmt, DBError] {
+            check_open(closed)?
             let raw = sqlite_prepare(handle, sql)?
             let s = Stmt.new()
             stmts.insert(s, Entry.Open(raw))
             Ok(s)
         }
         fn step(s: Stmt) -> Result[Int, DBError] {
+            check_open(closed)?
             match stmts.get(s) {
                 Some(Open(raw)) => sqlite_step(handle, raw)
                 Some(Finalized) => Err(ExecError("statement is finalized"))
@@ -4921,6 +4942,10 @@ fn sqlite_handler(handle: Sqlite3)
 
 A token from a mock, or from the handler of another connection, is not in `stmts`, so the driver gives the first Err of §4.4.10. A finalized token stays in `stmts`, so a later operation on it gives `Err(ExecError("statement is finalized"))`.
 
+**The exit sweep.** `exit()` runs after the handler is uninstalled (*Order* below), so it cannot call the handler. It reaches the map through `self`. `Map` is a shared cell (§3.6 *Shared cells*), so `self.stmts` in `exit` is the same map that the handler writes. It is not a stale copy: do not copy it or call `clone()`, or the sweep finds no statement. `let mut stmts = self.stmts` makes a second name for that cell, because `self` is not a mutable root (§3.2.2). `closed` is a shared cell in the same way.
+
+The sweep runs before the close, because the native close fails while a statement is open. It finalizes each `Open` entry and writes `Entry.Finalized` for it, so a second sweep over the same map finalizes nothing. The map is made in `connect`, before `enter()`, so it does not break *Acquire before the block*: `enter()` hands nothing new to `exit()`. This is a convention for driver packages, like `connect`. The compiler does not check it. A finalized entry stays in the map for the life of the connection, because a later operation on it must get "statement is finalized". So the map grows by one entry per `prepare`.
+
 When the `with` exits, the driver finalizes every `Stmt` that is still open. A `Stmt` kept past its `with` and used under the handler of a second connection gives `Err(ExecError("statement belongs to another connection"))`:
 
 ```blink
@@ -4942,6 +4967,26 @@ fn late(a: Str, b: Str) -> Result[Void, DBError]
             None => {}
         }
     }
+    Ok(())
+}
+```
+
+A second `with` on the same `Connection` runs `exit()` a second time. The marks and `closed` make that safe. The sweep finds no `Open` entry, `closed` is not empty so the close does not run again, and the handler of the second `with` gives `Err(ConnectionError("connection is closed"))` for a new statement. W0611 (§5.5) still warns about the second `with`:
+
+```blink
+fn twice(path: Str) -> Result[Void, DBError]
+    ! FS.Read, FS.Write, FS.Delete, Time.Read, Time.Sleep, Rand, IO {
+    let c = sqlite.connect(path)?
+    with c {
+        let s = db.prepare("SELECT 1")?
+        s.step()?
+    }    // exit: the sweep finalizes s, then the close runs
+    with c {    // W0611
+        match db.prepare("SELECT 1") {
+            Ok(_) => {}
+            Err(e) => io.println("{e}")    // prints: connection_error: connection is closed
+        }
+    }    // exit: no Open entry, and no second close
     Ok(())
 }
 ```
@@ -4972,7 +5017,7 @@ The rule applies only when `T.Context` normalizes to `Handler[E]` with a concret
 
 **Acquire before the block.** `self` is passed by value, so `enter()` cannot hand new state to `exit()`. A scoped effect handler therefore holds its resource from construction, like a `Closeable`. Build it in the `with` item, as `sqlite.connect` does above. Entering the same value in two `with` blocks runs `exit()` twice; W0611 (§5.5) warns about it.
 
-A second `exit()` on a value whose resource is already released should do nothing, or should fail with a defined error. The stdlib's native handles do this: after `close`, a call on the handle returns an error such as `Err(ConnectionError("connection is closed"))`, not a use-after-free. This is guidance for user impls, not a rule the compiler checks. `std.testing`'s `Cleanup` runs its action on each `exit()`, so a second entry runs the action a second time.
+A second `exit()` on a value whose resource is already released should do nothing, or should fail with a defined error. The stdlib's native handles do this: after `close`, a call on the handle returns an error such as `Err(ConnectionError("connection is closed"))`, not a use-after-free. The `Connection` above does this: the sweep marks each entry, and `closed` guards the close. This is guidance for user impls, not a rule the compiler checks. `std.testing`'s `Cleanup` runs its action on each `exit()`, so a second entry runs the action a second time.
 
 The clause row of the handler is part of `Context`. `Handler[DB]` here would claim that the driver performs nothing outside the handler, which is false for a driver that opens files. `":memory:"` does not change this: the row is a bound on every path of the driver, not a prediction for one call (§9.1, *Foreign Rows Inside a Built-in Effect's Handler*).
 
