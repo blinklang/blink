@@ -29,6 +29,7 @@ import mono.{instance_node_tids, instances}
 import cg_call.{
     cg_call_element_from_runtime, cg_call_element_to_slot, cg_call_stdlib_declares,
     cg_call_stdlib_symbol, cg_call_equality_fn, cg_call_container_ctor, cg_call_order_sign_helper,
+    cg_call_written_method_fn,
 }
 import cg_promote.{
     cg_promote_has_pending, cg_promote_print_walkers, cg_promote_on_demand_claim, cg_promote_on_demand_settle,
@@ -51,6 +52,7 @@ import typecheck.{
     tc_lookup_node_tid, tc_sfield_name, tc_sfield_tid, tc_struct_field_slots,
     tc_tid_child, tc_tid_child_count, tc_tid_decl_node, tc_tid_kind, tc_tid_resolved,
     tc_type_str, tk_name, tc_member_tid_at_instance, tc_instance_has_trait, tc_std_trait_built, range_repr_tid,
+    tc_written_impl_holds, tc_derived_hash_holds,
 }
 import parser.{
     parser_live_ranges, node_name, node_fields, node_source_module, node_type_params, sublist_get,
@@ -69,6 +71,10 @@ let derive_hash = "Hash"
 let derive_clone = "Clone"
 let derive_serialize = "Serialize"
 let derive_deserialize = "Deserialize"
+
+// The methods Eq and Hash name, which a written impl of either trait spells.
+let method_eq = "eq"
+let method_hash = "hash"
 
 // The two words a Bool renders as. They are the Display of a Bool, not C text, and the
 // runtime holds the same pair in blink_sb_write_bool.
@@ -136,7 +142,7 @@ fn derive_one(decl: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let name = tc_derive_arg_trait(arg)
     for tid in derive_tids(decl, arg) {
         if already_written(decl, tid, name) { continue }
-        if tc_std_trait_built(tid, name) {
+        if derive_builds(tid, name) {
             derive_at(decl, tid, arg, name, bodies)
         } else if (name == derive_ord || name == derive_hash) && tc_instance_has_trait(tid, derive_eq) && !already_written(decl, tid, derive_eq) {
             eq_method(decl, tid, arg, bodies)
@@ -155,6 +161,12 @@ fn derive_at(decl: Int, tid: Int, arg: Int, name: Str, bodies: Bool) ! Diag.Repo
     if name == derive_serialize { return ser_method(decl, tid, arg, bodies) }
     if name == derive_deserialize { return de_method(decl, tid, arg, bodies) }
     not_built(arg, "@derive({name})")
+}
+
+// Whether the derived `name` holds at `tid` and is built. A written Hash impl meets the Hash
+// fact too, so Hash also asks the derive alone.
+fn derive_builds(tid: Int, name: Str) -> Bool {
+    tc_std_trait_built(tid, name) && (name != derive_hash || tc_derived_hash_holds(tid))
 }
 
 // The types one derive writes a body for. A generic declaration is a template with no C
@@ -347,7 +359,7 @@ fn eq_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let self_spelling = spelling_or_ice(layout_of(tid, Position.Param), node_name(decl), arg)
     let ret = bool_spelling(arg)
     if self_spelling == "" || ret == "" { return }
-    let symbol = c_derived_method_symbol(tid, "eq")
+    let symbol = c_derived_method_symbol(tid, method_eq)
     let params = ["{self_spelling} {self_param()}", "{self_spelling} {other_param()}"]
     if !bodies { return print_fn_decl(false, ret, symbol, params, false) }
     let body = eq_body(decl, tid, arg)
@@ -524,7 +536,7 @@ fn eq_nested_differs(ftid: Int, lhs: Int, rhs: Int, bools: Str, label: Str, span
         not_built(span, "{refusal}, which the field `{label}` would have to call")
         return -1
     }
-    eq_call_differs(c_derived_method_symbol(ftid, "eq"), lhs, rhs, bools, span)
+    eq_call_differs(c_derived_method_symbol(ftid, method_eq), lhs, rhs, bools, span)
 }
 
 // Whether two values differ, when a derived method answers whether they are equal.
@@ -1555,7 +1567,7 @@ fn hash_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     let self_spelling = spelling_or_ice(rec, node_name(decl), arg)
     let ret = u64_spelling(arg)
     if self_spelling == "" || ret == "" { return }
-    let symbol = c_derived_method_symbol(tid, "hash")
+    let symbol = c_derived_method_symbol(tid, method_hash)
     let params = ["{self_spelling} {self_param()}"]
     if !bodies {
         print_fn_decl(false, ret, symbol, params, false)
@@ -1565,17 +1577,29 @@ fn hash_method(decl: Int, tid: Int, arg: Int, bodies: Bool) ! Diag.Report {
     if body < 0 { return }
     print_pending_walkers()
     print_fn(false, ret, symbol, params, false, body)
-    kops_table(tid, rec, self_spelling)
+    kops_table(tid, rec, self_spelling, arg)
 }
 
 // The adapters take the key by value, so the size and the spelling must be the ones
 // layout gives a parameter, not the ones it gives a container slot. Whether the runtime
 // keeps the key's own bytes in the slot is layout's answer too, never this stage's guess:
 // a guess from the slot form gets a one-field struct wrong and mis-reads every key.
-fn kops_table(tid: Int, rec: LayoutRecord, key_spelling: Str) {
+fn kops_table(tid: Int, rec: LayoutRecord, key_spelling: Str, span: Int) ! Diag.Report {
     if rec.kops_table == "" { return }
-    print_kops_table(rec.kops_table, key_spelling, c_derived_method_symbol(tid, "hash"),
-        c_derived_method_symbol(tid, "eq"), rec.kops_inline_key)
+    let hash = nominal_hash_fn(tid, span)
+    let eq = cg_call_equality_fn(span, tc_resolve(tid))
+    if hash == "" || eq == "" { return }
+    print_kops_table(rec.kops_table, key_spelling, hash, eq, rec.kops_inline_key)
+}
+
+// The hash a struct or enum key is reached by. A written impl is what the program said, as
+// it is for `==`, so it wins over a derive; the derived method answers only where none is
+// written. kops_table takes the equality from cg_call_equality_fn, which `==` chooses by the
+// same rule.
+fn nominal_hash_fn(tid: Int, span: Int) -> Str ! Diag.Report {
+    let hand = cg_call_written_method_fn(span, tid, derive_hash, method_hash)
+    if hand != "" { return hand }
+    c_derived_method_symbol(tid, method_hash)
 }
 
 // A unit that binds the table needs the symbol, and it may not be the unit that defines
@@ -1591,9 +1615,10 @@ fn kops_table_decl(rec: LayoutRecord) {
 // Every key above reaches its table through the declaration that carries @derive(Hash). A
 // tuple has no declaration. Section 3.8 derives a tuple's Hash and its Eq from its
 // elements, so `Map[(Str, Int), Int]` is a legal keyed map with nothing for the walk above
-// to hang a table on, while layout answers with the table's name for it. The reference is
-// then emitted where the map is created, and the unit stops linking unless this stage
-// writes the body.
+// to hang a table on, while layout answers with the table's name for it. A struct or enum
+// whose Hash at the instance is a written impl has no derive to hang one on either. The
+// reference is then emitted where the map is created, and the unit stops linking unless
+// this stage writes the body.
 //
 // The table is declared in every unit and defined where the bodies are written, the rule
 // every derived method already follows. A nominal key is placed by the module that declared
@@ -1602,7 +1627,7 @@ fn kops_table_decl(rec: LayoutRecord) {
 // equality are static: the adapters the table holds are the only callers, and they are
 // written beside it.
 pub fn cg_derive_emit_key_tables(uses: List[KeyTableUse]) ! Diag.Report {
-    for u in uses { tuple_key_table(u) }
+    for u in uses { use_key_table(u) }
 }
 
 // Declared in every unit and defined in one, the rule every derived method already
@@ -1615,7 +1640,7 @@ fn key_table_decls() ! Diag.Report {
     for u in cg_derive_key_table_uses() { kops_table_decl(layout_of(u.key, Position.Param)) }
 }
 
-// The keys the program USES, not the tuples it merely names. Layout answers with a table
+// The keys the program USES, not the types it merely names. Layout answers with a table
 // name for every tuple whose elements can each be keyed, whether or not anything keys on
 // it, so walking the type pool instead would write a hash and an equality for every pair a
 // program holds and call neither.
@@ -1640,13 +1665,14 @@ pub type KeyTableUse {
 
 pub fn cg_derive_key_table_uses() -> List[KeyTableUse] {
     let mut seen: Map[Str, Int] = Map()
+    let hand_keys: Map[Int, Bool] = Map()
     let mut out: List[KeyTableUse] = []
     let ranges = parser_live_ranges()
     let mut r = 0
     while r < ranges.len() {
         let mut n = ranges.get(r).unwrap()
         while n < ranges.get(r + 1).unwrap() {
-            let key = tuple_key_of(tc_lookup_node_tid(n))
+            let key = table_key_of(tc_lookup_node_tid(n), hand_keys)
             if unclaimed_key_table(seen, key) != "" { out.push(KeyTableUse { node: n, key: key, owner: n }) }
             n = n + 1
         }
@@ -1658,7 +1684,7 @@ pub fn cg_derive_key_table_uses() -> List[KeyTableUse] {
     while row < table.len() {
         let owner = table.get(row).unwrap().base_decl_node
         for (n, tid) in instance_node_tids(row) {
-            let key = tuple_key_of(tid)
+            let key = table_key_of(tid, hand_keys)
             let claimed = unclaimed_key_table(seen, key)
             if claimed != "" { by_table.insert(claimed, KeyTableUse { node: n, key: key, owner: owner }) }
         }
@@ -1677,7 +1703,7 @@ fn unclaimed_key_table(seen: Map[Str, Int], key: Int) -> Str {
     table
 }
 
-// The tuple type each use keys on, in their order. A Map is not a carrier, so the typedef
+// The key type each use keys on, in their order. A Map is not a carrier, so the typedef
 // walk reaches no key through the map: the driver hands it these as well, or a program that
 // spells the pair nowhere else names a table over a type no unit declares.
 pub fn cg_derive_key_table_keys(uses: List[KeyTableUse]) -> List[Int] {
@@ -1693,32 +1719,60 @@ pub fn cg_derive_key_table_names(uses: List[KeyTableUse]) -> List[Str] {
     out
 }
 
-// The tuple a keyed container of type `tid0` keys on, or -1. Map and Set are the two kinds
-// with a key, and child 0 is that key for both.
-fn tuple_key_of(tid0: Int) -> Int {
+// The key a keyed container of type `tid0` keys on, when no declaration's derive writes its
+// table, or -1. Map and Set are the two kinds with a key, and child 0 is that key for both.
+// `hand_keys` keeps the answer of written_hash_key per key, which every node of the program asks.
+fn table_key_of(tid0: Int, hand_keys: Map[Int, Bool]) -> Int {
     let tid = tc_tid_resolved(tid0)
     if tid < 0 { return -1 }
     let k = tc_tid_kind(tid)
     if k != TyKind.Map && k != TyKind.Set { return -1 }
     let key = tc_tid_resolved(tc_tid_child(tid, 0))
     if key < 0 { return -1 }
-    if tc_tid_kind(key) != TyKind.Tuple { return -1 }
-    key
+    let key_kind = tc_tid_kind(key)
+    if key_kind == TyKind.Tuple { return key }
+    if key_kind != TyKind.Struct && key_kind != TyKind.Enum { return -1 }
+    let known = hand_keys.get(key)
+    let holds = match known {
+        Some(b) => b
+        None => {
+            let b = written_hash_key(key)
+            hand_keys.insert(key, b)
+            b
+        }
+    }
+    if holds { key } else { -1 }
 }
 
-// One structural key's table, over the methods the key and its elements need. The two
+// A struct or enum key whose Hash at this instance is a written impl only. The derive walk
+// writes the table of a derived Hash beside its body, at the instances derive_one builds; a
+// written impl has no derive to hang one on, so the key's uses supply it, as a tuple's do.
+fn written_hash_key(key: Int) -> Bool {
+    let decl = tc_tid_decl_node(key)
+    if decl < 0 || decl == DECL_NODE_AMBIGUOUS { return false }
+    let derived = tc_decl_derives(decl, derive_hash) != 0 && derive_builds(key, derive_hash)
+    !derived && tc_written_impl_holds(key, derive_hash, method_hash)
+}
+
+// The table of a key its uses supply: a tuple, over the methods the key and its elements
+// need, or a struct or enum key with a written Hash, over the written methods. A tuple's two
 // symbols are spelled from the typedef name, which is the name the table is spelled from,
 // so a non-empty table means both are spellable and neither needs a second check here.
-fn tuple_key_table(u: KeyTableUse) ! Diag.Report {
+fn use_key_table(u: KeyTableUse) ! Diag.Report {
     let tid = u.key
     let n = u.node
     let rec = layout_of(tid, Position.Param)
     if rec.kops_table == "" { return }
-    if !tuple_methods(tid, n) { return }
+    let is_tuple = tc_tid_kind(tid) == TyKind.Tuple
+    if is_tuple && !tuple_methods(tid, n) { return }
     let key_spelling = spelling_or_ice(rec, tc_type_str(tid), n)
     if key_spelling == "" { return }
-    print_kops_table(rec.kops_table, key_spelling, c_tid_derive_method_name(tid, "hash"),
-        c_tid_derive_method_name(tid, "eq"), rec.kops_inline_key)
+    if !is_tuple {
+        kops_table(tid, rec, key_spelling, n)
+        return
+    }
+    print_kops_table(rec.kops_table, key_spelling, c_tid_derive_method_name(tid, method_hash),
+        c_tid_derive_method_name(tid, method_eq), rec.kops_inline_key)
 }
 
 // One tuple's equality and hash, and every tuple inside it first. An element that is itself
@@ -1729,7 +1783,7 @@ fn tuple_key_table(u: KeyTableUse) ! Diag.Report {
 // equality behind that nothing calls. Answers whether the pair now exists, so a refusal deep in an element stops
 // the table that would have named it.
 fn tuple_methods(tid: Int, span: Int) -> Bool ! Diag.Report {
-    let eq_symbol = c_tid_derive_method_name(tid, "eq")
+    let eq_symbol = c_tid_derive_method_name(tid, method_eq)
     if tuple_methods_done.contains_key(eq_symbol) {
         return tuple_methods_done.get(eq_symbol).unwrap() == 1
     }
@@ -1758,7 +1812,7 @@ fn tuple_methods(tid: Int, span: Int) -> Bool ! Diag.Report {
 // alike, so a unit that has both defines it once. "" is a refusal already reported.
 fn cg_derive_tuple_hash_fn(tid: Int, span: Int) -> Str ! Diag.Report {
     let r = tc_resolve(tid)
-    let symbol = c_tid_derive_method_name(r, "hash")
+    let symbol = c_tid_derive_method_name(r, method_hash)
     if diag_is_ice_seg(symbol) {
         derive_ice(span, "no hash function name for {tc_type_str(r)}: {symbol}")
         return ""
@@ -2090,16 +2144,14 @@ fn hash_nested(ftid: Int, value: Int, path: Str, span: Int) -> Int ! Diag.Report
         derive_ice(span, "field type {ftid} has no unambiguous declaration to hash through")
         return -1
     }
-    if !has_str(derive_names(fdecl), derive_hash) {
-        not_built(span, "@derive(Hash) on a field whose type `{node_name(fdecl)}` implements Hash by hand")
-        return -1
-    }
+    let hand = cg_call_written_method_fn(span, ftid, derive_hash, method_hash)
+    if hand != "" { return ir_call_direct(TYPE_U64, span, u64s, hand, u64_form(), [value]) }
     let refusal = hash_refusal(fdecl, ftid)
     if refusal != "" {
         not_built(span, "{refusal}, which the field `{path}` would have to call")
         return -1
     }
-    ir_call_direct(TYPE_U64, span, u64s, c_derived_method_symbol(ftid, "hash"), u64_form(), [value])
+    ir_call_direct(TYPE_U64, span, u64s, c_derived_method_symbol(ftid, method_hash), u64_form(), [value])
 }
 
 // ── Clone ────────────────────────────────────────────────────────────────

@@ -880,7 +880,7 @@ let first_two = names
 
 ## Map[K, V] Methods
 
-`K` may be `Str`, `Int`, `Bool`, `Char`, any sized-int (`I8`..`U64`), a tuple of hashable types, or a user `struct`/`enum` with `@derive(Hash, Eq)`. `Float`/`F32`/`F64` keys and user types without `@derive(Hash, Eq)` are rejected with `E1400 MapKeyNotHashable`. Tuples auto-derive `Hash`/`Eq` structurally.
+`K` may be `Str`, `Int`, `Bool`, `Char`, any sized-int (`I8`..`U64`), a tuple of hashable types, or a user `struct`/`enum` that implements `Hash` and `Eq`, by `@derive(Hash, Eq)` or by written `impl`s. `Float`/`F32`/`F64` keys and user types with no `Hash` impl are rejected with `E1400 MapKeyNotHashable`. Tuples auto-derive `Hash`/`Eq` structurally.
 
 A type parameter used as a key needs a `Hash` bound: `fn count[K: Hash](xs: List[K]) -> Map[K, Int]`. A generic body is checked once, from its written bounds, so a key use of an unbounded `K` (`m.insert(k, v)`, `s.contains(k)`, a `Map[K, V]` or `Set[K]` annotation in the body) is `E1400` in the body, whether or not code calls it. The fix adds `K: Hash`; in an impl method, put the bound on the trait method and repeat it on the method.
 

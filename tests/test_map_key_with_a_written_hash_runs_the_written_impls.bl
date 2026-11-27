@@ -1,0 +1,358 @@
+// sections/03_types.md §3.6, "Non-hashable keys and elements in general": a user type gets
+// Hash and Eq from @derive(Hash, Eq) or from a written impl, and either one keys a Map or a Set.
+// Each program runs as its own build, so one row that does not compile leaves the others.
+
+import compile_test_helpers
+
+fn has(text: Str, part: Str, label: Str) {
+    assert(text.contains(part), "{label}: expected `{part}` in:\n{text}")
+}
+
+fn runs(src: Str, tag: Str, want: Str) ! FS.Delete, FS.Write, Process.Spawn, FS.Read, Env.Read {
+    let r = compile_test_helpers.compile_and_run(src, tag)
+    let all = "{r.out}{r.err_out}"
+    assert_eq(r.exit_code, 0, all)
+    has(r.out, want, tag)
+}
+
+// The written eq reads only x, and the written hash is one value for all, so keys that differ
+// only in note are one key.
+fn written_k() -> Str {
+    #"type K { x: Int, note: Str }
+impl Eq for K { fn eq(self, other: K) -> Bool { self.x == other.x } }
+impl Hash for K { fn hash(self) -> U64 { 7 } }
+"#
+}
+
+test "a struct with a written Hash and Eq keys a Map, and the map calls the written eq" {
+    runs("{written_k()}fn main() \{
+    let mut m: Map[K, Int] = Map.new()
+    m.insert(K \{ x: 1, note: \"a\" }, 10)
+    m.insert(K \{ x: 1, note: \"b\" }, 20)
+    io.println(\"len=\{m.len()} got=\{m.get(K \{ x: 1, note: \"c\" }).unwrap()}\")
+}
+", "whash_map", "len=1 got=20")
+}
+
+test "a struct with a written Hash and Eq is a Set element" {
+    runs("{written_k()}fn main() \{
+    let mut s: Set[K] = Set.new()
+    s.insert(K \{ x: 2, note: \"a\" })
+    s.insert(K \{ x: 2, note: \"b\" })
+    io.println(\"len=\{s.len()} has=\{s.contains(K \{ x: 2, note: \"z\" })}\")
+}
+", "whash_set", "len=1 has=true")
+}
+
+// sections/03_types.md §3.6.1 *Supertrait Auto-Derivation*, rule 3: a derived Hash over a
+// written Eq would break the Hash law, so the pair is an error.
+test.failing(
+    "a derived Hash with a written Eq is the error DeriveOverHandWrittenEq",
+    reason: "the compiler does not report DeriveOverHandWrittenEq yet, so the pair builds",
+) {
+    let out = compile_test_helpers.compile_and_capture(#"@derive(Hash)
+type K { x: Int }
+impl Eq for K { fn eq(self, other: K) -> Bool { self.x == other.x } }
+fn main() {
+    let m: Map[K, Int] = Map.new()
+    io.println("{m.len()}")
+}
+"#, "whash_derived_hash_written_eq")
+    has(out, "DeriveOverHandWrittenEq", "a derived Hash over a written Eq")
+}
+
+test "a derived Eq with a written Hash keys a Map" {
+    runs(#"@derive(Eq)
+type K { x: Int, note: Str }
+impl Hash for K { fn hash(self) -> U64 { self.x.hash() } }
+fn main() {
+    let mut m: Map[K, Int] = Map.new()
+    m.insert(K { x: 1, note: "a" }, 10)
+    m.insert(K { x: 1, note: "b" }, 20)
+    m.insert(K { x: 1, note: "a" }, 30)
+    io.println("len={m.len()} got={m.get(K { x: 1, note: "a" }).unwrap()}")
+}
+"#, "whash_derived_eq_written_hash", "len=2 got=30")
+}
+
+test "an enum with a written Hash and Eq is a Set element" {
+    runs(#"type E { A(Int), B }
+impl Eq for E {
+    fn eq(self, other: E) -> Bool {
+        match (self, other) {
+            (E.B, E.B) => true
+            (E.A(_), E.A(_)) => true
+            _ => false
+        }
+    }
+}
+impl Hash for E {
+    fn hash(self) -> U64 {
+        match self {
+            E.A(_) => 1
+            E.B => 2
+        }
+    }
+}
+fn main() {
+    let mut s: Set[E] = Set.new()
+    s.insert(E.A(1))
+    s.insert(E.A(2))
+    s.insert(E.B)
+    io.println("len={s.len()} has={s.contains(E.A(9))}")
+}
+"#, "whash_enum", "len=2 has=true")
+}
+
+test "a tuple that holds a key with a written Hash and Eq keys a Map" {
+    runs("{written_k()}fn main() \{
+    let mut m: Map[(K, Int), Int] = Map.new()
+    m.insert((K \{ x: 1, note: \"a\" }, 0), 10)
+    m.insert((K \{ x: 1, note: \"b\" }, 0), 20)
+    m.insert((K \{ x: 1, note: \"b\" }, 1), 30)
+    io.println(\"len=\{m.len()} got=\{m.get((K \{ x: 1, note: \"z\" }, 0)).unwrap()}\")
+}
+", "whash_tuple", "len=2 got=20")
+}
+
+test "a derived Hash and Eq call the written impls of a field" {
+    runs("{written_k()}@derive(Hash, Eq)
+type W \{ k: K, n: Int }
+fn main() \{
+    let mut m: Map[W, Int] = Map.new()
+    m.insert(W \{ k: K \{ x: 1, note: \"a\" }, n: 0 }, 10)
+    m.insert(W \{ k: K \{ x: 1, note: \"b\" }, n: 0 }, 20)
+    io.println(\"len=\{m.len()} eq=\{W \{ k: K \{ x: 1, note: \"a\" }, n: 0 } == W \{ k: K \{ x: 1, note: \"c\" }, n: 0 }}\")
+}
+", "whash_field", "len=1 eq=true")
+}
+
+test "a generic type with a written Hash and Eq keys a Map at an instance" {
+    runs(#"type H[T] { v: T, note: Str }
+impl[T: Eq] Eq for H[T] { fn eq(self, other: H[T]) -> Bool { self.v == other.v } }
+impl[T: Hash] Hash for H[T] { fn hash(self) -> U64 { self.v.hash() } }
+fn main() {
+    let mut m: Map[H[Int], Int] = Map.new()
+    m.insert(H { v: 1, note: "a" }, 10)
+    m.insert(H { v: 1, note: "b" }, 20)
+    let mut s: Set[H[Str]] = Set.new()
+    s.insert(H { v: "p", note: "a" })
+    s.insert(H { v: "p", note: "b" })
+    io.println("len={m.len()} got={m.get(H { v: 1, note: "c" }).unwrap()} set={s.len()}")
+}
+"#, "whash_generic", "len=1 got=20 set=1")
+}
+
+test "a key type with a written Hash and Eq from another module keys a Map" {
+    let helper = #"pub type K { x: Int, note: Str }
+impl Eq for K { fn eq(self, other: K) -> Bool { self.x == other.x } }
+impl Hash for K { fn hash(self) -> U64 { self.x.hash() } }
+"#
+    let entry = #"import keys.kmod.{K}
+fn main() {
+    let mut m: Map[K, Int] = Map.new()
+    m.insert(K { x: 1, note: "a" }, 10)
+    m.insert(K { x: 1, note: "b" }, 20)
+    io.println("len={m.len()} got={m.get(K { x: 1, note: "c" }).unwrap()}")
+}
+"#
+    let r = compile_test_helpers.run_xmod(entry, "keys", "kmod", helper, "whash_xmod")
+    assert_eq(r.exit_code, 0, "{r.out}{r.err_out}")
+    has(r.out, "len=1 got=20", "cross-module key")
+}
+
+// The other side of the rule: a key with no Hash at all is still refused.
+test "a struct with neither a derived nor a written Hash is still refused as a Map key" {
+    let out = compile_test_helpers.compile_and_capture(#"type K { x: Int }
+fn main() {
+    let m: Map[K, Int] = Map.new()
+    io.println("{m.len()}")
+}
+"#, "whash_no_hash")
+    has(out, "\"code\":\"E1400\"", "no Hash is MapKeyNotHashable")
+}
+
+// Hash: Eq, so a written Hash with no Eq is refused at the impl, and the key holds the impl.
+test "a written Hash with no Eq is refused at the impl, not at the key" {
+    let out = compile_test_helpers.compile_and_capture(#"type K { x: Int }
+impl Hash for K { fn hash(self) -> U64 { self.x.hash() } }
+fn main() {
+    let m: Map[K, Int] = Map.new()
+    io.println("{m.len()}")
+}
+"#, "whash_no_eq")
+    has(out, "\"code\":\"E0911\"", "the impl misses its supertrait Eq")
+    assert(!out.contains("\"code\":\"E1400\""), out)
+}
+
+// A written impl holds only where its own bounds do, so an instance whose argument has no
+// Hash is refused, and the reason names the written impl, not a derive.
+test "an instance where the bounds of a written Hash fail is refused as a Set element" {
+    let out = compile_test_helpers.compile_and_capture(#"type W { n: Int }
+type H[T] { v: T }
+impl[T: Eq] Eq for H[T] { fn eq(self, other: H[T]) -> Bool { self.v == other.v } }
+impl[T: Hash] Hash for H[T] { fn hash(self) -> U64 { self.v.hash() } }
+fn main() {
+    let s: Set[H[W]] = Set.new()
+    io.println("{s.len()}")
+}
+"#, "whash_bound_fails")
+    has(out, "\"code\":\"E1400\"", "the instance has no Hash")
+    has(out, "the written Hash impl holds only where its bounds hold", "the reason names the written impl")
+}
+
+// A fieldless enum is Eq by its tag (§3.6 *Container Equality*), so an impl Hash alone keys it.
+test "a fieldless enum with only a written Hash keys a Set, a tuple key and a derived key" {
+    runs(#"type C { Red, Green, Blue }
+impl Hash for C {
+    fn hash(self) -> U64 {
+        match self {
+            C.Red => 1
+            C.Green => 2
+            C.Blue => 3
+        }
+    }
+}
+@derive(Hash, Eq)
+type W { c: C, n: Int }
+fn main() {
+    let mut s: Set[C] = Set.new()
+    s.insert(C.Red)
+    s.insert(C.Red)
+    s.insert(C.Blue)
+    let mut m: Map[(C, Int), Int] = Map.new()
+    m.insert((C.Red, 1), 1)
+    m.insert((C.Red, 1), 2)
+    let mut w: Set[W] = Set.new()
+    w.insert(W { c: C.Green, n: 1 })
+    w.insert(W { c: C.Green, n: 1 })
+    io.println("s={s.len()} m={m.len()} w={w.len()}")
+}
+"#, "whash_fieldless", "s=2 m=1 w=1")
+}
+
+// Each impl holds only where its own bounds do. At H[E] the derive needs E: Hash, which fails,
+// and the written impl needs E: Eq, which holds, so the written hash keys the Set.
+test "an instance where only the written Hash holds keys a Set through the written hash" {
+    runs(#"@derive(Eq)
+type E { n: Int }
+@derive(Hash, Eq)
+type H[T] { v: T }
+impl[T: Eq] Hash for H[T] {
+    fn hash(self) -> U64 { 7 }
+}
+fn main() {
+    let mut s: Set[H[E]] = Set.new()
+    s.insert(H { v: E { n: 1 } })
+    s.insert(H { v: E { n: 1 } })
+    s.insert(H { v: E { n: 2 } })
+    io.println("s={s.len()}")
+}
+"#, "whash_only_written_holds", "s=2")
+}
+
+// At H[S] the written impl needs S: Ord, which fails, so its body is not built there and the
+// derived hash keys the Set, alone and as the field of a derived key.
+test "an instance where only the derived Hash holds keys a Set through the derived hash" {
+    runs(#"@derive(Hash, Eq)
+type S { n: Int }
+@derive(Hash, Eq)
+type H[T] { v: T }
+impl[T: Ord] Hash for H[T] {
+    fn hash(self) -> U64 {
+        let a = self.v
+        if a < a { 1 } else { 2 }
+    }
+}
+@derive(Hash, Eq)
+type W2 { h: H[S] }
+fn main() {
+    let mut s: Set[H[S]] = Set.new()
+    s.insert(H { v: S { n: 1 } })
+    s.insert(H { v: S { n: 2 } })
+    s.insert(H { v: S { n: 2 } })
+    let mut t: Set[H[Int]] = Set.new()
+    t.insert(H { v: 1 })
+    t.insert(H { v: 2 })
+    let mut w: Set[W2] = Set.new()
+    w.insert(W2 { h: H { v: S { n: 1 } } })
+    w.insert(W2 { h: H { v: S { n: 1 } } })
+    io.println("s={s.len()} t={t.len()} w={w.len()}")
+}
+"#, "whash_only_derived_holds", "s=2 t=2 w=1")
+}
+
+// A signature and a field are checked before the impls are read, so their keys are judged
+// once every written impl is known.
+test "a key with a written Hash and Eq is accepted in a fn parameter" {
+    runs("{written_k()}fn count(m: Map[K, Int]) -> Int \{ m.len() }
+fn main() \{
+    let mut m: Map[K, Int] = Map.new()
+    m.insert(K \{ x: 1, note: \"a\" }, 1)
+    io.println(\"n=\{count(m)}\")
+}
+", "whash_sig_param", "n=1")
+}
+
+test "a key with a written Hash and Eq is accepted in a return type" {
+    runs("{written_k()}fn make() -> Set[K] \{
+    let mut s: Set[K] = Set.new()
+    s.insert(K \{ x: 1, note: \"a\" })
+    s.insert(K \{ x: 1, note: \"b\" })
+    s
+}
+fn main() \{
+    io.println(\"n=\{make().len()}\")
+}
+", "whash_sig_return", "n=1")
+}
+
+test "a key with a written Hash and Eq is accepted in a struct field" {
+    runs("{written_k()}type Holder \{ m: Map[K, Int] }
+fn main() \{
+    let mut h = Holder \{ m: Map.new() }
+    h.m.insert(K \{ x: 2, note: \"a\" }, 5)
+    io.println(\"n=\{h.m.len()}\")
+}
+", "whash_sig_field", "n=1")
+}
+
+test "a key with a written Hash and Eq is accepted in a trait and an impl method parameter" {
+    runs("{written_k()}type Counter \{ n: Int }
+trait Adds \{
+    fn add(self, m: Map[K, Int]) -> Int
+}
+impl Adds for Counter \{
+    fn add(self, m: Map[K, Int]) -> Int \{ self.n + m.len() }
+}
+fn main() \{
+    let m: Map[K, Int] = Map.new()
+    io.println(\"n=\{Counter \{ n: 3 }.add(m)}\")
+}
+", "whash_sig_method", "n=3")
+}
+
+test "an instance where the bounds of a written Hash fail is refused in a fn parameter" {
+    let out = compile_test_helpers.compile_and_capture(#"type W { n: Int }
+type H[T] { v: T }
+impl[T: Eq] Eq for H[T] { fn eq(self, other: H[T]) -> Bool { self.v == other.v } }
+impl[T: Hash] Hash for H[T] { fn hash(self) -> U64 { self.v.hash() } }
+fn count(s: Set[H[W]]) -> Int { s.len() }
+fn main() {
+    io.println("{count(Set.new())}")
+}
+"#, "whash_sig_bound_fails")
+    has(out, "\"code\":\"E1400\"", "the instance has no Hash")
+    has(out, "the written Hash impl holds only where its bounds hold", "the reason names the written impl")
+}
+
+test "a struct with neither a derived nor a written Hash is still refused in a struct field" {
+    let out = compile_test_helpers.compile_and_capture(#"type K { x: Int }
+type Holder { m: Map[K, Int] }
+fn main() {
+    let h = Holder { m: Map.new() }
+    io.println("{h.m.len()}")
+}
+"#, "whash_sig_field_refused")
+    has(out, "\"code\":\"E1400\"", "a key with no Hash")
+}
