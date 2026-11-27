@@ -71,7 +71,7 @@ import diagnostics.{
     UNUSED_VARIABLE, SET_BUT_NOT_READ, SHADOWED_VARIABLE, SHADOWED_PRELUDE_NAME, DUPLICATE_SYMBOL,
     DISCARDED_COLLECTION_COPY, TODO_IN_CODE, NEGATIVE_ZERO_COMPARISON, diag_warn_span_label_at_notes,
     UNREACHABLE_CODE, UNAUDITED_FFI, DEPRECATED_USAGE,
-    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, RESERVED_EFFECT_NAME, HANDLER_CLAUSE_MISMATCH, UNKNOWN_HANDLER_OP, DUPLICATE_HANDLER_CLAUSE, NOT_DERIVABLE,
+    NAME_COLLISION, AMBIGUOUS_CONSTRUCTION, RESERVED_TYPE_NAME, RESERVED_EFFECT_NAME, STATE_NOT_HANDLEABLE, HANDLER_CLAUSE_MISMATCH, UNKNOWN_HANDLER_OP, DUPLICATE_HANDLER_CLAUSE, NOT_DERIVABLE,
     NO_SUCH_FIELD, MISSING_FIELD, DUPLICATE_FIELD, VARIANT_SPREAD, PATTERN_MISSING_REST, MIXED_VARIANT_FIELDS, VARIANT_ARGUMENT_COUNT, diag_set_last_assist_at,
     INT_LITERAL_OUT_OF_RANGE, diag_has_error_at,
     OVERLAPPING_IMPLS, DUPLICATE_EFFECT_OP,
@@ -12842,6 +12842,14 @@ fn tc_check_handler_clauses(he: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag
     }
 }
 
+// `State` has no operations, so a handler of it has nothing to handle, and nothing takes
+// `State` out of a row (§4.16.1).
+fn tc_report_state_not_handleable(at: Int) ! Diag.Report {
+    diag_error_at("StateNotHandleable", STATE_NOT_HANDLEABLE,
+        "`State` has no handler", at,
+        "delete the handler: `State` stays in the row of each caller up to `main` or a test block, which hold it")
+}
+
 // error[DuplicateHandlerClause] at the clause `m`, a later clause for the operation that the
 // clause `first` names. No fix: a tool cannot know which body to keep.
 fn tc_report_duplicate_handler_clause(first: Int, m: Int) ! Diag.Report {
@@ -19413,7 +19421,12 @@ fn pp_walk(node: Int, fn_name: Str, anchor: Int) ! Diag.Report {
         pp_walk(node_value(node), fn_name, anchor)
         return
     }
-    // Literals + identifiers — leaves, nothing to check.
+    // Any other kind, such as an interpolated string, a struct or tuple literal, a closure or a
+    // `with`, can hold a call, and the effect-row check leaves a plain call here to this walk.
+    if k == NodeKind.FnDef { return }
+    let mut kids: List[Int] = []
+    node_push_value_child_ids(node, kids)
+    for c in kids { pp_walk(c, fn_name, anchor) }
 }
 
 fn tc_register_pure_fns(fns_sl: Int) {
@@ -26410,8 +26423,13 @@ fn tc_reject_reserved_effect_names(program: Int) ! Diag.Report {
             ("the handle `{handle}` is reserved for the built-in effect `{root}`", "reserved: `{name}` has the handle `{handle}`, the handle of the built-in `{root}`")
         }
         let (line, col) = nr_decl_name_at(ModuleDeclName { namespace: "type", name: name, decl: ed, binder: -1 })
+        let replace = if root == "State" {
+            "`State` has no handler (§4.16.1); to give a test its own state, pass the value in and return it"
+        } else {
+            "to replace `{root}` in a test, write `handler {root} \{ ... }` and install it with `with`"
+        }
         diag_error_span_label_at_notes("ReservedEffectName", RESERVED_EFFECT_NAME, msg, ed, line, col, col + name.byte_len(), label,
-            "rename the effect; its handle is the lowercase form of its name\nto replace `{root}` in a test, write `handler {root} \{ ... }` and install it with `with`",
+            "rename the effect; its handle is the lowercase form of its name\n{replace}",
             ["the reserved handles are {reserved_effect_handles().join(", ")}"])
         dropped.insert(ed, 1)
     }
@@ -47978,6 +47996,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
                     let _ = tc_check_with_item(wh_item2, item_tid, false)
                     tc_note_on_panic_hiding_since(before_item, wh_item2)
                     let item_eff = tc_tid_handler_effect(item_tid)
+                    // A handler literal reports itself, so the with reports only a value.
+                    if wh_kind2 != NodeKind.HandlerExpr && tc_handler_effect_root(item_eff) == "State" {
+                        tc_report_state_not_handleable(wh_item2)
+                    }
                     if item_eff != "" { tc_ue.with_effects.push(item_eff) }
                 }
                 wi2 = wi2 + 1
@@ -48028,6 +48050,10 @@ fn tc_check_body(node: Int) ! TypeCheck.Resolve, TypeCheck.Report, Diag.Report {
     // call argument, written inline in a `with`, or bound to a `let`. The WithBlock arm
     // above already routes an inline handler here, so this arm is what actually walks it.
     if kind == NodeKind.HandlerExpr {
+        if tc_handler_effect_root(tc_handler_effect_at(node)) == "State" {
+            tc_report_state_not_handleable(node)
+            return
+        }
         tc_check_partial_handler(node)
         tc_check_handler_clauses(node)
         return
@@ -52470,6 +52496,19 @@ fn tc_er_require(program: Int, site: Int, held: List[Str], owner: ErOwner, calle
         tc_fr_note_missed(owner, req)
         return
     }
+    // State is never declared below the roots: the compiler adds it to each caller's row
+    // (§4.16.1). Only a @pure fn may not hold it. The @pure body check (pp_walk) reports each
+    // plain call of a known fn in the body already, so this reports the rest, such as a method.
+    if req == "State" {
+        let pure = owner.decl >= 0 && has_annotation(owner.decl, "pure") != 0
+        let pp_reported = node_kind(site) == NodeKind.Call && lookup_fnsig(tc_call_declared_name(site)) != -1
+        if pure && !pp_reported {
+            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION,
+                "`@pure` function `{owner.name}` has the effect `State`", site,
+                "remove `@pure`, or pass the value in as an argument")
+        }
+        return
+    }
     if req == "_" && owner.default_body {
         diag_error_at("UndeclaredEffect", UNDECLARED_EFFECT,
             "call to `{callee}` needs effect `_`, which the default body of `{owner.name}` may not perform", site,
@@ -53566,6 +53605,7 @@ fn tc_er_walk(program: Int, node: Int, held: List[Str], owner: ErOwner, kids: Li
         tc_er_check_fn_values_run(program, node, held, owner)
     }
     if k == NodeKind.MethodCall && !owner.collect { tc_er_check_helper_fix(program, node, held) }
+    if k == NodeKind.MethodCall && !owner.collect && tc_is_async_spawn_call(node) { tc_check_spawn_state(node, owner.assigns) }
     // One child buffer serves the whole descent: each node appends its children, walks them,
     // and gives the slots back, so a body is walked without a list per node.
     let base = kids.len()
@@ -53590,6 +53630,7 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int
         tc_er_walk(program, node_body(fn_node), builtin_effect_tree_roots(), ErOwner { name: node_name(fn_node), decl: fn_node, default_body: false, msg_ran: msg_ran, assigns: assigns, root: true, hook: hook, collect: false, missed: [] }, kids)
         return
     }
+    if has_annotation(fn_node, "pure") != 0 { tc_pure_check_state_read(fn_node, node_body(fn_node), kids) }
     let block = tc_method_block.get(fn_node) ?? -1
     // A default body also runs for an impl that does not override it, and a call through
     // such an impl is charged nothing, so the body may not perform impl-chosen effects: its
@@ -53600,6 +53641,81 @@ fn tc_er_walk_fn(program: Int, fn_node: Int, msg_ran: Set[Int], assigns: Map[Int
         if !(default_body && e == "_") { held.push(e) }
     }
     tc_er_walk(program, node_body(fn_node), held, ErOwner { name: node_name(fn_node), decl: fn_node, default_body: default_body, msg_ran: msg_ran, assigns: assigns, root: false, hook: hook, collect: false, missed: [] }, kids)
+}
+
+// Two tasks that touch one module `let mut` race, so a spawned fn value may not have State in
+// its row (§4.16.6). A value that names no body brings the row of its fn type. The check
+// reports nothing yet: each such spawn is a line on the trace channel `blink.state_spawn`,
+// until src and lib/std spawn no task that touches module state.
+fn tc_check_spawn_state(call: Int, assigns: Map[Int, List[Int]]) ! TypeCheck.Resolve, Diag.Report {
+    let args = node_args(call)
+    if args == -1 || sublist_length(args) != 1 { return }
+    let v = sublist_get(args, 0)
+    let cs = tc_tm_closures_of([v], assigns)
+    let mut seen: Set[Str] = Set()
+    let mut todo: List[TmBody] = []
+    let mut reads: List[Str] = []
+    let mut writes: List[Str] = []
+    let mut kids: List[Int] = []
+    let mut declared = false
+    if cs.len() == 0 {
+        declared = tc_fr_type_row(resolve_alias_tid(tc_resolve(tc_lookup_node_tid(v)))).contains("State")
+    }
+    for c in cs {
+        if node_kind(c) == NodeKind.FnDef {
+            if tc_er_fn_row(c).contains("State") { declared = true }
+            tc_tm_touch_fn(c, tc_no_binds, 0, seen, todo)
+        } else {
+            tc_tm_touch_closure(c, tc_no_binds, 0, seen, todo)
+        }
+    }
+    tc_tm_touch_drain(seen, todo, reads, writes, assigns, kids)
+    let t = tc_tm_touch_result(reads, writes)
+    if t.name == "" && !declared { return }
+    let why = if t.name == "" { "the row has State" } else if t.writes { "writes {t.name}" } else { "reads {t.name}" }
+    let at = "{diag_file_for_node(v)}:{node_line(v)}:{node_col(v)}"
+    trace.log("blink.state_spawn", "{at} {why}")
+}
+
+// A read of a module `let mut` is State (§4.16.1), which a @pure fn may not hold. The @pure
+// body check reports a write already, so a site it reported gets nothing more.
+fn tc_pure_check_state_read(fn_node: Int, node: Int, kids: List[Int]) ! TypeCheck.Resolve, Diag.Report {
+    if node < 0 || node_kind(node) == NodeKind.FnDef { return }
+    let k = node_kind(node)
+    if (k == NodeKind.Assignment || k == NodeKind.CompoundAssign) && tc_tm_module_root(node_target(node)) != "" { return }
+    // pp_walk reports a mutating method as a write, so only its arguments can still read.
+    let mutating = k == NodeKind.MethodCall && pp_is_mutating_method(node_method(node)) != 0
+    if !mutating && (k == NodeKind.Ident || k == NodeKind.FieldAccess || k == NodeKind.MethodCall) {
+        let shown = tc_tm_module_mut(node)
+        if shown != "" {
+            diag_error_at("ImpureBodyForPureAnnotation", IMPURE_BODY_FOR_PURE_ANNOTATION,
+                "`@pure` function `{node_name(fn_node)}` has the effect `State`: it reads the module `let mut` `{shown}`", node,
+                "remove `@pure`, or pass the value in as an argument")
+            return
+        }
+    }
+    let base = kids.len()
+    if mutating {
+        let margs = node_args(node)
+        if margs != -1 {
+            let mut a = 0
+            while a < sublist_length(margs) {
+                kids.push(sublist_get(margs, a))
+                a = a + 1
+            }
+        }
+    } else {
+        node_push_value_child_ids(node, kids)
+    }
+    let end = kids.len()
+    let mut i = base
+    while i < end {
+        tc_pure_check_state_read(fn_node, kids.get(i).unwrap(), kids)
+        i = i + 1
+    }
+    while kids.len() > base {
+        let _ = kids.pop()
+    }
 }
 
 // An impl method's row may narrow its trait method's row but not widen it, so a bound
@@ -53619,6 +53735,51 @@ fn tc_er_check_impl_rows(program: Int) ! Diag.Report {
                 let m = sublist_get(ms, j)
                 let tm = tc_er_impl_method(tr, node_name(m))
                 if tm != -1 { tc_er_check_impl_row(program, m, tm, node_name(tr)) }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+}
+
+// An impl method whose body touches module state has State in its effective row, which a trait
+// row without State or `_` does not admit (§4.16.6).
+fn tc_er_check_impl_state(program: Int, assigns: Map[Int, List[Int]]) ! TypeCheck.Resolve, Diag.Report {
+    let impls = node_methods(program)
+    if impls == -1 { return }
+    let mut i = 0
+    while i < sublist_length(impls) {
+        let im = sublist_get(impls, i)
+        let tr = tc_trait_node_idx.get(tc_impl_trait_id(im)) ?? -1
+        let ms = node_methods(im)
+        if tr != -1 && ms != -1 && !impl_provided_by_closeable(im) {
+            let mut j = 0
+            while j < sublist_length(ms) {
+                let m = sublist_get(ms, j)
+                let tm = tc_er_impl_method(tr, node_name(m))
+                let rt = if tm != -1 { tc_er_fn_row(tm) } else { ["_"] }
+                if !rt.contains("_") && !rt.contains("State") && !tc_er_fn_row(m).contains("State") {
+                    let mut seen: Set[Str] = Set()
+                    let mut todo: List[TmBody] = []
+                    let mut reads: List[Str] = []
+                    let mut writes: List[Str] = []
+                    let mut kids: List[Int] = []
+                    tc_tm_touch_fn(m, tc_no_binds, 0, seen, todo)
+                    tc_tm_touch_drain(seen, todo, reads, writes, assigns, kids)
+                    let t = tc_tm_touch_result(reads, writes)
+                    if t.name != "" {
+                        let verb = if t.writes { "writes" } else { "reads" }
+                        let tshown = "{node_name(tr)}.{node_name(m)}"
+                        let mut rt_shown: List[Str] = []
+                        for r in rt { rt_shown.push(tc_effect_spelling_at(r, m)) }
+                        let row_shown = if rt.len() == 0 { "empty" } else { "`{rt_shown.join(", ")}`" }
+                        diag_error_label_at_notes("TraitContractEffectMismatch", TRAIT_CONTRACT_904,
+                            "this impl of `{tshown}` touches module state", m,
+                            "`State` is not in the row of `{tshown}`, which is {row_shown}",
+                            "hold the state in a value that the caller passes in, or add `State` to `{tshown}` in the trait",
+                            ["{verb} the module `let mut` `{t.name}`"])
+                    }
+                }
                 j = j + 1
             }
         }
@@ -53650,10 +53811,19 @@ fn tc_er_check_impl_row(program: Int, m: Int, tm: Int, trait_name: Str) ! Diag.R
     for r in rt { rt_shown.push(tc_effect_spelling_at(r, m)) }
     let row_shown = if rt.len() == 0 { "empty" } else { "`{rt_shown.join(", ")}`" }
     let mut named: List[Str] = []
+    let mut has_state = false
     for e in wide {
-        if node_name(e) != "_" { named.push(node_name(e)) }
+        // State has no operations to move to a call site; only the module state can go.
+        if node_name(e) == "State" {
+            has_state = true
+        } else if node_name(e) != "_" {
+            named.push(node_name(e))
+        }
     }
     let mut helps: List[Str] = []
+    if has_state {
+        helps.push("remove the module state from the impl, or add `State` to `{tshown}` in the trait")
+    }
     if named.len() == 1 && sublist_length(effs) == 1 {
         let en = named.get(0).unwrap()
         helps.push("remove `! {en}` and do the {en} at the call site, or add `{en}` to `{tshown}` in the trait")
@@ -53664,7 +53834,8 @@ fn tc_er_check_impl_row(program: Int, m: Int, tm: Int, trait_name: Str) ! Diag.R
         let list = "`{named.join("`, `")}`"
         helps.push("remove {list} from the row and do them at the call site, or add {list} to `{tshown}` in the trait")
     }
-    if named.len() < wide.len() {
+    let state_count = if has_state { 1 } else { 0 }
+    if named.len() + state_count < wide.len() {
         helps.push("name the effects this impl performs, or give `{tshown}` the row `! _` in the trait")
     }
     let before = diag_entry_count()
@@ -53771,6 +53942,7 @@ fn tc_check_effect_rows(program: Int, msg_ran: Set[Int], hook: Int) ! TypeCheck.
     tc_er_walk_methods(program, node_methods(program), msg_ran, assigns, hook, kids)
     tc_er_walk_methods(program, node_arms(program), msg_ran, assigns, hook, kids)
     tc_er_check_impl_rows(program)
+    tc_er_check_impl_state(program, assigns)
     // A derived body runs at the call site, and that call needs only the effect that declares
     // the operation, so the body holds that effect and nothing more.
     for op in effect_derived_ops(program) {

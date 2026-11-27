@@ -1,0 +1,445 @@
+// A fn that touches module state has `State` in its effective row, and so does each caller up
+// to `main` or a test block (sections/04_effects.md §4.16.1). A private fn or a closure does not
+// write `State`: the compiler adds it. `State` has no operations, so no handler names it.
+
+import compile_test_helpers.{check_via_cli}
+import std.fs
+import std.process
+
+fn has(out: Str, needle: Str, label: Str) {
+    assert(out.contains(needle), "{label}: want `{needle}` in:\n{out}")
+}
+
+fn lacks(out: Str, needle: Str, label: Str) {
+    assert(!out.contains(needle), "{label}: want no `{needle}` in:\n{out}")
+}
+
+fn clean(out: Str, label: Str) {
+    lacks(out, "\"severity\":\"error\"", label)
+}
+
+fn count(out: Str, needle: Str) -> Int {
+    out.split(needle).len() - 1
+}
+
+let COUNTER = #"let mut count = 0
+
+pub fn next_id() -> Int ! State {
+    count = count + 1
+    count
+}
+"#
+
+test "a private fn that calls a fn with State in its row needs no row of its own" {
+    let out = check_via_cli("{COUNTER}
+fn helper() -> Int \{
+    next_id()
+}
+
+fn main() \{
+    let _ = helper()
+}
+", "state_private_caller")
+    clean(out, "helper gets State from next_id")
+}
+
+test "a private fn that reads a module let mut, and the private fn that calls it, need no row" {
+    let out = check_via_cli(#"let mut pos = 0
+
+fn current_pos() -> Int {
+    pos
+}
+
+fn advance() {
+    pos = pos + 1
+}
+
+fn step() -> Int {
+    advance()
+    current_pos()
+}
+
+fn main() {
+    let _ = step()
+}
+"#, "state_private_chain")
+    clean(out, "each private fn gets State from the module let mut")
+}
+
+test "a closure that calls a fn with State runs in a private fn with no row" {
+    let out = check_via_cli("{COUNTER}
+fn take(g: fn() -> Int ! _) -> Int ! _ \{
+    g()
+}
+
+fn via_closure() -> Int \{
+    take(fn() \{ next_id() })
+}
+
+fn main() \{
+    let _ = via_closure()
+}
+", "state_closure")
+    clean(out, "the closure and its fn get State")
+}
+
+test "a call of a trait method whose row has State needs no row in a private fn" {
+    let out = check_via_cli("{COUNTER}
+trait Tick \{
+    fn tick(self) -> Int ! State
+}
+
+type Clock \{ n: Int }
+
+impl Tick for Clock \{
+    fn tick(self) -> Int ! State \{
+        next_id() + self.n
+    }
+}
+
+fn twice[T: Tick](t: T) -> Int \{
+    t.tick() + t.tick()
+}
+
+fn main() \{
+    let _ = twice(Clock \{ n: 1 })
+}
+", "state_trait_method")
+    clean(out, "twice gets State from the trait row")
+}
+
+test "main and a test block hold State" {
+    let out = check_via_cli("{COUNTER}
+fn main() \{
+    io.println(\"\{next_id()}\")
+}
+
+test \"a test calls it\" \{
+    assert(next_id() > 0)
+}
+", "state_roots")
+    clean(out, "the roots hold State")
+    lacks(out, "E0539", "no UnhandledEffect for State")
+}
+
+test "a public fn that touches module state without State is not E0500" {
+    let out = check_via_cli("{COUNTER}
+pub fn peek() -> Int \{
+    next_id()
+}
+
+fn main() \{
+    let _ = peek()
+}
+", "state_pub_no_e0500")
+    lacks(out, "E0500", "E0500 does not fire for State")
+}
+
+test.failing(
+    "a public fn that touches module state without State is E0552",
+    reason: "UndeclaredModuleState is off until each module of the compiler and of std declares State",
+) {
+    let out = check_via_cli("{COUNTER}
+pub fn peek() -> Int \{
+    next_id()
+}
+
+fn main() \{
+    let _ = peek()
+}
+", "state_pub_e0552")
+    has(out, "\"code\":\"E0552\"", "a public fn declares State")
+}
+
+test "a handler State literal is E0545" {
+    let out = check_via_cli(#"let h = handler State {
+}
+
+fn main() {
+}
+"#, "state_handler_literal")
+    has(out, "\"code\":\"E0545\"", "no handler for State")
+    assert_eq(count(out, "\"severity\":\"error\""), 1)
+}
+
+test "a with that installs a handler State is E0545 once" {
+    let out = check_via_cli(#"fn main() {
+    with handler State {
+    } {
+        io.println("x")
+    }
+}
+"#, "state_with_handler")
+    has(out, "\"code\":\"E0545\"", "no with for State")
+    assert_eq(count(out, "\"severity\":\"error\""), 1)
+}
+
+test "an effect named State is E0559 and its help does not offer a handler State" {
+    let out = check_via_cli(#"effect State {
+    effect Get { fn get() -> Int }
+}
+
+fn main() {
+}
+"#, "state_user_effect")
+    has(out, "\"code\":\"E0559\"", "State is a built-in effect name")
+    lacks(out, "handler State", "State has no handler")
+}
+
+test "a @pure fn that reads a module let mut is E1307" {
+    let out = check_via_cli(#"let mut limit = 3
+
+@pure
+fn cap(n: Int) -> Int {
+    if n > limit { limit } else { n }
+}
+
+fn main() {
+    let _ = cap(5)
+}
+"#, "state_pure_read")
+    has(out, "\"code\":\"E1307\"", "a @pure fn may not hold State")
+    has(out, "`limit`", "the report names the binding")
+    lacks(out, "E0500", "State is not an undeclared effect")
+}
+
+test "a @pure fn that calls a fn with State in its row is E1307 once" {
+    let out = check_via_cli("{COUNTER}
+@pure
+fn grab() -> Int \{
+    next_id()
+}
+
+fn main() \{
+    let _ = grab()
+}
+", "state_pure_call")
+    assert_eq(count(out, "\"code\":\"E1307\""), 1)
+    lacks(out, "E0500", "State is not an undeclared effect")
+}
+
+test "a @pure fn that calls a fn with State inside a string, a struct, a tuple or a closure is E1307" {
+    let out = check_via_cli("{COUNTER}
+type P \{ x: Int }
+
+@pure
+fn label() -> Str \{
+    \"id \{next_id()}\"
+}
+
+@pure
+fn make() -> P \{
+    P \{ x: next_id() }
+}
+
+@pure
+fn pair() -> (Int, Int) \{
+    (next_id(), 1)
+}
+
+@pure
+fn later() -> Int \{
+    let f = fn() -> Int \{ next_id() }
+    1
+}
+
+fn main() \{
+    let _ = label()
+    let _ = make()
+    let _ = pair()
+    let _ = later()
+}
+", "state_pure_nested_call")
+    assert_eq(count(out, "\"code\":\"E1307\""), 4)
+    has(out, "`pair`", "the call in the tuple")
+    has(out, "`label`", "the call in the string")
+    has(out, "`make`", "the call in the struct literal")
+    has(out, "`later`", "the call in the closure")
+}
+
+// A closure that a @pure fn makes but never calls is held to the same rule as the fn, so a read
+// and a call in it agree.
+test "a @pure fn that makes a closure that reads a module let mut is E1307" {
+    let out = check_via_cli(#"let mut limit = 3
+
+@pure
+fn later() -> Int {
+    let f = fn() -> Int { limit }
+    1
+}
+
+fn main() {
+    let _ = later()
+}
+"#, "state_pure_closure_read")
+    assert_eq(count(out, "\"code\":\"E1307\""), 1)
+    has(out, "`limit`", "the report names the binding")
+}
+
+test "a @pure fn that pushes to a module let mut is E1307 once, for the write" {
+    let out = check_via_cli(#"let mut items: List[Int] = []
+
+@pure
+fn add() -> Int {
+    items.push(1)
+    0
+}
+
+fn main() {
+    let _ = add()
+}
+"#, "state_pure_push")
+    assert_eq(count(out, "\"code\":\"E1307\""), 1)
+    lacks(out, "reads the module", "a push is a write, not a read")
+}
+
+test.failing(
+    "a spawned closure that writes module state through a call is E0651",
+    reason: "SpawnTouchesModuleState is off until no task that the compiler spawns touches module state",
+) {
+    let out = check_via_cli(#"let mut items: List[Int] = []
+
+fn add(n: Int) {
+    items.push(n)
+}
+
+fn main() {
+    async.scope {
+        let task = async.spawn(fn() { add(1) })
+        add(2)
+        task.await
+    }
+}
+"#, "state_spawn_write")
+    has(out, "\"code\":\"E0651\"", "two tasks would race on items")
+    has(out, "writes `items`", "the note names the binding")
+}
+
+// While E0651 is off, the check writes each spawn it would reject to the trace channel
+// `blink.state_spawn`. These two rows hold that the check finds the right spawns.
+fn spawn_trace(source: Str, tag: Str) -> Str ! FS.Write, FS.Delete, Process.Spawn {
+    let path = "build/{tag}.bl"
+    fs.write(path, source).unwrap()
+    let r = process.run("sh", ["-c", "env BLINK_TRACE_CHANNELS=blink.state_spawn build/blinkc {path} /dev/null --format json 2>&1; echo exit=$?"]).unwrap()
+    let _ = fs.delete(path)
+    r.out
+}
+
+test "the spawn check finds a spawned closure that writes module state through a call" {
+    let out = spawn_trace(#"let mut items: List[Int] = []
+
+fn add(n: Int) {
+    items.push(n)
+}
+
+fn main() {
+    async.scope {
+        let task = async.spawn(fn() { add(1) })
+        add(2)
+        task.await
+    }
+}
+"#, "state_spawn_trace_write")
+    has(out, "[trace:blink.state_spawn] ", "the spawn is found")
+    has(out, "writes items", "the line names the binding")
+}
+
+test "the spawn check passes a spawned closure that touches no module state" {
+    let out = spawn_trace(#"fn square(n: Int) -> Int {
+    n * n
+}
+
+fn main() {
+    async.scope {
+        let task = async.spawn(fn() { square(3) })
+        io.println("{task.await}")
+    }
+}
+"#, "state_spawn_trace_clean")
+    has(out, "exit=0", "the probe compiles")
+    lacks(out, "[trace:blink.state_spawn]", "square touches no module state")
+}
+
+let SHOWN = #"let mut shown = 0
+
+type Cell { n: Int }
+
+trait Show {
+    fn show(self) -> Str
+}
+
+trait ShowAny {
+    fn show_any(self) -> Str ! _
+}
+"#
+
+test "an impl method that writes module state under a trait row without State is E0904" {
+    let out = check_via_cli("{SHOWN}
+impl Show for Cell \{
+    fn show(self) -> Str \{
+        shown = shown + 1
+        \"x\"
+    }
+}
+
+fn main() \{
+    let c = Cell \{ n: 1 }
+    let _ = c.show()
+}
+", "state_impl_writes")
+    has(out, "\"code\":\"E0904\"", "impl writes shown")
+    has(out, "this impl of `Show.show` touches module state", "names the trait method")
+    has(out, "writes the module `let mut` `shown`", "names the let mut")
+}
+
+test "an impl method that touches module state under a trait row with _ is not E0904" {
+    let out = check_via_cli("{SHOWN}
+impl ShowAny for Cell \{
+    fn show_any(self) -> Str \{
+        shown = shown + 1
+        \"x\"
+    }
+}
+
+fn main() \{
+    let c = Cell \{ n: 1 }
+    let _ = c.show_any()
+}
+", "state_impl_wild_row")
+    clean(out, "a `_` row admits State")
+}
+
+test "an impl method that touches no module state is not E0904" {
+    let out = check_via_cli("{SHOWN}
+impl Show for Cell \{
+    fn show(self) -> Str \{
+        \"y\"
+    }
+}
+
+fn main() \{
+    let c = Cell \{ n: 1 }
+    let _ = c.show()
+}
+", "state_impl_clean")
+    clean(out, "no module state")
+}
+
+test "an impl method that writes State in its row under a trait row without it is E0904 with a help for module state" {
+    let out = check_via_cli("{SHOWN}
+impl Show for Cell \{
+    fn show(self) -> Str ! State \{
+        shown = shown + 1
+        \"x\"
+    }
+}
+
+fn main() \{
+    let c = Cell \{ n: 1 }
+    let _ = c.show()
+}
+", "state_impl_row_state")
+    has(out, "\"code\":\"E0904\"", "State widens the trait row")
+    has(out, "remove the module state from the impl, or add `State` to `Show.show` in the trait", "the help fits State")
+    lacks(out, "at the call site", "State has no call-site handling")
+}

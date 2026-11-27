@@ -93,6 +93,7 @@ pub const UNHANDLED_EFFECT         = "E0539"
 pub const NO_SUCH_VARIANT          = "E0547"
 pub const UNSOURCED_EFFECT_WILDCARD = "E0551"
 pub const RESERVED_EFFECT_NAME = "E0559"
+pub const STATE_NOT_HANDLEABLE = "E0545"
 pub const HANDLER_CLAUSE_MISMATCH = "E0548"
 pub const UNKNOWN_HANDLER_OP = "E0549"
 pub const DUPLICATE_HANDLER_CLAUSE = "E0550"
@@ -118,6 +119,7 @@ pub const NOT_A_PLACE             = "E0611"
 pub const PARAM_ASSIGN            = "E0612"
 pub const MUT_ON_PATTERN          = "E0613"
 pub const MUTABLE_CAPTURE_IN_SPAWN = "E0650"
+pub const SPAWN_TOUCHES_MODULE_STATE = "E0651"
 
 // E0700+ — arena escape analysis
 pub const ARENA_VALUE_ESCAPES        = "E0700"
@@ -2427,7 +2429,13 @@ pub fn diag_explain(code: Str) -> Str {
         return "E0550 -- DuplicateHandlerClause\n\nA second or later clause for one operation in one handler\n(sections/04_effects.md §4.7, Clause signatures). The error is at each\nlater clause, with a note at the first. Only the first clause is\nmatched against the header of the operation (E0548).\n\n  effect Ee \{ effect Op \{ fn op(x: Int) -> Int \} \}\n  with handler Ee.Op \{\n      fn op(x: Int) -> Int \{ x \}\n      fn op(x: Int) -> Int \{ x + 1 \}   // E0550\n  \} \{ ee.op(1) \}\n\nFix: delete one of the clauses. No machine fix is offered: a tool\ncannot know which body to keep."
     }
     if code == RESERVED_EFFECT_NAME {
-        return "E0559 -- ReservedEffectName\n\nA top-level `effect` declaration took the name of a built-in effect:\n`FS`, `Net`, `DB`, `IO`, `Env`, `Time`, `Rand`, `Crypto`, `Process`,\n`State` or `Async` (sections/04 §4.3). The rule holds in every module,\n`pub` or not. It compares lowercase forms, because the handle of an\neffect is the lowercase form of its name: `effect Io` would take the\nhandle `io` of `IO`.\n\n  effect Time \{ effect Now \{ fn now() -> Int \} \}   // E0559\n  effect Io \{ effect Ping \{ fn ping() -> Int \} \}   // E0559 -- the handle `io`\n\nA sub-effect may take such a name, and so may a `type`.\n\nThe declaration is dropped, so the name means the built-in effect.\n\nFix: rename the effect. To replace a built-in effect in a test, write\na handler for it and install it with `with`:\n\n  effect Clock \{ effect Now \{ fn now() -> Int \} \}  // OK\n  with handler Time \{ ... \} \{ ... \}"
+        return "E0559 -- ReservedEffectName\n\nA top-level `effect` declaration took the name of a built-in effect:\n`FS`, `Net`, `DB`, `IO`, `Env`, `Time`, `Rand`, `Crypto`, `Process`,\n`State` or `Async` (sections/04 §4.3). The rule holds in every module,\n`pub` or not. It compares lowercase forms, because the handle of an\neffect is the lowercase form of its name: `effect Io` would take the\nhandle `io` of `IO`.\n\n  effect Time \{ effect Now \{ fn now() -> Int \} \}   // E0559\n  effect Io \{ effect Ping \{ fn ping() -> Int \} \}   // E0559 -- the handle `io`\n\nA sub-effect may take such a name, and so may a `type`.\n\nThe declaration is dropped, so the name means the built-in effect.\n\nFix: rename the effect. To replace a built-in effect in a test, write\na handler for it and install it with `with`. `State` has no handler\n(E0545):\n\n  effect Clock \{ effect Now \{ fn now() -> Int \} \}  // OK\n  with handler Time \{ ... \} \{ ... \}"
+    }
+    if code == SPAWN_TOUCHES_MODULE_STATE {
+        return "E0651 -- SpawnTouchesModuleState\n\nA fn value passed to `async.spawn` has `State` in its row: its body, or\na fn it calls, reads or writes a module `let mut` (sections/04 §4.16.6).\nTwo tasks that touch one module `let mut` race. The rule holds for a\nclosure literal and for a named fn.\n\n  let mut items: List[Int] = []\n  fn add(n: Int) \{ items.push(n) \}\n  async.spawn(fn() \{ add(1) \})   // E0651\n\nFix: pass the data in, return it from the task, or use a `Channel`."
+    }
+    if code == STATE_NOT_HANDLEABLE {
+        return "E0545 -- StateNotHandleable\n\nA `handler State \{ ... \}`, or a `with` that names `State`\n(sections/04 §4.16.1). `State` has no operations and no handler.\nNothing removes it from a row: it stays in the row of each caller up\nto `main` or a test block, which hold it.\n\n  with handler State \{ \} \{ ... \}   // E0545\n\nFix: delete the handler. To give a test its own state, pass the value\nin as an argument and return the new value."
     }
     if code == EFFECT_HANDLE_COLLISION {
         return "E0562 -- EffectHandleCollision\n\nA handle use where two or more available effects have that handle. The\neffects available at a use are those of the row of the enclosing fn and\nof each `with` that encloses the use. Two modules may each declare an\neffect `Log`, and a row may hold both; the error is only at the use.\n\n  fn la() ! a.Log \{ log.log(\"a\") \}        // OK\n  fn bad() ! a.Log, b.Log \{\n      log.log(\"x\")                       // E0562\n  \}\n\nHandles compare in lowercase, so `Ab` and `AB` have one handle.\n\nA module may not declare two top-level effects with one handle. The\nerror is at the name of the second, with a note at the first, and holds\nwith no use of the handle:\n\n  effect Ab \{ effect Go \{ fn ping() -> Int \} \}\n  effect AB \{ effect Go \{ fn ping() -> Int \} \}   // E0562\n\nFix: put the call in a fn whose row names one of the effects, as `la`\ndoes, or rename one effect."
